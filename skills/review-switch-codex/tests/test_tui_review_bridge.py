@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from hook_fixtures import marker_lines, write_hook_config  # noqa: E402
+
+
+BRIDGE_PATH = (
+    pathlib.Path(__file__).parents[1] / "scripts" / "tui_review_bridge.py"
+)
+
+
+def load_bridge():
+    spec = importlib.util.spec_from_file_location("tui_review_bridge", BRIDGE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def base_args(**overrides):
+    values = {
+        "target": "HEAD",
+        "cwd": "/workspace/ticket-50",
+        "timeout": 1,
+        "startup_timeout": 1,
+        "sandbox": "danger-full-access",
+        "approval": "never",
+        "network": False,
+        "tmux_target": None,
+        "resume_session": None,
+        "recover_session": False,
+        "model": None,
+        "effort": None,
+        "probe": False,
+        "browser_probe": False,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class FakeSubprocess:
+    """Stands in for the module's `subprocess` while a launch is exercised.
+
+    Only the bridge's own calls are faked; the hook runs its command for real
+    through its own module.
+    """
+
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+        self.calls = []
+
+    def run(self, command, **kwargs):
+        self.calls.append(command)
+        return argparse.Namespace(returncode=0, stdout=self.stdout, stderr="")
+
+
+class FakeClient:
+    def __init__(self):
+        self.requests = []
+
+    async def request(self, method, params):
+        self.requests.append((method, params))
+        if method == "turn/start":
+            return {"turn": {"id": "turn-followup"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+
+class GateClient:
+    """An app-server whose MCP servers announce themselves over successive pumps.
+
+    `script` is one dict of name -> status per pump, merged in order, so a test
+    can spell out the startup sequence the gate has to sit through.
+    """
+
+    def __init__(self, script, inventory=("alpha", "beta")):
+        self.inventory = list(inventory)
+        self.script = [dict(step) for step in script]
+        self.mcp_startup = {}
+        self.requests = []
+        self.thread_start_params = None
+        self.startup_when_turn_started = None
+
+    async def request(self, method, params):
+        self.requests.append(method)
+        if method == "mcpServerStatus/list":
+            return {"data": [{"name": name} for name in self.inventory]}
+        if method == "thread/start":
+            self.thread_start_params = dict(params)
+            return {"thread": {"id": "thread-new"}}
+        if method == "thread/resume":
+            return {}
+        if method == "turn/start":
+            # The whole point of the gate: what MCP looked like at this moment.
+            self.startup_when_turn_started = dict(self.mcp_startup)
+            return {"turn": {"id": "turn-1"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    async def pump(self, _seconds):
+        if self.script:
+            self.mcp_startup.update(self.script.pop(0))
+
+    async def __aexit__(self, *_ignored):
+        return None
+
+
+class FakeStore:
+    def __init__(self):
+        self.written = {}
+        # Whether the pane had already been handed its thread when the record
+        # was written — the ordering a killed driver depends on.
+        self.handoff_done_at_write = None
+
+    def write(self, session_id, state):
+        handoff = pathlib.Path(state["runtimeDir"]) / "thread-id"
+        self.handoff_done_at_write = handoff.exists()
+        self.written[session_id] = state
+
+
+class McpReadinessGateTests(unittest.TestCase):
+    """The first turn must not go in while a server is still coming up (#14)."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.owner = self.bridge.InvocationOwner(
+            tmux_server="/tmp/tmux-501/default,1",
+            origin_pane="%1",
+            worktree_root="/workspace/ticket-50",
+        )
+        self.runtime_dirs = []
+        self.cleaned = []
+
+    def run_new_review(self, client, startup_timeout=5):
+        """Drive run_new_review with everything but the gate faked out."""
+
+        def fake_launch_pane(args, runtime_dir):
+            self.runtime_dirs.append(pathlib.Path(runtime_dir))
+            return "%9"
+
+        async def fake_connect(*_args, **_kwargs):
+            return client
+
+        async def fake_wait_for_review(*_args, **_kwargs):
+            return {"id": "thread-new"}, {"id": "turn-1", "status": "completed"}
+
+        args = base_args(cwd=os.getcwd(), tmux_target="%1",
+                         startup_timeout=startup_timeout)
+        self.store = FakeStore()
+        with mock.patch.multiple(
+            self.bridge,
+            launch_pane=fake_launch_pane,
+            connect_when_ready=fake_connect,
+            wait_for_review=fake_wait_for_review,
+            pane_exists=lambda pane_id: True,
+            cleanup_failed_pane=lambda pane, runtime: self.cleaned.append(pane),
+        ):
+            return asyncio.run(
+                self.bridge.run_new_review(args, self.owner, self.store)
+            )
+
+    def test_the_turn_waits_until_every_announced_server_has_settled(self):
+        client = GateClient([
+            {"alpha": "starting", "beta": "starting"},
+            {"alpha": "ready"},
+            {"beta": "ready"},
+        ])
+
+        self.run_new_review(client)
+
+        self.assertEqual(
+            client.startup_when_turn_started,
+            {"alpha": "ready", "beta": "ready"},
+            "the first turn was submitted while a server was still starting",
+        )
+
+    def test_the_thread_is_handed_over_only_after_the_turn_has_started(self):
+        """`resume` refuses a thread with no rollout, so this order matters."""
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        handoff = self.runtime_dirs[0] / self.bridge.THREAD_HANDOFF_FILENAME
+        self.assertEqual(handoff.read_text(encoding="utf-8"), "thread-new")
+        self.assertIn("thread/start", client.requests)
+        self.assertIn("turn/start", client.requests)
+
+    def test_the_review_thread_carries_unattended_session_policy(self):
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        self.assertEqual(client.thread_start_params["approvalPolicy"], "never")
+        self.assertEqual(client.thread_start_params["sandbox"], "danger-full-access")
+
+    def test_the_record_is_on_disk_before_the_pane_is_handed_the_thread(self):
+        """Otherwise a driver killed in between orphans a live, running review.
+
+        The pane attaches as soon as it sees the thread id, so a record written
+        after that leaves a window where a review is running that
+        `--recover-session` cannot find.
+        """
+        client = GateClient([{"alpha": "ready"}])
+
+        self.run_new_review(client)
+
+        self.assertFalse(
+            self.store.handoff_done_at_write,
+            "the pane was handed its thread before the record was written",
+        )
+
+    def test_a_late_announcement_is_still_waited_for(self):
+        """One server was measured announcing 169 ms after another went ready.
+
+        `ghost` is configured but never announces, so the gate cannot simply
+        wait for the whole inventory — and it must still not open in the window
+        where alpha is ready and beta has not spoken yet.
+        """
+        client = GateClient(
+            [
+                {"alpha": "starting"},
+                {"alpha": "ready"},
+                {"beta": "starting"},
+                {"beta": "ready"},
+            ],
+            inventory=("alpha", "beta", "ghost"),
+        )
+
+        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 10))
+
+        self.assertEqual(settled, {"alpha": "ready", "beta": "ready"})
+
+    def test_an_inventory_call_that_hangs_does_not_hang_the_gate(self):
+        """Nothing under `request` times out, so this RPC needs its own bound.
+
+        Without one a stuck app-server holds the gate open past every budget the
+        caller set, and only the pane's reaper eventually notices.
+        """
+
+        class HangingInventory:
+            mcp_startup = {}
+
+            async def request(self, method, _params):
+                assert method == "mcpServerStatus/list"
+                await asyncio.sleep(3600)
+
+            async def pump(self, _seconds):
+                raise AssertionError("the gate should never reach its poll loop")
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "which MCP servers are configured"):
+            asyncio.run(
+                self.bridge.wait_for_mcp_startup(HangingInventory(), None, 0.3)
+            )
+
+        self.assertLess(time.monotonic() - started, 30)
+
+    def test_a_server_that_never_settles_is_named_in_the_failure(self):
+        client = GateClient([{"alpha": "starting", "beta": "ready"}])
+
+        with self.assertRaisesRegex(RuntimeError, "still starting: alpha"):
+            asyncio.run(
+                self.bridge.wait_for_mcp_startup(client, None, 0.2)
+            )
+
+        self.assertIsNone(
+            client.startup_when_turn_started,
+            "a turn was submitted even though the gate never opened",
+        )
+
+    def test_a_gate_that_times_out_tears_the_pane_down(self):
+        client = GateClient([{"alpha": "starting"}])
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting for Codex MCP"):
+            self.run_new_review(client, startup_timeout=0.2)
+
+        self.assertEqual(self.cleaned, ["%9"])
+        self.assertIsNone(client.startup_when_turn_started)
+
+    def test_silence_from_every_server_names_the_configured_ones(self):
+        client = GateClient([])
+
+        with self.assertRaisesRegex(RuntimeError, "none of alpha, beta announced"):
+            asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
+
+    def test_a_codex_without_mcp_servers_is_ready_at_once(self):
+        client = GateClient([], inventory=())
+
+        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
+
+        self.assertEqual(settled, {})
+
+    def test_a_pane_that_dies_during_startup_is_reported(self):
+        client = GateClient([{"alpha": "starting"}])
+
+        with mock.patch.object(self.bridge, "pane_exists", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "pane exited before its MCP"):
+                asyncio.run(self.bridge.wait_for_mcp_startup(client, "%9", 5))
+
+
+class WaitForReviewTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.marker = "[claude-tui-review-bridge:abc]"
+
+    def thread_payload(self):
+        return {
+            "thread": {
+                "id": "thread-1",
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": self.marker}],
+                            },
+                            {
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": "findings",
+                            },
+                        ],
+                    }
+                ],
+            }
+        }
+
+    def test_a_thread_that_is_not_readable_yet_is_polled_again(self):
+        """The rollout is not flushed the instant turn/start returns.
+
+        Reading the thread fails until it is, which is this poll's normal first
+        answer — treating it as fatal aborts a review that is running fine.
+        """
+        outer = self
+
+        class FlakyClient:
+            def __init__(self):
+                self.reads = 0
+
+            async def request(self, method, _params):
+                assert method == "thread/read"
+                self.reads += 1
+                if self.reads == 1:
+                    raise outer.bridge.AppServerError(
+                        "thread/read failed: rollout at ... is empty"
+                    )
+                return outer.thread_payload()
+
+        client = FlakyClient()
+        with mock.patch.object(self.bridge, "pane_exists", return_value=True):
+            thread, turn = asyncio.run(
+                self.bridge.wait_for_review(client, "thread-1", self.marker, "%9", 10)
+            )
+
+        self.assertEqual(client.reads, 2)
+        self.assertEqual(turn["status"], "completed")
+        self.assertEqual(thread["id"], "thread-1")
+
+    def test_a_thread_that_never_becomes_readable_says_so(self):
+        class DeadClient:
+            async def request(self, _method, _params):
+                raise outer_bridge.AppServerError("rollout is empty")
+
+        outer_bridge = self.bridge
+        with mock.patch.object(self.bridge, "pane_exists", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "never became readable"):
+                asyncio.run(
+                    self.bridge.wait_for_review(
+                        DeadClient(), "thread-1", self.marker, "%9", 1
+                    )
+                )
+
+
+class BridgeContractTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+
+    def test_owner_uses_origin_pane_and_canonical_worktree(self):
+        environment = {
+            "TMUX": "/private/tmp/tmux-501/default,11028,2",
+            "TMUX_PANE": "%24",
+        }
+        with mock.patch.object(
+            self.bridge,
+            "canonical_worktree_root",
+            return_value="/workspace/ticket-50",
+        ):
+            owner = self.bridge.resolve_owner(base_args(), environment)
+
+        self.assertEqual(owner.origin_pane, "%24")
+        self.assertEqual(
+            owner.tmux_server, "/private/tmp/tmux-501/default,11028"
+        )
+        self.assertEqual(owner.worktree_root, "/workspace/ticket-50")
+
+    def test_parallel_panes_have_different_owner_keys(self):
+        with mock.patch.object(
+            self.bridge,
+            "canonical_worktree_root",
+            return_value="/workspace/ticket-51",
+        ):
+            owner_49 = self.bridge.resolve_owner(
+                base_args(),
+                {
+                    "TMUX": "/private/tmp/tmux-501/default,11028,2",
+                    "TMUX_PANE": "%23",
+                },
+            )
+            owner_50 = self.bridge.resolve_owner(
+                base_args(),
+                {
+                    "TMUX": "/private/tmp/tmux-501/default,11028,2",
+                    "TMUX_PANE": "%24",
+                },
+            )
+
+        self.assertNotEqual(owner_49.key, owner_50.key)
+
+    def test_session_owner_rejects_another_parallel_pane(self):
+        expected = self.bridge.InvocationOwner(
+            tmux_server="/private/tmp/tmux-501/default,11028",
+            origin_pane="%23",
+            worktree_root="/workspace/ticket-49",
+        )
+        actual = self.bridge.InvocationOwner(
+            tmux_server="/private/tmp/tmux-501/default,11028",
+            origin_pane="%24",
+            worktree_root="/workspace/ticket-50",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "belongs to another"):
+            self.bridge.validate_session_owner(
+                {"owner": expected.to_dict()}, actual
+            )
+
+    def test_launch_pane_requires_an_explicit_origin_target(self):
+        with self.assertRaisesRegex(RuntimeError, "originating tmux pane"):
+            self.bridge.launch_pane(
+                base_args(tmux_target=None),
+                pathlib.Path("/tmp/runtime"),
+            )
+
+    def test_followup_starts_a_turn_on_the_saved_thread(self):
+        client = FakeClient()
+        state = {"threadId": "thread-ticket-50"}
+
+        result = asyncio.run(
+            self.bridge.start_followup_turn(client, state, "review again")
+        )
+
+        self.assertEqual(result["turn"]["id"], "turn-followup")
+        self.assertEqual(
+            client.requests,
+            [
+                (
+                    "turn/start",
+                    {
+                        "threadId": "thread-ticket-50",
+                        "input": [
+                            {
+                                "type": "text",
+                                "text": "review again",
+                                "text_elements": [],
+                            }
+                        ],
+                    },
+                )
+            ],
+        )
+
+    def test_interrupted_review_remains_resumable(self):
+        self.assertFalse(
+            self.bridge.should_cleanup_session(
+                {"status": "interrupted"}, final_message=""
+            )
+        )
+
+    def test_completed_review_without_a_report_is_not_kept(self):
+        self.assertTrue(
+            self.bridge.should_cleanup_session(
+                {"status": "completed"}, final_message=""
+            )
+        )
+
+    def test_the_tui_attaches_to_the_bridges_thread(self):
+        command = self.bridge.build_tui_command(
+            base_args(),
+            pathlib.Path("/tmp/app-server.sock"),
+            "thread-ticket-50",
+        )
+        self.assertEqual(command[-2:], ["resume", "thread-ticket-50"])
+
+    def test_no_prompt_ever_reaches_the_tui_command_line(self):
+        """A positional prompt is submitted at TUI startup, racing MCP (#14).
+
+        The turn goes over the app-server once the readiness gate opens, so the
+        launch command must carry nothing but the thread to attach to.
+        """
+        command = self.bridge.build_tui_command(
+            base_args(),
+            pathlib.Path("/tmp/app-server.sock"),
+            "thread-ticket-50",
+        )
+        for argument in command:
+            self.assertNotIn("Review HEAD", argument)
+            self.assertNotIn("Rounds contract", argument)
+
+    def test_parser_exposes_explicit_resume_handle(self):
+        args = self.bridge.build_parser().parse_args(
+            ["--resume-session", "session-ticket-50", "HEAD"]
+        )
+        self.assertEqual(args.resume_session, "session-ticket-50")
+
+    def test_session_store_is_overridable_and_private(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.dict(
+                os.environ,
+                {"CODE_REVIEW_TUI_STATE_DIR": temp_dir},
+                clear=False,
+            ):
+                store = self.bridge.SessionStore()
+                store.write(
+                    "session-ticket-50",
+                    {
+                        "version": self.bridge.SESSION_STATE_VERSION,
+                        "reviewSessionId": "session-ticket-50",
+                        "threadId": "thread-ticket-50",
+                    },
+                )
+                state_path = pathlib.Path(temp_dir) / "session-ticket-50.json"
+                self.assertEqual(
+                    store.read("session-ticket-50")["threadId"],
+                    "thread-ticket-50",
+                )
+                self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+
+    def test_session_id_cannot_escape_the_state_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.bridge.SessionStore(temp_dir)
+            with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
+                store.read("../another-task")
+
+    def test_review_prompts_carry_the_request_and_name_no_skill(self):
+        for prompt in (
+            self.bridge.build_prompt(base_args(), "bridge-1"),
+            self.bridge.build_prompt(base_args(), "bridge-1", followup=True),
+        ):
+            for marker in ("$code-review", "/code-review", "mattpocock-skills"):
+                self.assertNotIn(marker, prompt)
+            self.assertIn("HEAD", prompt)
+            self.assertIn("Rounds contract", prompt)
+            self.assertIn("two axes", prompt)
+            self.assertIn("standards", prompt)
+            self.assertIn("one re-review", prompt)
+            self.assertIn("coordinator", prompt)
+            self.assertIn("review-only task", prompt)
+
+    def test_parser_carries_no_environment_specific_probe(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.build_parser().parse_args(["--network-probe", "HEAD"])
+
+    def test_same_pane_rejects_concurrent_bridge_calls(self):
+        owner = self.bridge.InvocationOwner(
+            tmux_server="/private/tmp/tmux-501/default,11028",
+            origin_pane="%24",
+            worktree_root="/workspace/ticket-50",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.bridge.SessionStore(temp_dir)
+            with self.bridge.owner_lock(store, owner):
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    with self.bridge.owner_lock(store, owner):
+                        pass
+
+
+MARKER_PATTERN = re.compile(r"\[claude-tui-review-bridge:[^\]]+\]")
+
+
+class FakeCodexSession:
+    """One Codex TUI pane and its app-server, seen through the bridge's calls.
+
+    It answers the three requests the bridge makes and records what it was asked
+    to create, so a test can assert that a second pane or a second turn was never
+    started.
+    """
+
+    def __init__(self):
+        self.marker = None
+        self.status = "in_progress"
+        self.final_message = ""
+        self.thread_id = "thread-ticket-13"
+        self.turn_id = "turn-round-one"
+        self.panes = []
+        self.started_turns = []
+        # The bridge gates the first turn on these; one server that goes ready
+        # on the first pump is enough to let every recovery test through.
+        self.mcp_startup = {}
+
+    def launch_pane(self, args, runtime_dir):
+        runtime_dir = pathlib.Path(runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        (runtime_dir / "app-server.sock").touch()
+        self.panes.append("%%%d" % (90 + len(self.panes)))
+        return self.panes[-1]
+
+    async def pump(self, _seconds):
+        self.mcp_startup["graph"] = "ready"
+
+    def finish(self, message):
+        self.status = "completed"
+        self.final_message = message
+
+    def turn(self):
+        return {
+            "id": self.turn_id,
+            "status": self.status,
+            "items": [
+                {
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": self.marker}],
+                },
+                {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": self.final_message,
+                },
+            ],
+        }
+
+    async def request(self, method, params):
+        if method == "mcpServerStatus/list":
+            return {"data": [{"name": "graph"}]}
+        if method == "thread/start":
+            return {"thread": {"id": self.thread_id}}
+        if method == "thread/resume":
+            return {}
+        if method == "thread/read":
+            return {"thread": {"id": self.thread_id, "turns": [self.turn()]}}
+        if method == "turn/start":
+            self.started_turns.append(params)
+            self.marker = MARKER_PATTERN.search(
+                params["input"][0]["text"]
+            ).group(0)
+            return {"turn": {"id": self.turn_id}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    async def __aexit__(self, *_ignored):
+        return None
+
+
+class FakePaneTestCase(unittest.TestCase):
+    """One stubbed Codex pane, driven through the bridge's own entry points.
+
+    Everything the bridge would reach the machine through — the pane, the
+    app-server connection, the worktree identity — is stubbed, so a test drives
+    a whole review and asserts on what the bridge left behind.
+    """
+
+    TMUX = "/private/tmp/tmux-501/default,11028,2"
+    ORIGIN_PANE = "%235"
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name)
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir()
+        self.state_dir = self.root / "state"
+        self.codex = FakeCodexSession()
+
+        self.environment = {
+            "TMUX": self.TMUX,
+            "TMUX_PANE": self.ORIGIN_PANE,
+            "CODE_REVIEW_TUI_STATE_DIR": str(self.state_dir),
+        }
+        self.worktree_root = str(self.worktree)
+        self.enter(mock.patch.dict(os.environ, self.environment, clear=False))
+        self.enter(mock.patch.object(
+            self.bridge, "canonical_worktree_root",
+            side_effect=lambda _cwd: self.worktree_root,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "launch_pane", self.codex.launch_pane
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "pane_exists",
+            side_effect=lambda pane: pane in self.codex.panes,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "connect_when_ready", self.connect
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "connect_existing_session", self.connect_existing
+        ))
+
+    def enter(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def connect(self, *_args, **_kwargs):
+        return self.codex
+
+    async def connect_existing(self, state):
+        if state["paneId"] not in self.codex.panes:
+            return None
+        return self.codex
+
+    def args(self, **overrides):
+        values = {"cwd": str(self.worktree), "timeout": 5, "startup_timeout": 5}
+        values.update(overrides)
+        return base_args(**values)
+
+    def run_bridge(self, args):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = asyncio.run(self.bridge.run_bridge(args))
+        printed = stdout.getvalue().strip()
+        return code, json.loads(printed) if printed else None
+
+    def kill_the_driver(self):
+        """The first review, killed the way the harness kills it."""
+        with self.assertRaisesRegex(RuntimeError, "Timed out"):
+            self.run_bridge(self.args(timeout=0.2))
+        return self.stored_session()
+
+    def stored_session(self):
+        records = sorted(self.state_dir.glob("*.json"))
+        self.assertEqual(len(records), 1, records)
+        return json.loads(records[0].read_text(encoding="utf-8"))
+
+
+class RecoveryTests(FakePaneTestCase):
+    """A driver killed mid-review is recovered, not restarted.
+
+    The whole path runs through `run_bridge` against a stubbed pane: the first
+    call is killed the way the harness kills it — the record is written, the
+    pane lives on, nothing is printed — and the second call has only its own
+    owner identity to work from.
+    """
+
+    def test_a_killed_driver_leaves_a_recoverable_record_and_a_live_pane(self):
+        state = self.kill_the_driver()
+
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(state["threadId"], self.codex.thread_id)
+        self.assertEqual(state["marker"], self.codex.marker)
+        self.assertEqual(state["owner"]["origin_pane"], self.ORIGIN_PANE)
+
+    def test_recovery_returns_the_same_session_without_a_second_pane(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("two spec findings, one standards finding")
+        # The first review's own turn; recovery must not add to it.
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(
+            self.args(target=None, recover_session=True)
+        )
+
+        self.assertEqual(code, 0)
+        self.assertTrue(output["recovered"])
+        self.assertEqual(output["reviewSessionId"], killed["reviewSessionId"])
+        self.assertEqual(output["threadId"], self.codex.thread_id)
+        self.assertEqual(output["paneId"], killed["paneId"])
+        self.assertEqual(
+            output["finalMessage"], "two spec findings, one standards finding"
+        )
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(
+            len(self.codex.started_turns),
+            turns_before,
+            "recovery started a second turn instead of waiting on the first",
+        )
+        self.assertEqual(
+            self.stored_session()["target"], killed["target"]
+        )
+
+    def test_recovery_keeps_the_lineage_resumable_for_round_two(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("round one findings")
+        self.run_bridge(self.args(target=None, recover_session=True))
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(
+            self.args(resume_session=killed["reviewSessionId"])
+        )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(output["recovered"])
+        self.assertEqual(
+            len(self.codex.started_turns) - turns_before,
+            1,
+            "round two should start exactly one follow-up turn",
+        )
+        self.assertEqual(self.codex.panes, ["%90"])
+
+    def test_another_origin_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        os.environ["TMUX_PANE"] = "%777"
+
+        with self.assertRaisesRegex(
+            self.bridge.NoLiveSessionError, "No live review session"
+        ):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+        self.assertEqual(self.codex.panes, ["%90"])
+
+    def test_another_worktree_recovers_nothing(self):
+        self.kill_the_driver()
+        self.worktree_root = str(self.root / "another-worktree")
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_a_dead_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        self.codex.panes.clear()
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_a_record_from_before_recovery_names_no_turn_to_wait_on(self):
+        state = self.kill_the_driver()
+        del state["marker"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(target=None, recover_session=True))
+
+    def test_nothing_to_recover_exits_distinguishably_from_a_failed_review(self):
+        with mock.patch.object(sys, "argv", [
+            "tui_review_bridge.py", "--recover-session", "--cwd", str(self.worktree),
+        ]):
+            code = self.bridge.main()
+
+        self.assertEqual(code, self.bridge.NO_LIVE_SESSION_EXIT)
+        self.assertNotEqual(self.bridge.NO_LIVE_SESSION_EXIT, 1)
+        self.assertEqual(self.codex.panes, [])
+
+
+STUB_WRITER = '''#!/usr/bin/env python3
+"""Stands in for the consumer's machine-log writer.
+
+`--machine-log` is a consumer-supplied seam: the consumer owns the writer and
+the line it writes, this lane owns the call. So this stub records the argv it
+was handed — the whole of what the lane is responsible for — and reports the one
+failure the lane must survive, a log path it cannot append to.
+"""
+
+import json
+import pathlib
+import sys
+
+arguments = sys.argv[1:]
+calls = pathlib.Path(sys.argv[0]).with_name("calls.jsonl")
+with calls.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+
+log = pathlib.Path(arguments[arguments.index("--log") + 1])
+try:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.open("a", encoding="utf-8").close()
+except OSError:
+    sys.exit(1)
+'''
+
+
+class MachineLogTests(FakePaneTestCase):
+    """The pair of `review` calls every review makes to the machine-log writer.
+
+    The bridge is the caller because it is the only party that deterministically
+    knows both that a review started and that it ended: the reviewed child may
+    skip a line it was asked for in prose, and a child whose session dies
+    mid-review can never report the end at all.
+
+    The writer itself belongs to whichever consumer configured `--machine-log`,
+    and is tested in that consumer's own suite; the lane's responsibility ends at
+    the argv it hands over, so that argv is what these tests pin.
+    """
+
+    TICKET = "26"
+    MODEL = "gpt-5.6-luna"
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.root / "run" / "log.jsonl"
+        writer = self.root / "machine_log.py"
+        writer.write_text(STUB_WRITER, encoding="utf-8")
+        self.calls_file = writer.with_name("calls.jsonl")
+        self.enter(mock.patch.object(self.bridge, "MACHINE_LOG", writer))
+
+    def main(self, *arguments):
+        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout):
+                return self.bridge.main()
+
+    def review_argv(self, *arguments, timeout="5"):
+        return (
+            "HEAD",
+            "--model", self.MODEL,
+            "--effort", "max",
+            "--timeout", timeout,
+            "--startup-timeout", "5",
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+        )
+
+    def reviews(self):
+        """Every `review` call the bridge made, read back as the flags it passed."""
+        if not self.calls_file.exists():
+            return []
+        records = []
+        for line in self.calls_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            arguments = json.loads(line)
+            if "review" not in arguments:
+                continue
+            records.append({
+                flag.lstrip("-"): value
+                for flag, value in zip(arguments, arguments[1:])
+                if flag.startswith("--")
+            })
+        return records
+
+    def assertPair(self, records):
+        """Exactly one `running` call and its `returned` pair, for this ticket, in that order."""
+        self.assertEqual([record["state"] for record in records], ["running", "returned"])
+        for record in records:
+            self.assertEqual(record["ticket"], self.TICKET)
+            # Vendor then model, the spelling the dashboard's annotation row prints verbatim.
+            self.assertEqual(record["lane"], f"codex {self.MODEL}")
+            # Absolute where the path entered, so no working directory can move
+            # what the consumer's writer is pointed at.
+            self.assertEqual(record["log"], os.path.abspath(str(self.machine_log)))
+
+    def test_a_review_leaves_its_running_line_and_its_returned_pair(self):
+        self.codex.finish("two spec findings, one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertPair(self.reviews())
+
+    def test_a_review_with_no_log_configured_writes_nothing(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            "HEAD", "--model", self.MODEL, "--timeout", "5", "--startup-timeout", "5"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.reviews(), [])
+        self.assertFalse(self.machine_log.exists())
+
+    def test_a_review_that_never_came_back_still_writes_its_returned_line(self):
+        """The turn never finishes, so the review fails — and the row must not stay standing."""
+        code = self.main(*self.review_argv(timeout="0.2"))
+
+        self.assertEqual(code, 1)
+        self.assertPair(self.reviews())
+
+    def test_a_log_that_cannot_be_written_leaves_the_exit_status_alone(self):
+        blocked = self.root / "not-a-directory"
+        blocked.write_text("this is a file, so nothing can be created beneath it\n")
+        self.machine_log = blocked / "log.jsonl"
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+
+    def test_round_two_writes_its_own_pair_for_the_same_ticket(self):
+        self.codex.finish("round one findings")
+        self.main(*self.review_argv())
+        session = self.stored_session()["reviewSessionId"]
+
+        code = self.main(*self.review_argv("--resume-session", session))
+
+        self.assertEqual(code, 0)
+        records = self.reviews()
+        self.assertEqual(
+            [record["state"] for record in records],
+            ["running", "returned", "running", "returned"],
+        )
+        self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
+
+
+class RecoveryParserTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+
+    def test_recovery_needs_no_target(self):
+        args = self.bridge.parse_args(["--recover-session"])
+
+        self.assertTrue(args.recover_session)
+        self.assertIsNone(args.target)
+
+    def test_a_review_still_requires_its_target(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(["--cwd", "/workspace/ticket-13"])
+
+    def test_recovery_and_resume_are_exclusive(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(
+                ["--recover-session", "--resume-session", "session-13"]
+            )
+
+    def test_recovery_takes_no_target(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(["--recover-session", "HEAD"])
+
+
+class LaunchHookTests(unittest.TestCase):
+    """The review pane is a child launch, so the project's hook covers it too.
+
+    A project that configures no hook gets what it got before the hook existed:
+    the pane inherits the caller's environment and nothing is called.
+    """
+
+    TAG = "CREW_LAUNCH_TAG"
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.work.name)
+        self.marker = self.root / "launched.log"
+        self.addCleanup(self.work.cleanup)
+
+    def marker_lines(self):
+        return marker_lines(self.marker)
+
+    def launch(self, pane_id):
+        fake = FakeSubprocess(stdout=f"{pane_id}\n")
+        with mock.patch.object(self.bridge, "subprocess", fake):
+            returned = self.bridge.launch_pane(
+                base_args(cwd=str(self.root), tmux_target="%1"),
+                self.root / "runtime",
+            )
+        self.assertEqual(returned, pane_id)
+
+    def test_an_unconfigured_hook_launches_the_pane_untouched(self):
+        self.launch("%42")
+
+        self.assertEqual(self.marker_lines(), [])
+
+    def test_the_command_runs_once_for_the_pane_it_launched(self):
+        write_hook_config(
+            self.root,
+            command=f'printf "%s\\n" "$AGENTCREW_CHILD_TMUX_TARGET" >> {self.marker}',
+        )
+
+        self.launch("%42")
+
+        self.assertEqual(self.marker_lines(), ["%42"])
+
+    def test_a_child_of_an_unconfigured_hook_gets_no_extra_environment(self):
+        hook = self.bridge.launch_hook.load_hook(self.root)
+
+        self.assertEqual(self.bridge.child_session_env(hook), dict(os.environ))
+
+    def test_the_configured_variables_reach_the_codex_child(self):
+        write_hook_config(self.root, env={self.TAG: "ticket-133"})
+
+        hook = self.bridge.launch_hook.load_hook(self.root)
+
+        self.assertEqual(self.bridge.child_session_env(hook)[self.TAG], "ticket-133")
+
+
+if __name__ == "__main__":
+    unittest.main()

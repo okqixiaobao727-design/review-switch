@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+.review-switch-local-identifiers
+.code-review-graph/
+.venv/
+build/
+dist/
