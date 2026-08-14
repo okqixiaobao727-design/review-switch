@@ -18,6 +18,10 @@ Register `hook/review-adjudicator.sh` as a Claude Code `PreToolUse` hook matchin
 Both lanes depend on the `mattpocock-skills` plugin: the CC Lane invokes
 `mattpocock-skills:code-review` directly, and the Codex Lane uses it as its hard-error fallback.
 
+The Codex Lane additionally needs `aiohttp` (`pip install aiohttp`) installed for the Python
+interpreter Claude Code runs, because its review bridge imports it; the CC Lane needs nothing
+beyond the plugin. Running the test suites additionally needs `pytest`.
+
 ## Skills
 
 - `/review-switch` selects the configured reviewer lane.
