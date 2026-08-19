@@ -1005,6 +1005,405 @@ class MachineLogTests(FakePaneTestCase):
         self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
 
 
+
+def token_count(usage):
+    """One `token_count` event, in the shape a Codex rollout writes it."""
+    return {
+        "timestamp": "2026-08-18T04:00:00.000Z",
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": usage}},
+    }
+
+
+def turn_context(model):
+    """One `turn_context` line, which is where a rollout says which model the turn resolved to."""
+    return {
+        "timestamp": "2026-08-18T04:00:00.000Z",
+        "type": "turn_context",
+        "payload": {"model": model, "cwd": "/workspace"},
+    }
+
+
+def write_rollout(root, thread_id, records, day="2026/08/18"):
+    """One rollout file, under the dated tree and named the way Codex names it."""
+    directory = root / day
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"rollout-2026-08-18T04-00-00-{thread_id}.jsonl"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return path
+
+
+# One round's cumulative counters, as Codex reports them: `input_tokens` counts the cached ones
+# inside itself, and `reasoning_output_tokens` counts a subset of `output_tokens`.
+ROUND_ONE_USAGE = {
+    "input_tokens": 200000,
+    "cached_input_tokens": 180000,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 9000,
+    "reasoning_output_tokens": 6000,
+    "total_tokens": 209000,
+}
+ROUND_TWO_USAGE = {
+    "input_tokens": 350000,
+    "cached_input_tokens": 310000,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 15000,
+    "reasoning_output_tokens": 9000,
+    "total_tokens": 365000,
+}
+# The same figures after the mapping the spec pins: cache-read is the cached count, input is what
+# is left of the input count once the cached ones are out of it, cache-creation is the write
+# count, and output keeps its reasoning tokens inside it rather than beside them.
+ROUND_ONE_COUNTERS = {
+    "input": 20000, "output": 9000, "cache_read": 180000, "cache_creation": 0,
+}
+ROUND_TWO_COUNTERS = {
+    "input": 40000, "output": 15000, "cache_read": 310000, "cache_creation": 0,
+}
+RESOLVED_MODEL = "gpt-5.6-sol"
+
+
+class RolloutHarvestTests(unittest.TestCase):
+    """Reading what a Codex review spent out of the rollout its thread id names.
+
+    A pure read of a file the lane already wrote: no model token is spent to obtain it, and every
+    way it can fail answers with the diagnosis that goes in the `session-cost` line instead.
+    """
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.sessions = pathlib.Path(self.work.name) / "sessions"
+
+    def harvest(self, thread_id="thread-ticket-13"):
+        return self.bridge.harvest_rollout(self.sessions, thread_id)
+
+    def test_a_rollout_is_found_by_the_thread_id_its_filename_ends_in(self):
+        write_rollout(
+            self.sessions, "thread-ticket-13",
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+        )
+        write_rollout(
+            self.sessions, "another-thread",
+            [turn_context("gpt-5.6-luna"), token_count(ROUND_TWO_USAGE)],
+        )
+
+        counters, model, detail = self.harvest()
+
+        self.assertIsNone(detail)
+        self.assertEqual(counters, ROUND_ONE_COUNTERS)
+        self.assertEqual(model, RESOLVED_MODEL)
+
+    def test_the_counters_are_de_overlapped_so_they_sum_to_the_total_codex_reported(self):
+        write_rollout(
+            self.sessions, "thread-ticket-13",
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+        )
+
+        counters, _model, _detail = self.harvest()
+
+        self.assertEqual(sum(counters.values()), ROUND_ONE_USAGE["total_tokens"])
+
+    def test_a_resumed_round_is_read_as_one_review_from_the_last_cumulative_count(self):
+        """Round two appends to the same rollout, and its counters already cover round one."""
+        write_rollout(
+            self.sessions, "thread-ticket-13",
+            [
+                turn_context(RESOLVED_MODEL),
+                token_count(ROUND_ONE_USAGE),
+                turn_context(RESOLVED_MODEL),
+                token_count(ROUND_TWO_USAGE),
+            ],
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(detail)
+        self.assertEqual(counters, ROUND_TWO_COUNTERS)
+
+    def test_a_rollout_that_counted_nothing_is_diagnosed_rather_than_billed_at_zero(self):
+        path = write_rollout(
+            self.sessions, "thread-ticket-13", [turn_context(RESOLVED_MODEL)]
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIn(str(path), detail)
+
+    def test_a_thread_with_no_rollout_on_disk_is_diagnosed(self):
+        write_rollout(self.sessions, "another-thread", [token_count(ROUND_ONE_USAGE)])
+
+        counters, model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIsNone(model)
+        self.assertIn("thread-ticket-13", detail)
+        self.assertIn(str(self.sessions), detail)
+
+    def test_a_count_that_contradicts_itself_is_diagnosed_rather_than_invented(self):
+        """More cached tokens than input tokens is not a figure to clamp into shape."""
+        path = write_rollout(
+            self.sessions, "thread-ticket-13",
+            [
+                turn_context(RESOLVED_MODEL),
+                token_count({
+                    "input_tokens": 100,
+                    "cached_input_tokens": 400,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 50,
+                    "reasoning_output_tokens": 10,
+                    "total_tokens": 150,
+                }),
+            ],
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIn(str(path), detail)
+
+    def test_a_count_that_does_not_add_up_to_its_own_total_is_diagnosed(self):
+        """The four mapped counters are the source's own total, or they are not its counters."""
+        write_rollout(
+            self.sessions, "thread-ticket-13",
+            [
+                turn_context(RESOLVED_MODEL),
+                token_count(dict(ROUND_ONE_USAGE, total_tokens=209001)),
+            ],
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIsNotNone(detail)
+
+    def test_a_count_missing_one_of_its_figures_is_diagnosed_rather_than_read_as_zero(self):
+        missing = dict(ROUND_ONE_USAGE)
+        missing.pop("cache_write_input_tokens")
+        write_rollout(
+            self.sessions, "thread-ticket-13",
+            [turn_context(RESOLVED_MODEL), token_count(missing)],
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIsNotNone(detail)
+
+    def test_a_line_that_does_not_parse_mid_rollout_is_diagnosed(self):
+        """A hole in the history is not a line to skip: what came after it is unaccounted for."""
+        path = write_rollout(
+            self.sessions, "thread-ticket-13",
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8") + "{not json at all\n"
+            + json.dumps(token_count(ROUND_TWO_USAGE)) + "\n",
+            encoding="utf-8",
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIn(str(path), detail)
+
+    def test_an_unreadable_last_count_is_diagnosed_rather_than_answered_by_an_older_one(self):
+        """The last count is the thread's word on what it spent; an older one is not a stand-in."""
+        path = write_rollout(
+            self.sessions, "thread-ticket-13",
+            [
+                turn_context(RESOLVED_MODEL),
+                token_count(ROUND_ONE_USAGE),
+                {
+                    "timestamp": "2026-08-18T04:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "info": {}},
+                },
+            ],
+        )
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(counters)
+        self.assertIn(str(path), detail)
+
+    def test_a_half_written_last_line_does_not_lose_the_count_before_it(self):
+        """The pane may still be writing, so a truncated tail is not a lost review."""
+        path = write_rollout(
+            self.sessions, "thread-ticket-13",
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+        )
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write('{"timestamp": "2026-08-18T04:0')
+
+        counters, _model, detail = self.harvest()
+
+        self.assertIsNone(detail)
+        self.assertEqual(counters, ROUND_ONE_COUNTERS)
+
+
+
+class SessionCostTests(FakePaneTestCase):
+    """The one `session-cost` call a Codex review makes beside its `review` pair.
+
+    Same seam as the `review` pair, tested the same way: the writer belongs to
+    the consumer that configured `--machine-log`, so what this lane is
+    responsible for is the argv it hands over, and that argv is what these
+    tests pin.
+    """
+
+    TICKET = "26"
+    MODEL_ALIAS = "sol"
+
+    def setUp(self):
+        super().setUp()
+        self.machine_log = self.root / "run" / "log.jsonl"
+        writer = self.root / "machine_log.py"
+        writer.write_text(STUB_WRITER, encoding="utf-8")
+        self.calls_file = writer.with_name("calls.jsonl")
+        self.enter(mock.patch.object(self.bridge, "MACHINE_LOG", writer))
+        self.codex_home = self.root / "codex-home"
+        os.environ["CODEX_HOME"] = str(self.codex_home)
+        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+
+    def write_rollout(self, records, thread_id=None):
+        return write_rollout(
+            self.codex_home / "sessions",
+            thread_id or self.codex.thread_id,
+            records,
+        )
+
+    def main(self, *arguments):
+        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout):
+                return self.bridge.main()
+
+    def review_argv(self, *arguments):
+        return (
+            "HEAD",
+            "--model", self.MODEL_ALIAS,
+            "--timeout", "5",
+            "--startup-timeout", "5",
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+        )
+
+    def costs(self):
+        """Every `session-cost` call the bridge made, read back as the flags it passed."""
+        if not self.calls_file.exists():
+            return []
+        records = []
+        for line in self.calls_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            arguments = json.loads(line)
+            if "session-cost" not in arguments:
+                continue
+            records.append({
+                flag.lstrip("-"): value
+                for flag, value in zip(arguments, arguments[1:])
+                if flag.startswith("--")
+            })
+        return records
+
+    def test_a_review_records_what_its_thread_spent(self):
+        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
+        self.codex.finish("one spec finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        costs = self.costs()
+        self.assertEqual(len(costs), 1, costs)
+        entry = costs[0]
+        self.assertEqual(entry["ticket"], self.TICKET)
+        self.assertEqual(entry["executor"], "codex")
+        self.assertEqual(entry["lane"], f"codex {self.MODEL_ALIAS}")
+        self.assertEqual(entry["session"], self.codex.thread_id)
+        # The model the thread resolved to, not the alias the caller asked for.
+        self.assertEqual(entry["model"], RESOLVED_MODEL)
+        # Every counter reaches the writer as the string a command line carries.
+        self.assertEqual(entry["input-tokens"], str(ROUND_ONE_COUNTERS["input"]))
+        self.assertEqual(entry["output-tokens"], str(ROUND_ONE_COUNTERS["output"]))
+        self.assertEqual(entry["cache-read-tokens"], str(ROUND_ONE_COUNTERS["cache_read"]))
+        self.assertEqual(
+            entry["cache-creation-tokens"], str(ROUND_ONE_COUNTERS["cache_creation"])
+        )
+        self.assertEqual(entry["total-tokens"], str(ROUND_ONE_USAGE["total_tokens"]))
+        self.assertNotIn("detail", entry)
+
+    def test_a_review_whose_rollout_is_missing_records_the_diagnosis(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        entry = self.costs()[0]
+        self.assertIn(self.codex.thread_id, entry["detail"])
+        self.assertNotIn("total-tokens", entry)
+
+    def test_a_review_that_never_came_back_records_the_diagnosis(self):
+        """The turn never finishes, so there is nothing to read — and the call still goes out."""
+        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
+
+        code = self.main(
+            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "0.2",
+            "--startup-timeout", "5", "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+        )
+
+        self.assertEqual(code, 1)
+        entry = self.costs()[0]
+        self.assertEqual(entry["lane"], f"codex {self.MODEL_ALIAS}")
+        self.assertTrue(entry["detail"])
+        self.assertNotIn("total-tokens", entry)
+
+    def test_a_failed_second_round_still_names_the_thread_it_spent_in(self):
+        """Naming it is what keeps a same-vendor review out of the reviewed child's figures."""
+        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
+        self.codex.finish("round one findings")
+        self.main(*self.review_argv())
+        session = self.stored_session()["reviewSessionId"]
+        self.codex.status = "in_progress"
+
+        code = self.main(
+            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "0.2",
+            "--startup-timeout", "5", "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET, "--resume-session", session,
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.costs()[-1]["session"], self.codex.thread_id)
+
+    def test_a_rollout_that_names_no_model_records_no_model_rather_than_the_alias(self):
+        """The alias is already on the row, in the lane; the model field is a measurement."""
+        self.write_rollout([token_count(ROUND_ONE_USAGE)])
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.costs()[0]["model"], "")
+
+    def test_a_review_with_no_log_configured_records_no_cost(self):
+        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
+        self.codex.finish("no findings")
+
+        code = self.main(
+            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "5", "--startup-timeout", "5"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.costs(), [])
+
+
 class RecoveryParserTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
