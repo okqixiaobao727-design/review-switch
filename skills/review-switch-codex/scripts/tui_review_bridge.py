@@ -75,6 +75,25 @@ MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
 # The vendor half of the lane this bridge reviews in. The model half is whatever
 # the lineage was pinned to, so the lane needs no argument of its own.
 REVIEW_VENDOR = "codex"
+# The four disjoint counters a `session-cost` line carries, in the machine log's
+# own spelling.
+COUNTERS = ("input", "output", "cache_read", "cache_creation")
+# Where Codex keeps the rollout of every thread it has run, one JSONL file per
+# thread under a dated tree, each filename ending in the thread's own id.
+CODEX_HOME_ENV_VAR = "CODEX_HOME"
+CODEX_HOME_DEFAULT = ".codex"
+ROLLOUT_DIRECTORY = "sessions"
+ROLLOUT_GLOB = "**/*.jsonl"
+# The counters a rollout's cumulative `total_token_usage` must carry for it to be
+# read at all. `reasoning_output_tokens` is not among them: it counts a subset of
+# the output tokens rather than a fifth pot, and nothing here needs it.
+# A `token_count` event that carried no usage object: held apart from "no count at all", because
+# what it means is that this thread's last word on what it spent is unreadable.
+MALFORMED_COUNT = object()
+ROLLOUT_USAGE_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "output_tokens", "total_tokens",
+)
 
 
 class AppServerError(RuntimeError):
@@ -104,6 +123,9 @@ class ReviewEvent:
         # field verbatim after collapsing whitespace, so this is the spelling the
         # dashboard shows.
         self.lane = " ".join(part for part in (vendor, model) if part)
+        # A review leaves exactly one cost line per call, whether it came back
+        # with figures or with the reason there are none.
+        self.costed = False
 
     def write(self, state):
         """Append one end of this review; returns nothing, and fails at nothing.
@@ -126,6 +148,180 @@ class ReviewEvent:
             )
         except OSError:
             pass
+
+    def cost(self, session, model, counters, detail):
+        """Append this review's one `session-cost` line; returns nothing, and fails at nothing.
+
+        Lane-tagged, so a review's spend is told apart from the implementing
+        child's, and written through the log's own writer, which holds the
+        figures-or-diagnosis rule: `counters` are the four disjoint totals, or
+        `None` with `detail` saying why nobody could tell.
+
+        Accounting must never fail a review, so every way this can go wrong is
+        swallowed here, exactly as the `review` pair's write is.
+        """
+        if not self.log or not self.ticket:
+            return
+        self.costed = True
+        command = [
+            sys.executable, str(MACHINE_LOG), "--log", str(self.log),
+            "session-cost", "--ticket", str(self.ticket),
+            "--executor", REVIEW_VENDOR, "--model", model or "", "--lane", self.lane,
+        ]
+        if session:
+            command += ["--session", str(session)]
+        if counters is None:
+            command += ["--detail", detail]
+        else:
+            for name in COUNTERS:
+                command += [f"--{name.replace('_', '-')}-tokens", str(counters[name])]
+            command += ["--total-tokens", str(sum(counters.values()))]
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=False)
+        except OSError:
+            pass
+
+
+def codex_sessions_root(environment=None):
+    """The directory Codex writes its rollouts under, wherever this machine keeps it."""
+    environment = os.environ if environment is None else environment
+    home = environment.get(CODEX_HOME_ENV_VAR)
+    root = pathlib.Path(home) if home else pathlib.Path.home() / CODEX_HOME_DEFAULT
+    return root / ROLLOUT_DIRECTORY
+
+
+def find_rollout(root, thread_id):
+    """The rollout file this thread wrote, or `None` where the tree holds none.
+
+    The id glob is the lookup: Codex names every rollout for the thread it
+    belongs to, so the filename ending in the id the bridge already holds is the
+    file, without reading a line of any other.
+    """
+    try:
+        found = sorted(
+            path for path in root.glob(ROLLOUT_GLOB) if path.stem.endswith(thread_id)
+        )
+    except OSError:
+        return None
+    return found[-1] if found else None
+
+
+def rollout_counters(usage):
+    """Codex's cumulative counters as the machine log's four disjoint ones, or `None`.
+
+    Codex counts its cached tokens inside `input_tokens`, so they come back out
+    here, and its reasoning tokens inside `output_tokens`, where they stay: the
+    four that come out are disjoint, and their sum is the total Codex itself
+    reported.
+
+    `None` is every way the source does not hold together — a counter missing,
+    not a count, or negative; more cached tokens than input tokens; a mapping
+    that does not add up to the reported total. A figure invented out of a
+    contradiction is worse than the diagnosis that says the rollout could not be
+    read, because nothing downstream can tell it apart from a measurement.
+    """
+    counts = {}
+    for name in ROLLOUT_USAGE_FIELDS:
+        value = usage.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        counts[name] = value
+    cached = counts["cached_input_tokens"]
+    if cached > counts["input_tokens"]:
+        return None
+    counters = {
+        "input": counts["input_tokens"] - cached,
+        "output": counts["output_tokens"],
+        "cache_read": cached,
+        "cache_creation": counts["cache_write_input_tokens"],
+    }
+    if sum(counters.values()) != counts["total_tokens"]:
+        return None
+    return counters
+
+
+def harvest_rollout(root, thread_id):
+    """What one review thread spent: `(counters, model, detail)`, read off its rollout.
+
+    A read of a file the lane already wrote, so it costs no model token and drives
+    nothing. `counters` is `None` when the figures could not be read, and `detail`
+    then says why, which is the diagnosis the `session-cost` line carries instead.
+
+    The **last** cumulative count is the answer: every turn appends one, and a
+    resumed round two appends to the same file, so one read covers a whole review
+    however many rounds it had.
+
+    Only the file's last line is forgiven for not parsing: the pane this reads
+    behind is still attached, so that one may be half written and is unbilled
+    either way. A line that does not parse with more of the rollout written after
+    it is a hole in the history, and is diagnosed rather than quietly skipped.
+    """
+    path = find_rollout(root, thread_id)
+    if path is None:
+        return None, None, f"no Codex rollout under {root} ends in {thread_id}"
+    reported = None
+    model = None
+    unparsed_last = False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if unparsed_last:
+                    return None, model, f"{path} carries a line that does not parse"
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    unparsed_last = True
+                    continue
+                if not isinstance(record, dict):
+                    unparsed_last = True
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if record.get("type") == "turn_context" and payload.get("model"):
+                    model = payload["model"]
+                if payload.get("type") == "token_count":
+                    info = payload.get("info")
+                    usage = info.get("total_token_usage") if isinstance(info, dict) else None
+                    # The count this event carries, whatever shape it is in: a `token_count`
+                    # whose usage is missing or is not an object is not an event to skip back
+                    # past, because the count before it is no longer this thread's last word.
+                    reported = usage if isinstance(usage, dict) else MALFORMED_COUNT
+    except OSError as error:
+        return None, model, f"{path} could not be read: {error.strerror}"
+    if reported is None:
+        return None, model, f"{path} reports no token count"
+    if reported is MALFORMED_COUNT:
+        return None, model, f"{path}'s last token count reports no usage"
+    counters = rollout_counters(reported)
+    if counters is None:
+        return None, model, f"{path} reports a token count that does not hold together"
+    return counters, model, None
+
+
+def resumed_thread_id(args):
+    """The thread a resumed call was about to review, or `None` when it names none.
+
+    A failed round still spent tokens in that thread, and the id is what keeps its rollout out of
+    a same-vendor child's figures, so the diagnosis row names it wherever the record survives.
+    """
+    if not getattr(args, "resume_session", None):
+        return None
+    try:
+        return SessionStore().read(args.resume_session).get("threadId")
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def record_review_cost(review, thread_id):
+    """Leave this review's one `session-cost` line, harvested from its own rollout.
+
+    The model recorded is the one the thread resolved to and nothing else: the
+    alias the caller asked for is already on the row, in the lane, and writing it
+    into the model field would dress a guess up as a measurement.
+    """
+    counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
+    review.cost(thread_id, model, counters, detail)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1240,7 +1436,7 @@ async def run_recovered_review(args, owner, store):
     )
 
 
-async def run_bridge(args):
+async def run_bridge(args, review=None):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
     owner = resolve_owner(args)
@@ -1269,6 +1465,10 @@ async def run_bridge(args):
         cleanup_required = should_cleanup_session(turn, final_message)
         if cleanup_required:
             cleanup_session(state, store)
+    if review is not None:
+        # Once the turn has settled, so the rollout's last cumulative count is
+        # the whole of what this review spent.
+        record_review_cost(review, state["threadId"])
     output = {
         "status": turn.get("status"),
         "reviewSessionId": state["reviewSessionId"],
@@ -1373,7 +1573,7 @@ def main():
     review = ReviewEvent(args.machine_log, args.ticket, args.model)
     review.write("running")
     try:
-        return asyncio.run(run_bridge(args))
+        return asyncio.run(run_bridge(args, review))
     except NoLiveSessionError as error:
         print(str(error), file=sys.stderr)
         return NO_LIVE_SESSION_EXIT
@@ -1381,6 +1581,14 @@ def main():
         print(str(error), file=sys.stderr)
         return 1
     finally:
+        # A review that never came back read no counters, and one that is left
+        # out of the log entirely is the blind spot this event exists to close:
+        # the diagnosis goes in where the figures cannot.
+        if not review.costed:
+            review.cost(
+                resumed_thread_id(args), None, None,
+                "this review returned no result to read a cost from",
+            )
         review.write("returned")
 
 
