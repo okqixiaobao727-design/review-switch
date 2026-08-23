@@ -1999,6 +1999,15 @@ class RecoveryTests(FakePaneTestCase):
     owner identity to work from.
     """
 
+    def kill_the_two_axis_driver(self):
+        """Kill a `both` call after both axis records and panes are live."""
+        self.codex.error("spec", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args(axis="both"))
+        del self.codex.axis_errors["spec"]
+        states = self.stored_sessions(expected_count=2)
+        return {state["axis"]: state for state in states}
+
     def test_a_killed_driver_leaves_a_recoverable_record_and_a_live_pane(self):
         state = self.kill_the_driver()
 
@@ -2033,6 +2042,28 @@ class RecoveryTests(FakePaneTestCase):
             self.stored_session()["target"], killed["target"]
         )
 
+    def test_recovery_returns_every_live_axis_with_its_original_handle(self):
+        killed = self.kill_the_two_axis_driver()
+        self.codex.finish("standards recovered", axis="standards")
+        self.codex.finish("spec recovered", axis="spec")
+        panes_before = list(self.codex.launched_panes)
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(set(output["axes"]), {"standards", "spec"})
+        for axis in ("standards", "spec"):
+            result = output["axes"][axis]
+            self.assertTrue(result["recovered"])
+            self.assertEqual(
+                result["reviewSessionId"], killed[axis]["reviewSessionId"]
+            )
+            self.assertEqual(result["finalMessage"], f"{axis} recovered")
+        self.assertEqual(self.codex.launched_panes, panes_before)
+        self.assertEqual(len(self.codex.started_turns), turns_before)
+        self.assertEqual(self.codex.panes, [])
+
     def test_recovery_tolerates_a_record_with_no_preparation_report(self):
         state = self.kill_the_driver()
         del state["preparation"]
@@ -2063,6 +2094,32 @@ class RecoveryTests(FakePaneTestCase):
             1,
             "round two should start exactly one follow-up turn",
         )
+        self.assertEqual(self.codex.panes, [])
+
+    def test_two_recovered_axes_each_remain_resumable_for_round_two(self):
+        killed = self.kill_the_two_axis_driver()
+        self.codex.finish("round one standards", axis="standards")
+        self.codex.finish("round one spec", axis="spec")
+        self.run_bridge(self.args(recover_session=True))
+        turns_before = len(self.codex.started_turns)
+
+        for axis in ("standards", "spec"):
+            self.codex.finish(f"round two {axis}", axis=axis)
+            code, output = self.run_bridge(
+                self.args(
+                    axis=axis,
+                    resume_session=killed[axis]["reviewSessionId"],
+                )
+            )
+
+            self.assertEqual(code, 0)
+            result = output["axes"][axis]
+            self.assertEqual(
+                result["reviewSessionId"], killed[axis]["reviewSessionId"]
+            )
+            self.assertEqual(result["finalMessage"], f"round two {axis}")
+
+        self.assertEqual(len(self.codex.started_turns) - turns_before, 2)
         self.assertEqual(self.codex.panes, [])
 
     def test_another_origin_pane_recovers_nothing(self):

@@ -1847,25 +1847,22 @@ async def run_existing_review(args, owner, store):
     return AxisCompleted(state, turn)
 
 
-async def run_recovered_review(args, owner, store):
-    """Re-attach to the review this owner already has running.
+async def run_recovered_reviews(args, owner, store):
+    """Re-attach to every review axis this owner already has running.
 
-    Returns the completed or failed axis for the session this owner already owns.
+    Returns each completed or failed axis for the sessions this owner already owns.
 
     The caller reaching here has lost the handle its driver was going to print —
     the driver was killed, or its output never arrived. Everything needed to pick
     the review back up survived that death: the record on disk, the pane, and the
     thread. So this starts no pane and no thread; it finds the owner's live
-    session and waits on the turn already in flight. With no such session it
+    sessions and waits on the turns already in flight. With no such session it
     raises `NoLiveSessionError` rather than falling back to a first review.
     """
-    for state in store.find_by_owner(owner):
+    async def recover(state):
         client = await connect_existing_session(state)
         if client is None:
-            continue
-        # The record's own fixed point, so the turn already in flight is
-        # reported as what it actually reviews.
-        args.base = state["target"]
+            return None
         try:
             try:
                 _thread, turn = await wait_for_review(
@@ -1884,6 +1881,13 @@ async def run_recovered_review(args, owner, store):
         finally:
             await client.__aexit__(None, None, None)
         return AxisCompleted(state, turn)
+
+    recovered = await asyncio.gather(
+        *(recover(state) for state in store.find_by_owner(owner))
+    )
+    live = [run for run in recovered if run is not None]
+    if live:
+        return {run.state["axis"]: run for run in live}
     raise NoLiveSessionError(
         "No live review session for this tmux pane and worktree. "
         "Nothing to recover; start a review instead."
@@ -1909,8 +1913,7 @@ async def run_bridge(args, review=None):
     # block the very recovery call that clears the duplicate.
     with owner_lock(store, owner):
         if args.recover_session:
-            recovered = await run_recovered_review(args, owner, store)
-            runs = {recovered.state["axis"]: recovered}
+            runs = await run_recovered_reviews(args, owner, store)
         elif args.resume_session:
             resumed = await run_existing_review(args, owner, store)
             runs = {resumed.state["axis"]: resumed}
@@ -1927,7 +1930,7 @@ async def run_bridge(args, review=None):
                         run.state.get("paneId") if run.state else None,
                         run.state.get("runtimeDir") if run.state else None,
                     )
-                results[axis] = {
+                result = {
                     "status": "failed",
                     "finalMessage": "",
                     "reviewSessionId": (
@@ -1935,17 +1938,21 @@ async def run_bridge(args, review=None):
                     ),
                     "reason": run.reason,
                 }
-                continue
-            state = run.state
-            turn = run.turn
-            final_message = final_agent_message(turn)
-            update_session_after_turn(state, turn, args.base)
-            if not args.recover_session:
-                state["preparation"] = preparation_report(args)
-            store.write(state["reviewSessionId"], state)
-            if args.recover_session or args.resume_session:
-                cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
-            results[axis] = axis_result(state, turn, final_message)
+            else:
+                state = run.state
+                turn = run.turn
+                final_message = final_agent_message(turn)
+                target = state["target"] if args.recover_session else args.base
+                update_session_after_turn(state, turn, target)
+                if not args.recover_session:
+                    state["preparation"] = preparation_report(args)
+                store.write(state["reviewSessionId"], state)
+                if args.recover_session or args.resume_session:
+                    cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
+                result = axis_result(state, turn, final_message)
+            if args.recover_session:
+                result["recovered"] = True
+            results[axis] = result
     if review is not None:
         # Once the turn has settled, so the rollout's last cumulative count is
         # the whole of what this review spent.
