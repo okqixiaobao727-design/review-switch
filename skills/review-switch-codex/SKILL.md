@@ -1,73 +1,88 @@
 ---
 name: review-switch-codex
 description: Run a code review on the Codex lane — an isolated interactive Codex TUI lineage. Use when the review-switch dispatcher names this lane, or when the Codex reviewer is asked for by name.
-allowed-tools: Bash(python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py:*), Skill(mattpocock-skills:code-review)
+allowed-tools: Read, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py:*)
 ---
 
-Ask for a target if none was supplied. A review cycle has one isolated lineage:
+The Codex Lane is a thin coordinator. The Bridge owns review preparation: it pins the three-dot
+diff, reads the spec and standards, consults the optional code graph, and writes each Axis Brief.
+The Lane's only input work is the spec-reference discovery below. Hand the Bridge references,
+then apply the Rounds contract to its result.
 
-- **First review:** run the bridge from the repository being reviewed without a session handle.
-- **Follow-up review of the same change:** pass the exact `reviewSessionId` returned earlier in
-  this Claude conversation.
-- **Different change or no known handle:** begin a first review. A handle from another task,
-  tmux pane, worktree, or conversation is a different lineage.
+## First review
 
-Pass the caller's target through as `<TARGET>` and nothing else. The bridge states the Rounds
-contract to the reviewer itself, so the reviewing side needs no contract appended to the target
-and no skill of ours installed to follow it. The Rounds section below is this side's half of that
-same contract: what to do with the findings that come back.
+Use the caller's fixed point and axis; ask for the fixed point when it is missing, and use `both`
+when the caller leaves the axis open. When the caller supplies a spec reference, pass that
+reference untouched.
+
+When the caller supplies no spec reference, locate the reference without opening the spec:
+
+1. Identify the originating issue reference in the commit messages (`#123`, `Closes #45`, GitLab
+   `!67`, etc.) using the convention in `docs/agents/issue-tracker.md`; pass the reference rather
+   than fetching or reading the issue.
+2. Otherwise locate a spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name
+   or feature.
+3. If neither yields a reference, ask the user once where the spec is. Pass the reference they
+   provide. If they say there is none, run only the standards axis and state under `## Spec` that
+   the user confirmed no spec was available.
+
+Make one Bridge call from the repository being reviewed, with no session handle:
 
 ```bash
-# First review
-python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py -- '<TARGET>'
-
-# Follow-up in the same lineage
 python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py \
-  --resume-session '<REVIEW_SESSION_ID>' -- '<TARGET>'
-
-# Recover a review whose JSON result never arrived
-python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py --recover-session
+  --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis '<AXIS>'
 ```
 
-When a review was started but its JSON result was lost — the command was killed, its output never
-arrived, or no `reviewSessionId` is held for a review known to have started — recover rather than
-start a second one: recovery re-attaches to every live review axis this tmux pane and worktree
-already own, waits out the turns in flight, and prints each per-axis result with `recovered` true. Exit
-code 3 means no live review belongs here, and it is the only result that licenses a first review;
-starting one while the old pane lives reviews and bills the same change twice.
+For a confirmed no-spec review, omit `--spec` and pass `--axis standards`. Forward any
+caller-supplied execution options accepted by the Bridge; its `--help` is their source of truth.
 
-`--model '<MODEL>'` and `--effort '<EFFORT>'` are both optional and independent. Pass one only
-when the caller asked for that specific model or reasoning effort; omit it and Codex uses its own
-configured default. Whatever a first review pins carries through every follow-up in that lineage
-unless a follow-up passes a new value. Valid effort values differ per model, so pass a pair the
-requested model actually supports.
+The Bridge prepares both axes once and, for `both`, runs Standards and Spec concurrently in two
+Codex TUI panes. Treat `preparation` as its receipt. If that report explicitly names a gap or a
+required action, act on it exactly as named before declaring the review complete.
 
-Parse the bridge's single JSON result through `axes`; a single-axis result has exactly one axis
-entry, and a two-axis result has `standards` and `spec`. A recovered axis additionally has
-`recovered == true`, confirming that its result came from the turn already in flight:
+## Result
 
-- `status == "completed"`: retain each axis's `reviewSessionId` and return its non-empty
-  `finalMessage` under that axis. The Bridge has already closed every pane; the records keep the
-  threads resumable.
-- `status == "partially_completed"`: return every completed axis's `finalMessage` and every
-  incomplete axis's `reason`, retaining any non-empty `reviewSessionId`. Re-run a failed axis as
-  an ordinary single-axis review.
-- A hard error or malformed result: report it exactly, announce the Claude fallback, then invoke
-  `mattpocock-skills:code-review` with the caller's exact target, appending the tokens
-  `via=review-switch via=codex-fallback` to the args.
+Read the single JSON result through `axes`:
+
+- `status == "completed"`: retain every axis's `reviewSessionId` and place each non-empty
+  `finalMessage` under the matching heading.
+- `status == "partially_completed"`: place each completed axis's `finalMessage` and each
+  incomplete axis's `reason` under the matching heading. Retain every non-empty handle, then run
+  an incomplete axis again as an ordinary single-axis review.
+- A hard error or malformed result ends this lane's review. Report it exactly.
+
+Use these headings for the axes returned, preserving the Bridge's report text without merging or
+reranking it:
+
+```markdown
+## Standards
+<axes.standards.finalMessage or reason>
+
+## Spec
+<axes.spec.finalMessage or reason>
+```
+
+After a `both` review, keep the Spec handle for the one automatic re-review the Rounds contract
+allows. Keep the Standards handle too, solely so a human can wake that session by hand.
+
+## Recovery
+
+When a review started but its JSON result was lost, use the Bridge's recovery mode before
+starting another review. Recovery re-attaches to every live axis owned by this tmux pane and
+worktree; retain every recovered handle and process the result above. Exit code 3 means no live
+review belongs here and licenses a new first review. A partially complete recovery follows the
+same ordinary single-axis re-run rule.
 
 ## Rounds
 
-Classify each finding on two axes: **standards** — style, naming, convention, anything that
-leaves behaviour intact — and **spec** — correctness, security, deviation from the spec or
-ticket.
+This section is the sole authority on round capping.
 
-Fix the standards findings you accept in one pass; they are done without re-review. Spec findings
-that required fixes get one re-review, scoped to exactly those fixes. Most reviews end clean
-after the first pass — the re-review is a cap, not a stage to fill.
+Fix accepted Standards findings in one pass; Standards gets no automatic re-review. Spec
+findings that required fixes earn one re-review, using that axis's exact handle and scoped to
+exactly those fixes.
 
-When a re-review leaves a spec finding open, or the reviewer reopens a finding already ruled on,
-stop reviewing and surface the disagreement with both positions to whoever asked for the review.
+If that re-review leaves a Spec finding open, or a finding is reopened after it was ruled on,
+end the review as a disagreement and escalate both positions to whoever requested the review.
 
-**Completion criterion:** the result is shown and every Codex follow-up used the exact handle from
-its own review lineage.
+**Completion criterion:** every returned axis is reported unchanged, every preparation gap is
+handled, and every automatic follow-up stays within the Rounds cap using its own axis handle.
