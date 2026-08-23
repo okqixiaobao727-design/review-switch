@@ -1,0 +1,209 @@
+# AgentCrew configuration — the defaults this plugin ships.
+#
+# The setup wizard copies this file to `agentcrew.toml` at your project root, where you edit it
+# per repo. A project file overrides only the cells it names; every case it leaves out keeps the
+# value it has here. Everything here is an outcome: which vendor, model, and effort each
+# classification case gets. The classification logic itself — six workflows, core vs non-core,
+# complex vs routine — is fixed, so you configure the answers, not the questions.
+#
+# Every cell carries three fields:
+#   executor — `claude` or `codex`, the vendor that runs the ticket
+#   model    — a full model ID for either vendor, never an alias: the value passes verbatim from
+#              this cell to the ticket's `## Routing` line to the launch command, and an alias
+#              mis-resolves under plan mode
+#   effort   — the reasoning effort that vendor is launched at
+#
+# Each cell's name is the case that selects it. The comment above each group says what the
+# classification turns on, so the case a cell answers is readable from this file alone.
+
+# --- Implementer table ------------------------------------------------------
+# Which agent writes the ticket's code, one cell per case of `/route`'s classification.
+
+# `tdd` and `refactor` split on two axes, and the cell is the two answers hyphenated. Core:
+# downstream couples to this ticket's design decisions. Complex: it crosses modules, the spec
+# leaves the approach to the executor, or the logic is convoluted. The three cells other than
+# non-core × routine share one default; each is listed separately so any one of them can be
+# retargeted on its own.
+
+[implementer.tdd-refactor.core-complex]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.core-routine]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.non-core-complex]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+[implementer.tdd-refactor.non-core-routine]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+# `direct` — prose, docs, skill copy, config: one cell for every difficulty.
+
+[implementer.direct.any]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `spike` splits on whether the questions are enumerable up front as fill-in blanks, each naming
+# its verification method, with no recommendation in the deliverable (directed collection) — or
+# not (open exploration).
+
+[implementer.spike.directed-collection]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[implementer.spike.open-exploration]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `ops` is mechanical iff the steps are known up front and the deliverable is the record that they
+# ran; a run whose result someone has to weigh before calling it done is acceptance-judgement.
+
+[implementer.ops.mechanical]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[implementer.ops.acceptance-judgement]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# `acceptance` — finishing needs a human, so the agent's job is to prepare and hand over.
+
+[implementer.acceptance.any]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# --- Reviewer table ---------------------------------------------------------
+# `tdd` and `refactor` are the only workflows whose diff a review can catch anything in, so they
+# are the only ones that carry a reviewer, and the four cells are the same quadrant that chose the
+# implementer — no second classification. Keep the reviewer on the vendor that did not implement,
+# at the strength the stakes justify.
+
+[reviewer.core-complex]
+executor = "codex"
+model = "gpt-5.6-sol"
+effort = "medium"
+
+[reviewer.core-routine]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[reviewer.non-core-complex]
+executor = "codex"
+model = "gpt-5.6-luna"
+effort = "max"
+
+[reviewer.non-core-routine]
+executor = "claude"
+model = "claude-opus-5"
+effort = "medium"
+
+# --- Hooks ------------------------------------------------------------------
+# `command` runs once per child agent at launch, and is empty by default — set it to wire your own
+# notification or session-tracking system to crew launches. `env` adds variables to the child's
+# environment. Both empty means a child launches exactly as it would with no hook at all.
+#
+# The command runs in the child's working directory, with the `env` variables below plus two
+# naming the child that launched:
+#   AGENTCREW_CHILD_CWD          the child's working directory
+#   AGENTCREW_CHILD_TMUX_TARGET  the tmux window or pane the child runs in, empty for a child
+#                                that has none
+# The command is a courtesy to what you already run: one that fails or hangs leaves the launch
+# itself standing.
+
+[hooks.on-child-launch]
+command = ""
+
+[hooks.on-child-launch.env]
+
+# --- Dashboard --------------------------------------------------------------
+# Which surface a run draws itself on. `window` gives the run its own tmux window, as it always
+# has; `pin` skips that window and draws the same frame into the coordinator's Claude Code
+# statusline instead, so there is nothing left to close when the run ends; `both` runs each, and
+# the run's shared toast state keeps them from announcing the same thing twice. The window is the
+# shipped default for projects without the machine preference recorded by `pin-install`, so
+# upgrading agentcrew changes nobody's run. What the pin is and how it is wired in is in
+# `docs/monitor-dashboard.md`.
+
+[dashboard]
+surface = "window"
+
+# --- Merge repair -----------------------------------------------------------
+# The model the merge ladder's repair rung runs on. A mechanical merge conflict — two children
+# editing the same region, neither rewriting the other's work — is resolved by the merge driver
+# itself; the one it will not rewrite, where the file's own text carries a line that reads as a
+# conflict marker, is handed to a headless session on this model under a hard budget cap before
+# anything reaches the coordinator
+# (`docs/adr/0004-escalation-ladder-script-then-sonnet-then-coordinator.md`). Pick a cheap model:
+# the rung exists to keep mechanical work off the expensive one. A full model ID, never an alias,
+# on the same rule every other model value here follows.
+#
+# Unlike every cell above it, this key is not inherited. A project file that leaves out a model
+# cell gets this file's answer; a project file that leaves out this key gets nothing, and its run
+# stops in preflight rather than repairing on a model nobody chose. The value below is what the
+# setup wizard copies into your `agentcrew.toml`, not a fallback your run reads from here.
+
+[repair]
+model = "claude-sonnet-5"
+
+# --- Issue tracker ----------------------------------------------------------
+# Which tracker a run closes its merged tickets in, and so which close operation and which undo it
+# records (`references/trackers.md`). Two values are exercised end to end: `github`, where a ticket
+# is an issue reached through the `gh` CLI, and `local`, where a ticket is a markdown file in the
+# repo whose `Status:` line carries what a label carries on github. Anything else stops the run in
+# preflight rather than guessing a CLI.
+#
+# Not inherited either, and the one value in this file that cannot be shipped correct: it is your
+# repo's convention, the one `docs/agents/issue-tracker.md` states, and no file here can know it.
+# The value below is a placeholder the setup wizard settles against that document and confirms with
+# you. If you copied this file by hand, this is the line to check before your first run — a wrong
+# tracker does not fail, it closes your tickets in the wrong place.
+
+[tracker]
+kind = "github"
+
+# --- Accounts ---------------------------------------------------------------
+# Which Claude accounts this repo's tickets may name. An **account** is a named Claude Code login:
+# a ticket names one on its `## Routing` section's `Account:` line, and every Claude process that
+# ticket owns — its child, its reviewer, the handler that repairs its merge — runs under that
+# login and spends its subscription. A ticket naming none runs on the coordinator's own account,
+# exactly as every ticket did before this key existed, so a single-account project leaves this
+# section out entirely.
+#
+# This file holds **names, never paths**. The name-to-profile mapping is machine-level, because a
+# profile directory belongs to one machine and one person and committing it would hand every other
+# clone a configuration that is wrong and still runnable
+# (`docs/adr/0013-the-account-registry-is-not-profile-scoped.md`):
+#
+#   default location  ~/.claude/agentcrew/accounts.toml — a fixed path on the machine, resolved
+#                     from the home directory itself and deliberately NOT through
+#                     CLAUDE_CONFIG_DIR, so no coordinator's own login can select which mapping
+#                     is in force
+#   format            TOML, one `[accounts]` table of `name = "<profile directory>"` entries
+#   override          AGENTCREW_ACCOUNT_REGISTRY, an absolute path to the registry file; it moves
+#                     the one registry rather than splitting it, and it is what lets a test — or a
+#                     machine that keeps its configuration elsewhere — run without touching
+#                     `~/.claude`
+#
+# The registry file is needed only once a ticket names an account: a machine that has none runs
+# single-account waves with nothing to create. `names` below is optional and purely diagnostic —
+# declaring the names this repo expects turns a machine missing one into a message that names it,
+# rather than into a crash. A ticket naming an account this list leaves out, or one the registry
+# does not hold, stops the run in preflight; neither ever falls back to the coordinator's account.
+
+[accounts]
+names = []
