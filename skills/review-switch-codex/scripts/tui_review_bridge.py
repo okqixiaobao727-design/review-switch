@@ -64,7 +64,7 @@ HANDOFF_GRACE_SECONDS = 60
 THREAD_HANDOFF_FILENAME = "thread-id"
 DEFAULT_TIMEOUT_SECONDS = 7200
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
-SESSION_STATE_VERSION = 1
+SESSION_STATE_VERSION = 2
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Recovery found nothing to re-attach to, which is a different answer from a
 # failed review: it is the one result that licenses starting a first review.
@@ -107,6 +107,9 @@ class NoLiveSessionError(RuntimeError):
 class ReviewEvent:
     """The pair of `review` lines one bridge call leaves in the run's machine log.
 
+    Each axis thread that actually starts also leaves its own `session-cost`
+    line, so every line names one truthful session lineage and resolved model.
+
     Both the log path and the ticket are optional everywhere they appear, and a
     call given neither writes nothing: `--log` is optional on dispatch, and a run
     without one still reviews normally.
@@ -123,8 +126,8 @@ class ReviewEvent:
         # field verbatim after collapsing whitespace, so this is the spelling the
         # dashboard shows.
         self.lane = " ".join(part for part in (vendor, model) if part)
-        # A review leaves exactly one cost line per call, whether it came back
-        # with figures or with the reason there are none.
+        # A review leaves one cost line per started axis thread, whether it came
+        # back with figures or with the reason there are none.
         self.costed = False
 
     def write(self, state):
@@ -480,9 +483,6 @@ class SessionStore:
             )
         return state
 
-    def delete(self, session_id):
-        self.state_path(session_id).unlink(missing_ok=True)
-
     def find_by_owner(self, owner):
         """Returns every recoverable record this owner wrote, newest turn first.
 
@@ -713,7 +713,10 @@ class ReviewPreparation:
             )
         if axis == "spec":
             if self.spec_contents is None:
-                raise RuntimeError("spec source was not provided for the spec axis")
+                raise RuntimeError(
+                    "spec source was not provided; run with --axis standards "
+                    "when no spec exists"
+                )
             return build_spec_brief(
                 self.fixed_point, self.commit_list, self.spec_contents
             )
@@ -1006,7 +1009,7 @@ def close_pane(pane_id):
     )
 
 
-def cleanup_failed_pane(pane_id, runtime_dir):
+def cleanup_pane(pane_id, runtime_dir):
     close_pane(pane_id)
     deadline = time.monotonic() + 2
     while pane_exists(pane_id) and time.monotonic() < deadline:
@@ -1054,7 +1057,11 @@ def launch_pane(args, runtime_dir):
     tmux_command = [
         "tmux",
         "split-window",
-        "-h",
+        (
+            "-v"
+            if getattr(args, "split_direction", "horizontal") == "vertical"
+            else "-h"
+        ),
         "-P",
         "-F",
         "#{pane_id}",
@@ -1327,11 +1334,6 @@ async def start_followup_turn(client, state, prompt):
     )
 
 
-def should_cleanup_session(turn, final_message):
-    status = turn.get("status")
-    return status == "failed" or (status == "completed" and not final_message)
-
-
 def make_runtime(prompt):
     """Returns the session's runtime directory, the request recorded beside its log.
 
@@ -1346,12 +1348,13 @@ def make_runtime(prompt):
 
 def session_state(
     session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort,
-    marker,
+    marker, axis,
 ):
     now = time.time()
     return {
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
+        "axis": axis,
         "owner": owner.to_dict(),
         "runtimeDir": str(runtime_dir),
         "socketPath": str(runtime_dir / "app-server.sock"),
@@ -1393,25 +1396,79 @@ def update_session_after_turn(state, turn, target):
     state["updatedAt"] = time.time()
 
 
-def cleanup_session(state, store):
-    cleanup_failed_pane(state.get("paneId"), state.get("runtimeDir"))
-    store.delete(state["reviewSessionId"])
+def axis_result(state, turn, final_message):
+    status = turn.get("status")
+    if status == "completed" and not final_message:
+        status = "failed"
+    result = {
+        "status": status,
+        "finalMessage": final_message,
+        "reviewSessionId": state["reviewSessionId"],
+    }
+    if status != "completed":
+        if turn.get("status") == "completed":
+            result["reason"] = "review completed without a final message"
+        else:
+            result["reason"] = (
+                f"review turn ended with status {turn.get('status') or 'unknown'}"
+            )
+    return result
 
 
-async def run_new_review(args, owner, store):
+@dataclasses.dataclass(frozen=True)
+class AxisLaunch:
+    args: argparse.Namespace
+    prompt: str
+    marker: str
+    runtime_dir: pathlib.Path
+    pane_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisCompleted:
+    state: dict
+    turn: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisFailure:
+    state: dict | None
+    thread_id: str | None
+    reason: str
+
+
+class AxisRunError(Exception):
+    def __init__(self, state, thread_id, reason):
+        super().__init__(reason)
+        self.state = state
+        self.thread_id = thread_id
+        self.reason = reason
+
+
+def launch_axis(args, axis, tmux_target, split_direction):
+    axis_args = argparse.Namespace(**vars(args))
+    axis_args.axis = axis
+    axis_args.tmux_target = tmux_target
+    axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(args, bridge_id)
-
+    prompt = build_prompt(axis_args, bridge_id)
     runtime_dir = make_runtime(prompt)
-    args.tmux_target = owner.origin_pane
     try:
-        pane_id = launch_pane(args, runtime_dir)
+        pane_id = launch_pane(axis_args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
+    return AxisLaunch(axis_args, prompt, marker, runtime_dir, pane_id)
 
+
+async def drive_new_review(launch, owner, store):
+    args = launch.args
+    runtime_dir = launch.runtime_dir
+    pane_id = launch.pane_id
+    client = None
     state = None
+    thread_id = None
     try:
         client = await connect_when_ready(
             runtime_dir / "app-server.sock",
@@ -1419,41 +1476,84 @@ async def run_new_review(args, owner, store):
             args.startup_timeout,
             runtime_dir / "app-server.log",
         )
-        try:
-            thread_id = await start_thread(
-                client, cwd=args.cwd, sandbox=args.sandbox, approval=args.approval
-            )
-            await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
-            await start_turn(client, thread_id, prompt, args.model, args.effort)
-            session_id = str(uuid.uuid4())
-            state = session_state(
-                session_id,
-                owner,
-                runtime_dir,
-                pane_id,
-                thread_id,
-                args.base,
-                args.model,
-                args.effort,
-                marker,
-            )
-            state["preparation"] = preparation_report(args)
-            # The record goes down before the pane is told to attach. Handing
-            # over first would let a driver killed in between leave a live pane
-            # running a review that `--recover-session` can no longer find.
-            store.write(session_id, state)
-            # Only now does the thread have a rollout for the TUI to resume.
-            hand_off_thread(runtime_dir, thread_id)
-            thread, turn = await wait_for_review(
-                client, thread_id, marker, pane_id, args.timeout
-            )
-        finally:
+        thread_id = await start_thread(
+            client, cwd=args.cwd, sandbox=args.sandbox, approval=args.approval
+        )
+        await wait_for_mcp_startup(client, pane_id, args.startup_timeout)
+        await start_turn(
+            client, thread_id, launch.prompt, args.model, args.effort
+        )
+        session_id = str(uuid.uuid4())
+        state = session_state(
+            session_id,
+            owner,
+            runtime_dir,
+            pane_id,
+            thread_id,
+            args.base,
+            args.model,
+            args.effort,
+            launch.marker,
+            args.axis,
+        )
+        state["preparation"] = preparation_report(args)
+        # The record goes down before the pane is told to attach. Handing
+        # over first would let a driver killed in between leave a live pane
+        # running a review that `--recover-session` can no longer find.
+        store.write(session_id, state)
+        # Only now does the thread have a rollout for the TUI to resume.
+        hand_off_thread(runtime_dir, thread_id)
+        _thread, turn = await wait_for_review(
+            client, thread_id, launch.marker, pane_id, args.timeout
+        )
+    except Exception as error:
+        reason = str(error) or type(error).__name__
+        raise AxisRunError(state, thread_id, reason) from error
+    finally:
+        if client is not None:
             await client.__aexit__(None, None, None)
+    return AxisCompleted(state, turn)
+
+
+async def drive_terminal_axis(launch, owner, store):
+    try:
+        result = await drive_new_review(launch, owner, store)
+    except AxisRunError as error:
+        cleanup_pane(launch.pane_id, launch.runtime_dir)
+        return AxisFailure(error.state, error.thread_id, error.reason)
+    cleanup_pane(launch.pane_id, launch.runtime_dir)
+    return result
+
+
+async def run_new_review(args, owner, store):
+    launch = launch_axis(
+        args, args.axis, owner.origin_pane, "horizontal"
+    )
+    return await drive_terminal_axis(launch, owner, store)
+
+
+async def run_new_reviews(args, owner, store):
+    if args.preparation is not None:
+        args.preparation.brief("spec")
+    launches = []
+    try:
+        standards = launch_axis(
+            args, "standards", owner.origin_pane, "horizontal"
+        )
+        launches.append(standards)
+        spec = launch_axis(
+            args, "spec", standards.pane_id, "vertical"
+        )
+        launches.append(spec)
     except Exception:
-        if state is None:
-            cleanup_failed_pane(pane_id, runtime_dir)
+        for launch in launches:
+            cleanup_pane(launch.pane_id, launch.runtime_dir)
         raise
-    return state, thread, turn, False
+
+    completed = await asyncio.gather(
+        *(drive_terminal_axis(launch, owner, store) for launch in launches)
+    )
+    return dict(zip(("standards", "spec"), completed, strict=True))
 
 
 async def connect_existing_session(state):
@@ -1505,7 +1605,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
         store.write(state["reviewSessionId"], state)
         hand_off_thread(runtime_dir, state["threadId"])
     except Exception:
-        cleanup_failed_pane(pane_id, runtime_dir)
+        cleanup_pane(pane_id, runtime_dir)
         raise
 
     try:
@@ -1532,32 +1632,38 @@ async def run_existing_review(args, owner, store):
     # recovery path can wait on.
     state["marker"] = marker
 
-    client = await connect_existing_session(state)
-    if client is None:
-        thread, turn = await resume_session_in_new_pane(
-            args, owner, store, state, prompt, marker
-        )
-    else:
-        try:
-            store.write(state["reviewSessionId"], state)
-            await start_followup_turn(client, state, prompt)
-            thread, turn = await wait_for_review(
-                client,
-                state["threadId"],
-                marker,
-                state["paneId"],
-                args.timeout,
+    try:
+        client = await connect_existing_session(state)
+        if client is None:
+            _thread, turn = await resume_session_in_new_pane(
+                args, owner, store, state, prompt, marker
             )
-        finally:
-            await client.__aexit__(None, None, None)
-    return state, thread, turn, True
+        else:
+            try:
+                store.write(state["reviewSessionId"], state)
+                await start_followup_turn(client, state, prompt)
+                _thread, turn = await wait_for_review(
+                    client,
+                    state["threadId"],
+                    marker,
+                    state["paneId"],
+                    args.timeout,
+                )
+            finally:
+                await client.__aexit__(None, None, None)
+    except Exception as error:
+        return AxisFailure(
+            state,
+            state["threadId"],
+            str(error) or type(error).__name__,
+        )
+    return AxisCompleted(state, turn)
 
 
 async def run_recovered_review(args, owner, store):
     """Re-attach to the review this owner already has running.
 
-    Returns the same `(state, thread, turn, reused)` tuple the other two review
-    paths return, for the session this owner already owns.
+    Returns the completed or failed axis for the session this owner already owns.
 
     The caller reaching here has lost the handle its driver was going to print —
     the driver was killed, or its output never arrived. Everything needed to pick
@@ -1574,16 +1680,23 @@ async def run_recovered_review(args, owner, store):
         # reported as what it actually reviews.
         args.base = state["target"]
         try:
-            thread, turn = await wait_for_review(
-                client,
-                state["threadId"],
-                state["marker"],
-                state["paneId"],
-                args.timeout,
-            )
+            try:
+                _thread, turn = await wait_for_review(
+                    client,
+                    state["threadId"],
+                    state["marker"],
+                    state["paneId"],
+                    args.timeout,
+                )
+            except Exception as error:
+                return AxisFailure(
+                    state,
+                    state["threadId"],
+                    str(error) or type(error).__name__,
+                )
         finally:
             await client.__aexit__(None, None, None)
-        return state, thread, turn, True
+        return AxisCompleted(state, turn)
     raise NoLiveSessionError(
         "No live review session for this tmux pane and worktree. "
         "Nothing to recover; start a review instead."
@@ -1609,42 +1722,77 @@ async def run_bridge(args, review=None):
     # block the very recovery call that clears the duplicate.
     with owner_lock(store, owner):
         if args.recover_session:
-            state, thread, turn, reused = await run_recovered_review(
-                args, owner, store
-            )
+            recovered = await run_recovered_review(args, owner, store)
+            runs = {recovered.state["axis"]: recovered}
         elif args.resume_session:
-            state, thread, turn, reused = await run_existing_review(
-                args, owner, store
-            )
+            resumed = await run_existing_review(args, owner, store)
+            runs = {resumed.state["axis"]: resumed}
+        elif args.axis == "both" and not probe:
+            runs = await run_new_reviews(args, owner, store)
         else:
-            state, thread, turn, reused = await run_new_review(
-                args, owner, store
-            )
-        final_message = final_agent_message(turn)
-        update_session_after_turn(state, turn, args.base)
-        if not args.recover_session:
-            state["preparation"] = preparation_report(args)
-        store.write(state["reviewSessionId"], state)
-        cleanup_required = should_cleanup_session(turn, final_message)
-        if cleanup_required:
-            cleanup_session(state, store)
+            runs = {args.axis: await run_new_review(args, owner, store)}
+
+        results = {}
+        for axis, run in runs.items():
+            if isinstance(run, AxisFailure):
+                if args.recover_session or args.resume_session:
+                    cleanup_pane(
+                        run.state.get("paneId") if run.state else None,
+                        run.state.get("runtimeDir") if run.state else None,
+                    )
+                results[axis] = {
+                    "status": "failed",
+                    "finalMessage": "",
+                    "reviewSessionId": (
+                        run.state["reviewSessionId"] if run.state else None
+                    ),
+                    "reason": run.reason,
+                }
+                continue
+            state = run.state
+            turn = run.turn
+            final_message = final_agent_message(turn)
+            update_session_after_turn(state, turn, args.base)
+            if not args.recover_session:
+                state["preparation"] = preparation_report(args)
+            store.write(state["reviewSessionId"], state)
+            if args.recover_session or args.resume_session:
+                cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
+            results[axis] = axis_result(state, turn, final_message)
     if review is not None:
         # Once the turn has settled, so the rollout's last cumulative count is
         # the whole of what this review spent.
-        record_review_cost(review, state["threadId"])
+        for run in runs.values():
+            state = run.state
+            thread_id = (
+                run.thread_id
+                if isinstance(run, AxisFailure)
+                else state["threadId"]
+            )
+            if thread_id is not None:
+                record_review_cost(review, thread_id)
+    if args.recover_session:
+        states = [run.state for run in runs.values()]
+        preparation = next(
+            (state.get("preparation") for state in states if state is not None),
+            None,
+        )
+    else:
+        preparation = preparation_report(args)
     output = {
-        "status": turn.get("status"),
-        "reviewSessionId": state["reviewSessionId"],
-        "reused": reused,
-        "recovered": bool(args.recover_session),
-        "threadId": thread.get("id"),
-        "turnId": turn.get("id"),
-        "paneId": state["paneId"],
-        "finalMessage": final_message,
-        "preparation": state.get("preparation"),
+        "status": (
+            "completed"
+            if all(
+                result["status"] == "completed" and result["finalMessage"]
+                for result in results.values()
+            )
+            else "partially_completed"
+        ),
+        "axes": results,
+        "preparation": preparation,
     }
     print(json.dumps(output, ensure_ascii=False))
-    succeeded = turn.get("status") == "completed" and bool(output["finalMessage"])
+    succeeded = output["status"] == "completed"
     return 0 if succeeded else 1
 
 
@@ -1748,12 +1896,13 @@ def main():
         print(str(error), file=sys.stderr)
         return 1
     finally:
-        # A review that never came back read no counters, and one that is left
-        # out of the log entirely is the blind spot this event exists to close:
-        # the diagnosis goes in where the figures cannot.
-        if not review.costed:
+        # A resumed lineage may spend before the call returns enough state to
+        # harvest it. A first review that never started a thread has no session
+        # cost line: there is no lineage or spend to name truthfully.
+        resume_thread = resumed_thread_id(args)
+        if not review.costed and resume_thread:
             review.cost(
-                resumed_thread_id(args), None, None,
+                resume_thread, None, None,
                 "this review returned no result to read a cost from",
             )
         review.write("returned")
