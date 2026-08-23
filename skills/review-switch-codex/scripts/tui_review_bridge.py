@@ -321,8 +321,9 @@ def record_review_cost(review, thread_id):
     """Leave this review's one `session-cost` line, harvested from its own rollout.
 
     The model recorded is the one the thread resolved to and nothing else: the
-    alias the caller asked for is already on the row, in the lane, and writing it
-    into the model field would dress a guess up as a measurement.
+    caller's alias is already in the lane when every requested axis names the
+    same one. Mixed-model calls leave the lane vendor-only; each thread's model
+    field remains the per-axis truth either way.
     """
     counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
     review.cost(thread_id, model, counters, detail)
@@ -1040,6 +1041,43 @@ def model_config_overrides(args):
     return overrides
 
 
+def resolve_axis_choice(args, axis, choice):
+    """Resolve one axis's model or effort, with its own flag overriding the generic one."""
+    axis_choice = getattr(args, f"{axis}_{choice}", None)
+    if axis_choice is not None:
+        return axis_choice
+    return getattr(args, choice, None)
+
+
+def validate_resume_axis(args, state):
+    """Reject a caller axis that disagrees with the axis owned by the resume handle."""
+    saved_axis = state["axis"]
+    if args.axis != saved_axis:
+        raise RuntimeError(
+            f"Review session {args.resume_session} resumes axis "
+            f"'{saved_axis}', but --axis is '{args.axis}'"
+        )
+
+
+def resume_state_for_review(args):
+    """Read and validate a resumed handle before its machine-log `running` event."""
+    if not args.resume_session:
+        return None
+    state = SessionStore().read(args.resume_session)
+    validate_resume_axis(args, state)
+    return state
+
+
+def review_event_model(args, resume_state=None):
+    """Return the model shared by requested axes, including a resumed axis's saved pin."""
+    if resume_state is not None:
+        selected = resolve_axis_choice(args, resume_state["axis"], "model")
+        return selected if selected is not None else resume_state.get("model")
+    axes = ("standards", "spec") if args.axis == "both" else (args.axis,)
+    models = [resolve_axis_choice(args, axis, "model") for axis in axes]
+    return models[0] if all(model == models[0] for model in models[1:]) else None
+
+
 def run_pane(args):
     runtime_dir = pathlib.Path(args.runtime_dir)
     socket_path = runtime_dir / "app-server.sock"
@@ -1521,19 +1559,16 @@ def session_state(
 def apply_session_model_choice(args, state):
     """Reconcile a follow-up's model/effort with the ones the lineage carries.
 
-    A follow-up that names neither inherits whatever the first review pinned,
-    so the whole lineage keeps one model and one effort. Naming either one
-    repins the lineage from this turn on. A lineage that was never pinned
-    stays unpinned, which is the pre-existing behaviour.
+    The resumed record decides the axis. For each choice, that axis's flag
+    overrides the generic flag; with neither, the follow-up inherits whatever
+    its first review pinned. A lineage that was never pinned stays unpinned.
     """
-    if args.model:
-        state["model"] = args.model
-    else:
-        args.model = state.get("model")
-    if args.effort:
-        state["effort"] = args.effort
-    else:
-        args.effort = state.get("effort")
+    axis = state["axis"]
+    for choice in ("model", "effort"):
+        selected = resolve_axis_choice(args, axis, choice)
+        if selected is not None:
+            state[choice] = selected
+        setattr(args, choice, state.get(choice))
 
 
 def update_session_after_turn(state, turn, target):
@@ -1595,6 +1630,8 @@ class AxisRunError(Exception):
 def launch_axis(args, axis, tmux_target, split_direction):
     axis_args = argparse.Namespace(**vars(args))
     axis_args.axis = axis
+    for choice in ("model", "effort"):
+        setattr(axis_args, choice, resolve_axis_choice(args, axis, choice))
     axis_args.tmux_target = tmux_target
     axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
@@ -1768,7 +1805,10 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
 
 
 async def run_existing_review(args, owner, store):
-    state = store.read(args.resume_session)
+    state = getattr(args, "_resume_state", None)
+    if state is None:
+        state = store.read(args.resume_session)
+    validate_resume_axis(args, state)
     validate_session_owner(state, owner)
     apply_session_model_choice(args, state)
     bridge_id = str(uuid.uuid4())
@@ -1969,6 +2009,22 @@ def build_parser():
         "--effort",
         help="Reasoning effort for this review lineage (default: Codex config)",
     )
+    parser.add_argument(
+        "--standards-model",
+        help="Codex model for the standards axis (default: --model)",
+    )
+    parser.add_argument(
+        "--standards-effort",
+        help="Reasoning effort for the standards axis (default: --effort)",
+    )
+    parser.add_argument(
+        "--spec-model",
+        help="Codex model for the spec axis (default: --model)",
+    )
+    parser.add_argument(
+        "--spec-effort",
+        help="Reasoning effort for the spec axis (default: --effort)",
+    )
     parser.add_argument("--network", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-session")
     parser.add_argument(
@@ -2028,11 +2084,20 @@ def main():
         args = build_pane_parser().parse_args(sys.argv[2:])
         return run_pane(args)
     args = parse_args()
+    try:
+        args._resume_state = resume_state_for_review(args)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
     # The pair straddles the whole call, so the `returned` line is written on
     # every exit path this bridge controls — a review that failed, timed out, or
     # raised included. A row claiming a review that is no longer running is worse
     # than no row at all.
-    review = ReviewEvent(args.machine_log, args.ticket, args.model)
+    review = ReviewEvent(
+        args.machine_log,
+        args.ticket,
+        review_event_model(args, args._resume_state),
+    )
     review.write("running")
     try:
         return asyncio.run(run_bridge(args, review))
