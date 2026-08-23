@@ -32,7 +32,7 @@ python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py --reco
 When a review was started but its JSON result was lost — the command was killed, its output never
 arrived, or no `reviewSessionId` is held for a review known to have started — recover rather than
 start a second one: recovery re-attaches to the live review this tmux pane and worktree already
-own, waits out the turn in flight, and prints the same JSON object with `recovered` true. Exit
+owns, waits out the turn in flight, and prints the same per-axis JSON shape. Exit
 code 3 means no live review belongs here, and it is the only result that licenses a first review;
 starting one while the old pane lives reviews and bills the same change twice.
 
@@ -42,13 +42,16 @@ configured default. Whatever a first review pins carries through every follow-up
 unless a follow-up passes a new value. Valid effort values differ per model, so pass a pair the
 requested model actually supports.
 
-Parse the bridge's single JSON result:
+Parse the bridge's single JSON result through `axes`; a single-axis result has exactly one axis
+entry, and a two-axis result has `standards` and `spec`:
 
-- `status == "completed"` with a non-empty `finalMessage`: retain its `reviewSessionId`, return
-  `finalMessage` prefixed with `Reviewed by Codex (review-switch-codex)`, and leave the pane open.
-- `status == "interrupted"` with a `reviewSessionId`: retain the handle, report the exact status,
-  and leave the resumable pane open.
-- A hard error or any other result: report it exactly, announce the Claude fallback, then invoke
+- `status == "completed"`: retain each axis's `reviewSessionId` and return its non-empty
+  `finalMessage` under that axis. The Bridge has already closed every pane; the records keep the
+  threads resumable.
+- `status == "partially_completed"`: return every completed axis's `finalMessage` and every
+  incomplete axis's `reason`, retaining any non-empty `reviewSessionId`. Re-run a failed axis as
+  an ordinary single-axis review.
+- A hard error or malformed result: report it exactly, announce the Claude fallback, then invoke
   `mattpocock-skills:code-review` with the caller's exact target, appending the tokens
   `via=review-switch via=codex-fallback` to the args.
 
