@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -31,9 +32,25 @@ def load_bridge():
     return module
 
 
+class StaticPreparation:
+    def brief(self, axis):
+        return f"Read-only {axis} review"
+
+    def report(self):
+        return {
+            "fixedPoint": "resolved-main",
+            "specSource": "docs/feature.md",
+            "standardsFiles": [],
+            "codeGraphUsed": False,
+        }
+
+
 def base_args(**overrides):
     values = {
-        "target": "HEAD",
+        "base": "main",
+        "spec": "docs/feature.md",
+        "axis": "standards",
+        "preparation": StaticPreparation(),
         "cwd": "/workspace/ticket-50",
         "timeout": 1,
         "startup_timeout": 1,
@@ -50,6 +67,74 @@ def base_args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def initialize_review_repo(worktree):
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "init.defaultBranch=main",
+            "init",
+            "--quiet",
+            str(worktree),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "user.name", "Test User"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "config",
+            "user.email",
+            "test@example.com",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "config", "commit.gpgsign", "false"],
+        check=True,
+    )
+    (worktree / "README.md").write_text("baseline\n", encoding="utf-8")
+    (worktree / "AGENTS.md").write_text(
+        "Follow the documented standards.\n", encoding="utf-8"
+    )
+    (worktree / "spec.md").write_text("Feature spec.\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    fixed_point = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (worktree / "feature.py").write_text(
+        "FEATURE_ENABLED = True\n", encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "add", "feature.py"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "commit",
+            "--quiet",
+            "-m",
+            "feature change",
+        ],
+        check=True,
+    )
+    return fixed_point
 
 
 class FakeSubprocess:
@@ -389,6 +474,103 @@ class BridgeContractTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
 
+    def test_parser_accepts_the_review_preparation_inputs(self):
+        args = self.bridge.parse_args(
+            [
+                "--base",
+                "main",
+                "--spec",
+                "docs/feature.md",
+                "--axis",
+                "standards",
+            ]
+        )
+
+        self.assertEqual(args.base, "main")
+        self.assertEqual(args.spec, "docs/feature.md")
+        self.assertEqual(args.axis, "standards")
+
+    def test_parser_defaults_to_both_axes(self):
+        args = self.bridge.parse_args(
+            ["--base", "main", "--spec", "docs/feature.md"]
+        )
+
+        self.assertEqual(args.axis, "both")
+
+    def test_parser_rejects_the_old_free_text_target(self):
+        with self.assertRaises(SystemExit):
+            self.bridge.parse_args(
+                ["--base", "main", "--spec", "docs/feature.md", "review HEAD"]
+            )
+
+    def test_standards_axis_brief_matches_the_fixed_text(self):
+        brief = self.bridge.build_standards_brief(
+            "base-ref",
+            "abc1234 feature one\ndef5678 feature two",
+            ["AGENTS.md", "docs/agents/domain.md"],
+        )
+
+        self.assertEqual(
+            brief,
+            """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Diff: git diff base-ref...HEAD
+Commits:
+abc1234 feature one
+def5678 feature two
+
+Standards sources: AGENTS.md, docs/agents/domain.md
+
+Smell baseline (applies even when the repo documents nothing; the repo overrides; every smell is a judgement call; skip anything tooling enforces):
+- Mysterious Name: a function, variable, or type whose name doesn't reveal what it does or holds. → rename it; if no honest name comes, the design's murky.
+- Duplicated Code: the same logic shape appears in more than one hunk or file in the change. → extract the shared shape, call it from both.
+- Feature Envy: a method that reaches into another object's data more than its own. → move the method onto the data it envies.
+- Data Clumps: the same few fields or params keep travelling together (a type wanting to be born). → bundle them into one type, pass that.
+- Primitive Obsession: a primitive or string standing in for a domain concept that deserves its own type. → give the concept its own small type.
+- Repeated Switches: the same switch/if-cascade on the same type recurs across the change. → replace with polymorphism, or one map both sites share.
+- Shotgun Surgery: one logical change forces scattered edits across many files in the diff. → gather what changes together into one module.
+- Divergent Change: one file or module is edited for several unrelated reasons. → split so each module changes for one reason.
+- Speculative Generality: abstraction, parameters, or hooks added for needs the spec doesn't have. → delete it; inline back until a real need shows.
+- Message Chains: long a.b().c().d() navigation the caller shouldn't depend on. → hide the walk behind one method on the first object.
+- Middle Man: a class or function that mostly just delegates onward. → cut it, call the real target direct.
+- Refused Bequest: a subclass or implementer that ignores or overrides most of what it inherits. → drop the inheritance, use composition.
+
+Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words.""",
+        )
+
+    def test_spec_axis_brief_matches_the_fixed_text(self):
+        brief = self.bridge.build_spec_brief(
+            "base-ref",
+            "abc1234 feature one\ndef5678 feature two",
+            "Feature title\n\nThe feature must keep the contract.",
+        )
+
+        self.assertEqual(
+            brief,
+            """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Diff: git diff base-ref...HEAD
+Commits:
+abc1234 feature one
+def5678 feature two
+
+Spec:
+Feature title
+
+The feature must keep the contract.
+
+Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words.""",
+        )
+
+    def test_standards_brief_names_the_documented_fallback(self):
+        brief = self.bridge.build_standards_brief(
+            "main", "abc123 feature change", []
+        )
+
+        self.assertIn(
+            "Standards sources: none documented; baseline only", brief
+        )
+
     def test_owner_uses_origin_pane_and_canonical_worktree(self):
         environment = {
             "TMUX": "/private/tmp/tmux-501/default,11028,2",
@@ -521,7 +703,16 @@ class BridgeContractTests(unittest.TestCase):
 
     def test_parser_exposes_explicit_resume_handle(self):
         args = self.bridge.build_parser().parse_args(
-            ["--resume-session", "session-ticket-50", "HEAD"]
+            [
+                "--base",
+                "main",
+                "--spec",
+                "docs/feature.md",
+                "--axis",
+                "spec",
+                "--resume-session",
+                "session-ticket-50",
+            ]
         )
         self.assertEqual(args.resume_session, "session-ticket-50")
 
@@ -554,24 +745,43 @@ class BridgeContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
                 store.read("../another-task")
 
-    def test_review_prompts_carry_the_request_and_name_no_skill(self):
-        for prompt in (
-            self.bridge.build_prompt(base_args(), "bridge-1"),
-            self.bridge.build_prompt(base_args(), "bridge-1", followup=True),
+    def test_review_prompts_carry_the_axis_brief_and_no_rounds_contract(self):
+        preparation = self.bridge.ReviewPreparation(
+            fixed_point="main",
+            resolved_fixed_point="abc123",
+            commit_list="def456 feature change",
+            spec_source="docs/feature.md",
+            spec_contents="Feature spec.",
+            standards_files=("AGENTS.md",),
+        )
+        prompt = self.bridge.build_prompt(
+            base_args(preparation=preparation), "bridge-1"
+        )
+
+        for marker in (
+            "$code-review",
+            "/code-review",
+            "mattpocock-skills",
+            "Rounds contract",
+            "one re-review",
+            "coordinator",
         ):
-            for marker in ("$code-review", "/code-review", "mattpocock-skills"):
-                self.assertNotIn(marker, prompt)
-            self.assertIn("HEAD", prompt)
-            self.assertIn("Rounds contract", prompt)
-            self.assertIn("two axes", prompt)
-            self.assertIn("standards", prompt)
-            self.assertIn("one re-review", prompt)
-            self.assertIn("coordinator", prompt)
-            self.assertIn("review-only task", prompt)
+            self.assertNotIn(marker, prompt)
+        self.assertIn("Read-only review", prompt)
+        self.assertIn("Diff: git diff main...HEAD", prompt)
 
     def test_parser_carries_no_environment_specific_probe(self):
         with self.assertRaises(SystemExit):
             self.bridge.build_parser().parse_args(["--network-probe", "HEAD"])
+
+    def test_health_probes_need_no_review_preparation_inputs(self):
+        for flag in ("--probe", "--browser-probe"):
+            with self.subTest(flag=flag):
+                args = self.bridge.parse_args([flag])
+
+                self.assertTrue(args.probe or args.browser_probe)
+                self.assertIsNone(args.base)
+                self.assertIsNone(args.spec)
 
     def test_same_pane_rejects_concurrent_bridge_calls(self):
         owner = self.bridge.InvocationOwner(
@@ -680,6 +890,7 @@ class FakePaneTestCase(unittest.TestCase):
         self.root = pathlib.Path(self.work.name)
         self.worktree = self.root / "worktree"
         self.worktree.mkdir()
+        self.fixed_point = initialize_review_repo(self.worktree)
         self.state_dir = self.root / "state"
         self.codex = FakeCodexSession()
 
@@ -721,7 +932,14 @@ class FakePaneTestCase(unittest.TestCase):
         return self.codex
 
     def args(self, **overrides):
-        values = {"cwd": str(self.worktree), "timeout": 5, "startup_timeout": 5}
+        values = {
+            "base": self.fixed_point,
+            "spec": "spec.md",
+            "axis": "standards",
+            "cwd": str(self.worktree),
+            "timeout": 5,
+            "startup_timeout": 5,
+        }
         values.update(overrides)
         return base_args(**values)
 
@@ -742,6 +960,175 @@ class FakePaneTestCase(unittest.TestCase):
         records = sorted(self.state_dir.glob("*.json"))
         self.assertEqual(len(records), 1, records)
         return json.loads(records[0].read_text(encoding="utf-8"))
+
+
+class PreparationTests(FakePaneTestCase):
+    def test_an_unresolvable_fixed_point_fails_before_a_pane_opens(self):
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "fixed point did not resolve: missing-ref"
+            ):
+                self.run_bridge(self.args(base="missing-ref"))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_an_empty_three_dot_diff_fails_before_a_pane_opens(self):
+        fixed_point = subprocess.run(
+            ["git", "-C", str(self.worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "three-dot diff is empty"):
+                self.run_bridge(self.args(base=fixed_point))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_standards_run_reports_what_was_prepared(self):
+        fixed_point = self.fixed_point
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(
+            self.args(base=fixed_point, spec="spec.md", axis="standards")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(
+            output["preparation"],
+            {
+                "fixedPoint": fixed_point,
+                "specSource": "spec.md",
+                "standardsFiles": ["AGENTS.md"],
+                "codeGraphUsed": False,
+            },
+        )
+
+    def test_a_symbolic_fixed_point_is_resolved_only_for_the_report(self):
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(
+            self.args(base="HEAD~1", spec="spec.md", axis="standards")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["fixedPoint"], self.fixed_point)
+        self.assertIn("Diff: git diff HEAD~1...HEAD", prompt)
+
+    def test_the_spec_axis_without_a_spec_fails_before_a_pane_opens(self):
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "spec source was not provided"):
+                self.run_bridge(self.args(spec=None, axis="spec"))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_an_unreadable_spec_fails_before_a_pane_opens(self):
+        (self.worktree / "invalid-spec.md").write_bytes(b"\xff")
+
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "spec file could not be read"):
+                self.run_bridge(self.args(spec="invalid-spec.md", axis="spec"))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_missing_spec_path_is_not_reported_as_an_issue(self):
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "spec file not found"):
+                self.run_bridge(self.args(spec="docs/missing.md", axis="spec"))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_spec_run_sends_only_the_spec_axis_brief_to_one_pane(self):
+        fixed_point = self.fixed_point
+        self.codex.finish("no findings")
+
+        code, _output = self.run_bridge(
+            self.args(base=fixed_point, spec="spec.md", axis="spec")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"].split("\n", 1)[1]
+        self.assertEqual(code, 0)
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertIn("Spec:\nFeature spec.\n\nReport:", prompt)
+        self.assertNotIn("Smell baseline", prompt)
+        for excluded in (
+            "Rounds contract",
+            "one re-review",
+            "$code-review",
+            "/code-review",
+            "mattpocock-skills",
+            "Start here (from the code graph",
+        ):
+            self.assertNotIn(excluded, prompt)
+
+    def test_a_probe_skips_review_preparation(self):
+        head = subprocess.run(
+            ["git", "-C", str(self.worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.codex.finish("TUI_REVIEW_BRIDGE_OK")
+
+        code, output = self.run_bridge(
+            self.args(base=head, spec=None, probe=True)
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"], None)
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertIn("This is a bridge health probe", prompt)
+
+    def test_an_issue_spec_reaches_the_spec_axis_with_its_comments(self):
+        real_run = subprocess.run
+
+        def run(command, **kwargs):
+            if command[:3] == ["gh", "issue", "view"]:
+                self.assertEqual(command, ["gh", "issue", "view", "17", "--comments"])
+                return argparse.Namespace(
+                    returncode=0,
+                    stdout="Issue title\n\nIssue body\n\nFirst comment\n",
+                    stderr="",
+                )
+            return real_run(command, **kwargs)
+
+        self.codex.finish("no findings")
+        with mock.patch.object(self.bridge.subprocess, "run", side_effect=run):
+            code, output = self.run_bridge(
+                self.args(spec="17", axis="spec")
+            )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"].split("\n", 1)[1]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["specSource"], "17")
+        self.assertIn(
+            "Spec:\nIssue title\n\nIssue body\n\nFirst comment\n\nReport:",
+            prompt,
+        )
 
 
 class RecoveryTests(FakePaneTestCase):
@@ -768,7 +1155,7 @@ class RecoveryTests(FakePaneTestCase):
         turns_before = len(self.codex.started_turns)
 
         code, output = self.run_bridge(
-            self.args(target=None, recover_session=True)
+            self.args(recover_session=True)
         )
 
         self.assertEqual(code, 0)
@@ -789,10 +1176,23 @@ class RecoveryTests(FakePaneTestCase):
             self.stored_session()["target"], killed["target"]
         )
 
+    def test_recovery_tolerates_a_record_with_no_preparation_report(self):
+        state = self.kill_the_driver()
+        del state["preparation"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        self.codex.finish("legacy review findings")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(output["preparation"])
+
     def test_recovery_keeps_the_lineage_resumable_for_round_two(self):
         killed = self.kill_the_driver()
         self.codex.finish("round one findings")
-        self.run_bridge(self.args(target=None, recover_session=True))
+        self.run_bridge(self.args(recover_session=True))
         turns_before = len(self.codex.started_turns)
 
         code, output = self.run_bridge(
@@ -815,7 +1215,7 @@ class RecoveryTests(FakePaneTestCase):
         with self.assertRaisesRegex(
             self.bridge.NoLiveSessionError, "No live review session"
         ):
-            self.run_bridge(self.args(target=None, recover_session=True))
+            self.run_bridge(self.args(recover_session=True))
 
         self.assertEqual(self.codex.panes, ["%90"])
 
@@ -824,14 +1224,14 @@ class RecoveryTests(FakePaneTestCase):
         self.worktree_root = str(self.root / "another-worktree")
 
         with self.assertRaises(self.bridge.NoLiveSessionError):
-            self.run_bridge(self.args(target=None, recover_session=True))
+            self.run_bridge(self.args(recover_session=True))
 
     def test_a_dead_pane_recovers_nothing(self):
         self.kill_the_driver()
         self.codex.panes.clear()
 
         with self.assertRaises(self.bridge.NoLiveSessionError):
-            self.run_bridge(self.args(target=None, recover_session=True))
+            self.run_bridge(self.args(recover_session=True))
 
     def test_a_record_from_before_recovery_names_no_turn_to_wait_on(self):
         state = self.kill_the_driver()
@@ -841,7 +1241,7 @@ class RecoveryTests(FakePaneTestCase):
         )
 
         with self.assertRaises(self.bridge.NoLiveSessionError):
-            self.run_bridge(self.args(target=None, recover_session=True))
+            self.run_bridge(self.args(recover_session=True))
 
     def test_nothing_to_recover_exits_distinguishably_from_a_failed_review(self):
         with mock.patch.object(sys, "argv", [
@@ -914,7 +1314,9 @@ class MachineLogTests(FakePaneTestCase):
 
     def review_argv(self, *arguments, timeout="5"):
         return (
-            "HEAD",
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", "standards",
             "--model", self.MODEL,
             "--effort", "max",
             "--timeout", timeout,
@@ -965,7 +1367,8 @@ class MachineLogTests(FakePaneTestCase):
         self.codex.finish("no findings")
 
         code = self.main(
-            "HEAD", "--model", self.MODEL, "--timeout", "5", "--startup-timeout", "5"
+            "--base", self.fixed_point, "--spec", "spec.md", "--axis", "standards",
+            "--model", self.MODEL, "--timeout", "5", "--startup-timeout", "5"
         )
 
         self.assertEqual(code, 0)
@@ -1284,11 +1687,13 @@ class SessionCostTests(FakePaneTestCase):
             with contextlib.redirect_stdout(stdout):
                 return self.bridge.main()
 
-    def review_argv(self, *arguments):
+    def review_argv(self, *arguments, timeout="5"):
         return (
-            "HEAD",
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", "standards",
             "--model", self.MODEL_ALIAS,
-            "--timeout", "5",
+            "--timeout", timeout,
             "--startup-timeout", "5",
             "--machine-log", str(self.machine_log),
             "--ticket", self.TICKET,
@@ -1354,9 +1759,7 @@ class SessionCostTests(FakePaneTestCase):
         self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
 
         code = self.main(
-            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "0.2",
-            "--startup-timeout", "5", "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET,
+            *self.review_argv(timeout="0.2")
         )
 
         self.assertEqual(code, 1)
@@ -1374,9 +1777,7 @@ class SessionCostTests(FakePaneTestCase):
         self.codex.status = "in_progress"
 
         code = self.main(
-            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "0.2",
-            "--startup-timeout", "5", "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET, "--resume-session", session,
+            *self.review_argv("--resume-session", session, timeout="0.2")
         )
 
         self.assertEqual(code, 1)
@@ -1397,7 +1798,8 @@ class SessionCostTests(FakePaneTestCase):
         self.codex.finish("no findings")
 
         code = self.main(
-            "HEAD", "--model", self.MODEL_ALIAS, "--timeout", "5", "--startup-timeout", "5"
+            "--base", self.fixed_point, "--spec", "spec.md", "--axis", "standards",
+            "--model", self.MODEL_ALIAS, "--timeout", "5", "--startup-timeout", "5"
         )
 
         self.assertEqual(code, 0)
@@ -1408,13 +1810,14 @@ class RecoveryParserTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
 
-    def test_recovery_needs_no_target(self):
+    def test_recovery_needs_no_preparation_inputs(self):
         args = self.bridge.parse_args(["--recover-session"])
 
         self.assertTrue(args.recover_session)
-        self.assertIsNone(args.target)
+        self.assertIsNone(args.base)
+        self.assertIsNone(args.spec)
 
-    def test_a_review_still_requires_its_target(self):
+    def test_a_review_still_requires_its_fixed_point(self):
         with self.assertRaises(SystemExit):
             self.bridge.parse_args(["--cwd", "/workspace/ticket-13"])
 
@@ -1424,7 +1827,7 @@ class RecoveryParserTests(unittest.TestCase):
                 ["--recover-session", "--resume-session", "session-13"]
             )
 
-    def test_recovery_takes_no_target(self):
+    def test_recovery_takes_no_free_text_target(self):
         with self.assertRaises(SystemExit):
             self.bridge.parse_args(["--recover-session", "HEAD"])
 
