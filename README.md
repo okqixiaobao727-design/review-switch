@@ -15,12 +15,22 @@ ln -sfn "$PWD/skills/review-switch-codex" "$HOME/.claude/skills/review-switch-co
 
 Register `hook/review-adjudicator.sh` as a Claude Code `PreToolUse` hook matching `Skill`.
 
-Both lanes depend on the `mattpocock-skills` plugin: the CC Lane invokes
-`mattpocock-skills:code-review` directly, and the Codex Lane uses it as its hard-error fallback.
+The CC Lane depends on the `mattpocock-skills` plugin and invokes
+`mattpocock-skills:code-review` directly.
 
 The Codex Lane additionally needs `aiohttp` (`pip install aiohttp`) installed for the Python
-interpreter Claude Code runs, because its review bridge imports it; the CC Lane needs nothing
-beyond the plugin. Running the test suites additionally needs `pytest`.
+interpreter Claude Code runs, because its review bridge imports it. `code-review-graph` is an
+optional Codex Lane dependency: when its CLI and an existing graph are available, the Bridge adds
+navigation pointers to each Axis Brief; the review still runs without it. The CC Lane needs
+nothing beyond its plugin. Running the test suites additionally needs `pytest`.
+
+## Codex Lane
+
+The Codex Lane is a thin coordinator around one Bridge call. The Bridge prepares the review once
+from the fixed point, spec reference, and requested axis. An `axis=both` review opens two Codex TUI
+panes concurrently — Standards and Spec — then closes each pane when its turn ends and returns the
+two reports separately. The Lane preserves that separation while applying its bounded Rounds
+contract.
 
 ## Skills
 
