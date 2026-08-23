@@ -251,7 +251,7 @@ class McpReadinessGateTests(unittest.TestCase):
             connect_when_ready=fake_connect,
             wait_for_review=fake_wait_for_review,
             pane_exists=lambda pane_id: True,
-            cleanup_failed_pane=lambda pane, runtime: self.cleaned.append(pane),
+            cleanup_pane=lambda pane, runtime: self.cleaned.append(pane),
         ):
             return asyncio.run(
                 self.bridge.run_new_review(args, self.owner, self.store)
@@ -369,9 +369,10 @@ class McpReadinessGateTests(unittest.TestCase):
     def test_a_gate_that_times_out_tears_the_pane_down(self):
         client = GateClient([{"alpha": "starting"}])
 
-        with self.assertRaisesRegex(RuntimeError, "Timed out waiting for Codex MCP"):
-            self.run_new_review(client, startup_timeout=0.2)
+        failure = self.run_new_review(client, startup_timeout=0.2)
 
+        self.assertIsInstance(failure, self.bridge.AxisFailure)
+        self.assertIn("Timed out waiting for Codex MCP", failure.reason)
         self.assertEqual(self.cleaned, ["%9"])
         self.assertIsNone(client.startup_when_turn_started)
 
@@ -756,20 +757,6 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             ],
         )
 
-    def test_interrupted_review_remains_resumable(self):
-        self.assertFalse(
-            self.bridge.should_cleanup_session(
-                {"status": "interrupted"}, final_message=""
-            )
-        )
-
-    def test_completed_review_without_a_report_is_not_kept(self):
-        self.assertTrue(
-            self.bridge.should_cleanup_session(
-                {"status": "completed"}, final_message=""
-            )
-        )
-
     def test_the_tui_attaches_to_the_bridges_thread(self):
         command = self.bridge.build_tui_command(
             base_args(),
@@ -837,6 +824,28 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
                 store.read("../another-task")
 
+    def test_recovery_skips_records_from_state_version_one(self):
+        owner = self.bridge.InvocationOwner(
+            tmux_server="/tmp/tmux-501/default,1",
+            origin_pane="%1",
+            worktree_root="/workspace/ticket-50",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.bridge.SessionStore(temp_dir)
+            store.write(
+                "session-ticket-50",
+                {
+                    "version": 1,
+                    "reviewSessionId": "session-ticket-50",
+                    "owner": owner.to_dict(),
+                    "threadId": "thread-ticket-50",
+                    "marker": "[claude-tui-review-bridge:old]",
+                },
+            )
+
+            self.assertEqual(self.bridge.SESSION_STATE_VERSION, 2)
+            self.assertEqual(store.find_by_owner(owner), [])
+
     def test_review_prompts_carry_the_axis_brief_and_no_rounds_contract(self):
         preparation = self.bridge.ReviewPreparation(
             fixed_point="main",
@@ -892,44 +901,35 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
 MARKER_PATTERN = re.compile(r"\[claude-tui-review-bridge:[^\]]+\]")
 
 
-class FakeCodexSession:
-    """One Codex TUI pane and its app-server, seen through the bridge's calls.
+class FakeCodexAxis:
+    """One fake pane/app-server pair in the multi-pane harness."""
 
-    It answers the three requests the bridge makes and records what it was asked
-    to create, so a test can assert that a second pane or a second turn was never
-    started.
-    """
-
-    def __init__(self):
+    def __init__(self, owner, axis, pane_id, socket_path):
+        self.owner = owner
+        self.axis = axis
+        self.pane_id = pane_id
+        self.socket_path = str(socket_path)
+        self.thread_id = f"thread-{axis}-{pane_id.lstrip('%')}"
+        self.turn_id = f"turn-{axis}-{pane_id.lstrip('%')}"
         self.marker = None
-        self.status = "in_progress"
-        self.final_message = ""
-        self.thread_id = "thread-ticket-13"
-        self.turn_id = "turn-round-one"
-        self.panes = []
-        self.started_turns = []
-        # The bridge gates the first turn on these; one server that goes ready
-        # on the first pump is enough to let every recovery test through.
         self.mcp_startup = {}
 
-    def launch_pane(self, args, runtime_dir):
-        runtime_dir = pathlib.Path(runtime_dir)
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        (runtime_dir / "app-server.sock").touch()
-        self.panes.append("%%%d" % (90 + len(self.panes)))
-        return self.panes[-1]
-
     async def pump(self, _seconds):
+        error = self.owner.mcp_errors.get(self.axis)
+        if error is not None:
+            raise RuntimeError(error)
         self.mcp_startup["graph"] = "ready"
 
-    def finish(self, message):
-        self.status = "completed"
-        self.final_message = message
-
     def turn(self):
+        status, final_message = self.owner.outcome_for(self.axis)
+        if (
+            self.owner.concurrent_turn_count
+            and len(self.owner.started_turns) < self.owner.concurrent_turn_count
+        ):
+            status, final_message = "in_progress", ""
         return {
             "id": self.turn_id,
-            "status": self.status,
+            "status": status,
             "items": [
                 {
                     "type": "userMessage",
@@ -938,7 +938,7 @@ class FakeCodexSession:
                 {
                     "type": "agentMessage",
                     "phase": "final_answer",
-                    "text": self.final_message,
+                    "text": final_message,
                 },
             ],
         }
@@ -947,13 +947,21 @@ class FakeCodexSession:
         if method == "mcpServerStatus/list":
             return {"data": [{"name": "graph"}]}
         if method == "thread/start":
+            error = self.owner.thread_start_errors.get(self.axis)
+            if error is not None:
+                raise RuntimeError(error)
             return {"thread": {"id": self.thread_id}}
         if method == "thread/resume":
             return {}
         if method == "thread/read":
+            error = self.owner.axis_errors.get(self.axis)
+            if error is not None:
+                if isinstance(error, BaseException):
+                    raise error
+                raise RuntimeError(error)
             return {"thread": {"id": self.thread_id, "turns": [self.turn()]}}
         if method == "turn/start":
-            self.started_turns.append(params)
+            self.owner.started_turns.append(params)
             self.marker = MARKER_PATTERN.search(
                 params["input"][0]["text"]
             ).group(0)
@@ -962,6 +970,96 @@ class FakeCodexSession:
 
     async def __aexit__(self, *_ignored):
         return None
+
+
+class FakeCodexSession:
+    """All fake panes and app-servers launched by one Bridge call."""
+
+    def __init__(self):
+        self.panes = []
+        self.launched_panes = []
+        self.launches = []
+        self.started_turns = []
+        self.sessions = {}
+        self.default_outcome = ("in_progress", "")
+        self.axis_outcomes = {}
+        self.axis_errors = {}
+        self.thread_start_errors = {}
+        self.mcp_errors = {}
+        self.concurrent_turn_count = 0
+
+    @property
+    def first_session(self):
+        return next(iter(self.sessions.values()), None)
+
+    @property
+    def marker(self):
+        return self.first_session.marker if self.first_session else None
+
+    @property
+    def thread_id(self):
+        return (
+            self.first_session.thread_id
+            if self.first_session
+            else "thread-standards-90"
+        )
+
+    @property
+    def status(self):
+        return self.default_outcome[0]
+
+    @status.setter
+    def status(self, value):
+        self.default_outcome = (value, self.default_outcome[1])
+        self.axis_outcomes = {
+            axis: (value, final_message)
+            for axis, (_status, final_message) in self.axis_outcomes.items()
+        }
+
+    def launch_pane(self, args, runtime_dir):
+        runtime_dir = pathlib.Path(runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        socket_path = runtime_dir / "app-server.sock"
+        socket_path.touch()
+        pane_id = f"%{90 + len(self.launched_panes)}"
+        axis = args.axis
+        session = FakeCodexAxis(self, axis, pane_id, socket_path)
+        self.sessions[str(socket_path)] = session
+        self.panes.append(pane_id)
+        self.launched_panes.append(pane_id)
+        self.launches.append(
+            (axis, args.tmux_target, getattr(args, "split_direction", "horizontal"))
+        )
+        return pane_id
+
+    def close_pane(self, pane_id):
+        if pane_id in self.panes:
+            self.panes.remove(pane_id)
+
+    def client(self, socket_path):
+        return self.sessions[str(socket_path)]
+
+    def outcome_for(self, axis):
+        return self.axis_outcomes.get(axis, self.default_outcome)
+
+    def finish(self, message, axis=None):
+        if axis is None:
+            self.default_outcome = ("completed", message)
+        else:
+            self.axis_outcomes[axis] = ("completed", message)
+
+    def error(self, axis, reason):
+        self.axis_errors[axis] = reason
+
+    def fail_thread_start(self, axis, reason):
+        self.thread_start_errors[axis] = reason
+
+    def fail_mcp_startup(self, axis, reason):
+        self.mcp_errors[axis] = reason
+
+
+class DriverKilled(BaseException):
+    """The process vanished, so in-process exception cleanup cannot run."""
 
 
 class FakePaneTestCase(unittest.TestCase):
@@ -1005,6 +1103,10 @@ class FakePaneTestCase(unittest.TestCase):
             side_effect=lambda pane: pane in self.codex.panes,
         ))
         self.enter(mock.patch.object(
+            self.bridge, "close_pane",
+            side_effect=self.codex.close_pane,
+        ))
+        self.enter(mock.patch.object(
             self.bridge, "connect_when_ready", self.connect
         ))
         self.enter(mock.patch.object(
@@ -1015,13 +1117,13 @@ class FakePaneTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def connect(self, *_args, **_kwargs):
-        return self.codex
+    async def connect(self, socket_path, *_args, **_kwargs):
+        return self.codex.client(socket_path)
 
     async def connect_existing(self, state):
         if state["paneId"] not in self.codex.panes:
             return None
-        return self.codex
+        return self.codex.client(state["socketPath"])
 
     def args(self, **overrides):
         values = {
@@ -1106,14 +1208,22 @@ class FakePaneTestCase(unittest.TestCase):
 
     def kill_the_driver(self):
         """The first review, killed the way the harness kills it."""
-        with self.assertRaisesRegex(RuntimeError, "Timed out"):
-            self.run_bridge(self.args(timeout=0.2))
+        self.codex.error("standards", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args())
+        del self.codex.axis_errors["standards"]
         return self.stored_session()
 
     def stored_session(self):
+        return self.stored_sessions()[0]
+
+    def stored_sessions(self, expected_count=1):
         records = sorted(self.state_dir.glob("*.json"))
-        self.assertEqual(len(records), 1, records)
-        return json.loads(records[0].read_text(encoding="utf-8"))
+        self.assertEqual(len(records), expected_count, records)
+        return [
+            json.loads(record.read_text(encoding="utf-8"))
+            for record in records
+        ]
 
 
 class PreparationTests(FakePaneTestCase):
@@ -1414,7 +1524,24 @@ class PreparationTests(FakePaneTestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.panes, [])
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(set(output["axes"]), {"standards"})
+        result = output["axes"]["standards"]
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["finalMessage"], "no findings")
+        self.assertNotIn("reason", result)
+        state = self.stored_session()
+        self.assertEqual(
+            result["reviewSessionId"], state["reviewSessionId"]
+        )
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["axis"], "standards")
+        self.assertEqual(state["threadId"], self.codex.thread_id)
+        self.assertEqual(state["paneId"], "%90")
+        self.assertTrue(state["runtimeDir"])
+        self.assertIsNone(state["model"])
+        self.assertIsNone(state["effort"])
         self.assertEqual(
             output["preparation"],
             {
@@ -1424,6 +1551,91 @@ class PreparationTests(FakePaneTestCase):
                 "codeGraphUsed": False,
             },
         )
+
+    def test_both_axes_run_concurrently_in_two_panes_and_leave_two_records(self):
+        self.codex.concurrent_turn_count = 2
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec clear", axis="spec")
+
+        code, output = self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.codex.panes, [])
+        self.assertEqual(self.codex.launched_panes, ["%90", "%91"])
+        self.assertEqual(
+            self.codex.launches,
+            [
+                ("standards", self.ORIGIN_PANE, "horizontal"),
+                ("spec", "%90", "vertical"),
+            ],
+        )
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(set(output["axes"]), {"standards", "spec"})
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"], "standards clear"
+        )
+        self.assertEqual(output["axes"]["spec"]["finalMessage"], "spec clear")
+        self.assertNotIn("reason", output["axes"]["standards"])
+        self.assertNotIn("reason", output["axes"]["spec"])
+
+        states = self.stored_sessions(expected_count=2)
+        states_by_axis = {state["axis"]: state for state in states}
+        self.assertEqual(set(states_by_axis), {"standards", "spec"})
+        self.assertNotEqual(
+            states_by_axis["standards"]["threadId"],
+            states_by_axis["spec"]["threadId"],
+        )
+        for axis in ("standards", "spec"):
+            self.assertEqual(
+                output["axes"][axis]["reviewSessionId"],
+                states_by_axis[axis]["reviewSessionId"],
+            )
+
+        prompts = [turn["input"][0]["text"] for turn in self.codex.started_turns]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(sum("Standards sources:" in prompt for prompt in prompts), 1)
+        self.assertEqual(sum("\nSpec:\n" in prompt for prompt in prompts), 1)
+
+    def test_half_open_run_keeps_the_completed_report_and_failed_reason(self):
+        self.codex.concurrent_turn_count = 2
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.error("spec", "Timed out waiting for the spec review turn")
+
+        code, output = self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(output["status"], "partially_completed")
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"], "standards clear"
+        )
+        self.assertNotIn("reason", output["axes"]["standards"])
+        self.assertEqual(output["axes"]["spec"]["status"], "failed")
+        self.assertEqual(output["axes"]["spec"]["finalMessage"], "")
+        self.assertTrue(output["axes"]["spec"]["reviewSessionId"])
+        self.assertEqual(
+            output["axes"]["spec"]["reason"],
+            "Timed out waiting for the spec review turn",
+        )
+        self.assertEqual(self.codex.panes, [])
+        self.assertEqual(
+            {state["axis"] for state in self.stored_sessions(expected_count=2)},
+            {"standards", "spec"},
+        )
+
+    def test_completed_turn_without_a_report_is_a_failed_axis(self):
+        self.codex.finish("")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(output["status"], "partially_completed")
+        result = output["axes"]["standards"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["finalMessage"], "")
+        self.assertTrue(result["reason"])
+        self.assertTrue(result["reviewSessionId"])
+        self.assertEqual(self.codex.panes, [])
+        self.stored_session()
 
     def test_a_symbolic_fixed_point_is_resolved_only_for_the_report(self):
         self.codex.finish("no findings")
@@ -1443,10 +1655,20 @@ class PreparationTests(FakePaneTestCase):
             "launch_pane",
             side_effect=AssertionError("a pane opened"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "spec source was not provided"):
+            with self.assertRaisesRegex(
+                RuntimeError, "run with --axis standards when no spec exists"
+            ):
                 self.run_bridge(self.args(spec=None, axis="spec"))
 
         self.assertEqual(self.codex.panes, [])
+
+    def test_both_axes_without_a_spec_fail_before_a_pane_opens(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "run with --axis standards when no spec exists"
+        ):
+            self.run_bridge(self.args(spec=None, axis="both"))
+
+        self.assertEqual(self.codex.launched_panes, [])
 
     def test_an_unreadable_spec_fails_before_a_pane_opens(self):
         (self.worktree / "invalid-spec.md").write_bytes(b"\xff")
@@ -1482,7 +1704,7 @@ class PreparationTests(FakePaneTestCase):
 
         prompt = self.codex.started_turns[0]["input"][0]["text"].split("\n", 1)[1]
         self.assertEqual(code, 0)
-        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.panes, [])
         self.assertIn("Spec:\nFeature spec.\n\nReport:", prompt)
         self.assertNotIn("Smell baseline", prompt)
         for excluded in (
@@ -1505,13 +1727,14 @@ class PreparationTests(FakePaneTestCase):
         self.codex.finish("TUI_REVIEW_BRIDGE_OK")
 
         code, output = self.run_bridge(
-            self.args(base=head, spec=None, probe=True)
+            self.args(base=head, spec=None, axis="both", probe=True)
         )
 
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"], None)
-        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.panes, [])
+        self.assertEqual(self.codex.launched_panes, ["%90"])
         self.assertIn("This is a bridge health probe", prompt)
 
     def test_an_issue_spec_reaches_the_spec_axis_with_its_comments(self):
@@ -1570,14 +1793,12 @@ class RecoveryTests(FakePaneTestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertTrue(output["recovered"])
-        self.assertEqual(output["reviewSessionId"], killed["reviewSessionId"])
-        self.assertEqual(output["threadId"], self.codex.thread_id)
-        self.assertEqual(output["paneId"], killed["paneId"])
+        result = output["axes"]["standards"]
+        self.assertEqual(result["reviewSessionId"], killed["reviewSessionId"])
         self.assertEqual(
-            output["finalMessage"], "two spec findings, one standards finding"
+            result["finalMessage"], "two spec findings, one standards finding"
         )
-        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.panes, [])
         self.assertEqual(
             len(self.codex.started_turns),
             turns_before,
@@ -1611,13 +1832,13 @@ class RecoveryTests(FakePaneTestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertFalse(output["recovered"])
+        self.assertEqual(output["status"], "completed")
         self.assertEqual(
             len(self.codex.started_turns) - turns_before,
             1,
             "round two should start exactly one follow-up turn",
         )
-        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(self.codex.panes, [])
 
     def test_another_origin_pane_recovers_nothing(self):
         self.kill_the_driver()
@@ -1723,11 +1944,11 @@ class MachineLogTests(FakePaneTestCase):
             with contextlib.redirect_stdout(stdout):
                 return self.bridge.main()
 
-    def review_argv(self, *arguments, timeout="5"):
+    def review_argv(self, *arguments, timeout="5", axis="standards"):
         return (
             "--base", self.fixed_point,
             "--spec", "spec.md",
-            "--axis", "standards",
+            "--axis", axis,
             "--model", self.MODEL,
             "--effort", "max",
             "--timeout", timeout,
@@ -1770,6 +1991,14 @@ class MachineLogTests(FakePaneTestCase):
         self.codex.finish("two spec findings, one standards finding")
 
         code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertPair(self.reviews())
+
+    def test_both_axes_still_leave_one_review_event_pair(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="both"))
 
         self.assertEqual(code, 0)
         self.assertPair(self.reviews())
@@ -2062,7 +2291,7 @@ class RolloutHarvestTests(unittest.TestCase):
 
 
 class SessionCostTests(FakePaneTestCase):
-    """The one `session-cost` call a Codex review makes beside its `review` pair.
+    """The per-started-thread `session-cost` calls beside a `review` pair.
 
     Same seam as the `review` pair, tested the same way: the writer belongs to
     the consumer that configured `--machine-log`, so what this lane is
@@ -2098,11 +2327,11 @@ class SessionCostTests(FakePaneTestCase):
             with contextlib.redirect_stdout(stdout):
                 return self.bridge.main()
 
-    def review_argv(self, *arguments, timeout="5"):
+    def review_argv(self, *arguments, timeout="5", axis="standards"):
         return (
             "--base", self.fixed_point,
             "--spec", "spec.md",
-            "--axis", "standards",
+            "--axis", axis,
             "--model", self.MODEL_ALIAS,
             "--timeout", timeout,
             "--startup-timeout", "5",
@@ -2155,6 +2384,49 @@ class SessionCostTests(FakePaneTestCase):
         self.assertEqual(entry["total-tokens"], str(ROUND_ONE_USAGE["total_tokens"]))
         self.assertNotIn("detail", entry)
 
+    def test_both_axes_record_one_cost_for_each_started_thread(self):
+        standards_thread = "thread-standards-90"
+        spec_thread = "thread-spec-91"
+        for thread_id in (standards_thread, spec_thread):
+            self.write_rollout(
+                [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+                thread_id=thread_id,
+            )
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 0)
+        costs = self.costs()
+        self.assertEqual(len(costs), 2, costs)
+        self.assertEqual(
+            {entry["session"] for entry in costs},
+            {standards_thread, spec_thread},
+        )
+
+    def test_an_axis_that_never_started_a_thread_records_no_cost(self):
+        self.codex.fail_thread_start("standards", "thread could not start")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.costs(), [])
+
+    def test_a_started_thread_records_cost_when_startup_later_fails(self):
+        thread_id = "thread-standards-90"
+        self.write_rollout(
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+            thread_id=thread_id,
+        )
+        self.codex.fail_mcp_startup("standards", "MCP startup failed")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 1)
+        costs = self.costs()
+        self.assertEqual(len(costs), 1, costs)
+        self.assertEqual(costs[0]["session"], thread_id)
+
     def test_a_review_whose_rollout_is_missing_records_the_diagnosis(self):
         self.codex.finish("no findings")
 
@@ -2165,8 +2437,8 @@ class SessionCostTests(FakePaneTestCase):
         self.assertIn(self.codex.thread_id, entry["detail"])
         self.assertNotIn("total-tokens", entry)
 
-    def test_a_review_that_never_came_back_records_the_diagnosis(self):
-        """The turn never finishes, so there is nothing to read — and the call still goes out."""
+    def test_a_timed_out_review_records_its_known_thread_cost(self):
+        """A partial result still has a thread whose rollout can be measured."""
         self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
 
         code = self.main(
@@ -2176,8 +2448,9 @@ class SessionCostTests(FakePaneTestCase):
         self.assertEqual(code, 1)
         entry = self.costs()[0]
         self.assertEqual(entry["lane"], f"codex {self.MODEL_ALIAS}")
-        self.assertTrue(entry["detail"])
-        self.assertNotIn("total-tokens", entry)
+        self.assertEqual(entry["session"], self.codex.thread_id)
+        self.assertEqual(entry["total-tokens"], str(ROUND_ONE_USAGE["total_tokens"]))
+        self.assertNotIn("detail", entry)
 
     def test_a_failed_second_round_still_names_the_thread_it_spent_in(self):
         """Naming it is what keeps a same-vendor review out of the reviewed child's figures."""
@@ -2193,6 +2466,27 @@ class SessionCostTests(FakePaneTestCase):
 
         self.assertEqual(code, 1)
         self.assertEqual(self.costs()[-1]["session"], self.codex.thread_id)
+
+    def test_a_failed_recovery_records_the_thread_it_recovered(self):
+        state = self.kill_the_driver()
+        self.write_rollout(
+            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
+            thread_id=state["threadId"],
+        )
+        self.codex.error("standards", "recovery timed out")
+
+        code = self.main(
+            "--recover-session",
+            "--timeout", "0.2",
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            "--model", self.MODEL_ALIAS,
+        )
+
+        self.assertEqual(code, 1)
+        costs = self.costs()
+        self.assertEqual(len(costs), 1, costs)
+        self.assertEqual(costs[0]["session"], state["threadId"])
 
     def test_a_rollout_that_names_no_model_records_no_model_rather_than_the_alias(self):
         """The alias is already on the row, in the lane; the model field is a measurement."""
