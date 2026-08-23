@@ -63,6 +63,10 @@ def base_args(**overrides):
         "recover_session": False,
         "model": None,
         "effort": None,
+        "standards_model": None,
+        "standards_effort": None,
+        "spec_model": None,
+        "spec_effort": None,
         "probe": False,
         "browser_probe": False,
     }
@@ -568,6 +572,39 @@ class BridgeContractTests(unittest.TestCase):
 
         self.assertEqual(args.axis, "both")
 
+    def test_parser_accepts_optional_model_and_effort_for_each_axis(self):
+        args = self.bridge.parse_args(
+            [
+                "--base",
+                "main",
+                "--spec",
+                "docs/feature.md",
+                "--standards-model",
+                "standards-model",
+                "--standards-effort",
+                "standards-effort",
+                "--spec-model",
+                "spec-model",
+                "--spec-effort",
+                "spec-effort",
+            ]
+        )
+
+        self.assertEqual(args.standards_model, "standards-model")
+        self.assertEqual(args.standards_effort, "standards-effort")
+        self.assertEqual(args.spec_model, "spec-model")
+        self.assertEqual(args.spec_effort, "spec-effort")
+
+    def test_per_axis_model_and_effort_default_to_none(self):
+        args = self.bridge.parse_args(
+            ["--base", "main", "--spec", "docs/feature.md"]
+        )
+
+        self.assertIsNone(args.standards_model)
+        self.assertIsNone(args.standards_effort)
+        self.assertIsNone(args.spec_model)
+        self.assertIsNone(args.spec_effort)
+
     def test_parser_rejects_the_old_free_text_target(self):
         with self.assertRaises(SystemExit):
             self.bridge.parse_args(
@@ -952,6 +989,7 @@ class FakeCodexAxis:
                 raise RuntimeError(error)
             return {"thread": {"id": self.thread_id}}
         if method == "thread/resume":
+            self.owner.resumed_threads.append(params["threadId"])
             return {}
         if method == "thread/read":
             error = self.owner.axis_errors.get(self.axis)
@@ -980,6 +1018,7 @@ class FakeCodexSession:
         self.launched_panes = []
         self.launches = []
         self.started_turns = []
+        self.resumed_threads = []
         self.sessions = {}
         self.default_outcome = ("in_progress", "")
         self.axis_outcomes = {}
@@ -1765,6 +1804,192 @@ class PreparationTests(FakePaneTestCase):
         )
 
 
+class PerAxisModelAndEffortTests(FakePaneTestCase):
+    def test_generic_model_and_effort_apply_to_both_axes(self):
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec clear", axis="spec")
+
+        code, _output = self.run_bridge(
+            self.args(axis="both", model="m", effort="e")
+        )
+
+        self.assertEqual(code, 0)
+        states = {
+            state["axis"]: state
+            for state in self.stored_sessions(expected_count=2)
+        }
+        self.assertEqual(
+            {
+                axis: (state["model"], state["effort"])
+                for axis, state in states.items()
+            },
+            {"standards": ("m", "e"), "spec": ("m", "e")},
+        )
+
+    def test_spec_model_overrides_the_generic_model_for_only_the_spec_axis(self):
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec clear", axis="spec")
+
+        code, _output = self.run_bridge(
+            self.args(
+                axis="both",
+                model="m",
+                effort="e",
+                spec_model="s2",
+            )
+        )
+
+        self.assertEqual(code, 0)
+        states = {
+            state["axis"]: state
+            for state in self.stored_sessions(expected_count=2)
+        }
+        self.assertEqual(
+            {
+                axis: (state["model"], state["effort"])
+                for axis, state in states.items()
+            },
+            {"standards": ("m", "e"), "spec": ("s2", "e")},
+        )
+        turn_choices = {
+            (
+                "spec"
+                if "\nSpec:\n" in turn["input"][0]["text"]
+                else "standards"
+            ): (turn.get("model"), turn.get("effort"))
+            for turn in self.codex.started_turns
+        }
+        self.assertEqual(
+            turn_choices,
+            {"standards": ("m", "e"), "spec": ("s2", "e")},
+        )
+
+    def test_standards_effort_alone_overrides_only_the_standards_axis(self):
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec clear", axis="spec")
+
+        code, _output = self.run_bridge(
+            self.args(axis="both", standards_effort="standards-effort")
+        )
+
+        self.assertEqual(code, 0)
+        states = {
+            state["axis"]: state
+            for state in self.stored_sessions(expected_count=2)
+        }
+        self.assertEqual(
+            {
+                axis: (state["model"], state["effort"])
+                for axis, state in states.items()
+            },
+            {
+                "standards": (None, "standards-effort"),
+                "spec": (None, None),
+            },
+        )
+
+    def test_single_axis_run_ignores_the_other_axis_choices(self):
+        self.codex.finish("spec clear", axis="spec")
+
+        code, output = self.run_bridge(
+            self.args(
+                axis="spec",
+                standards_model="ignored-model",
+                standards_effort="ignored-effort",
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(set(output["axes"]), {"spec"})
+        state = self.stored_session()
+        self.assertEqual(state["axis"], "spec")
+        self.assertIsNone(state["model"])
+        self.assertIsNone(state["effort"])
+
+    def test_followup_wakes_only_its_axis_in_a_fresh_pane_with_saved_choices(self):
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec needs a fix", axis="spec")
+        first_code, _first_output = self.run_bridge(
+            self.args(
+                axis="both",
+                spec_model="spec-model",
+                spec_effort="high",
+            )
+        )
+        self.assertEqual(first_code, 0)
+        first_states = {
+            state["axis"]: state
+            for state in self.stored_sessions(expected_count=2)
+        }
+        standards_path = self.state_dir / (
+            f"{first_states['standards']['reviewSessionId']}.json"
+        )
+        standards_record = standards_path.read_bytes()
+        spec_state = first_states["spec"]
+        panes_before = list(self.codex.launched_panes)
+        self.codex.finish("spec fix is clear", axis="spec")
+
+        code, output = self.run_bridge(
+            self.args(
+                axis="spec",
+                resume_session=spec_state["reviewSessionId"],
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(set(output["axes"]), {"spec"})
+        self.assertEqual(
+            self.codex.launched_panes[len(panes_before):], ["%92"]
+        )
+        self.assertEqual(self.codex.launches[-1][0], "spec")
+        self.assertEqual(self.codex.resumed_threads, [spec_state["threadId"]])
+        self.assertEqual(self.codex.panes, [])
+        saved_spec = self.bridge.SessionStore().read(
+            spec_state["reviewSessionId"]
+        )
+        self.assertEqual(saved_spec["threadId"], spec_state["threadId"])
+        self.assertEqual(saved_spec["model"], "spec-model")
+        self.assertEqual(saved_spec["effort"], "high")
+        self.assertEqual(
+            (
+                self.codex.started_turns[-1].get("model"),
+                self.codex.started_turns[-1].get("effort"),
+            ),
+            ("spec-model", "high"),
+        )
+        self.assertEqual(standards_path.read_bytes(), standards_record)
+
+    def test_followup_can_replace_its_axis_model_and_effort(self):
+        self.codex.finish("round one clear", axis="spec")
+        first_code, first_output = self.run_bridge(
+            self.args(
+                axis="spec",
+                spec_model="spec-model-one",
+                spec_effort="medium",
+            )
+        )
+        self.assertEqual(first_code, 0)
+        session_id = first_output["axes"]["spec"]["reviewSessionId"]
+        self.codex.finish("round two clear", axis="spec")
+
+        code, _output = self.run_bridge(
+            self.args(
+                axis="spec",
+                resume_session=session_id,
+                model="generic-model-two",
+                effort="low",
+                spec_model="spec-model-two",
+                spec_effort="high",
+            )
+        )
+
+        self.assertEqual(code, 0)
+        state = self.bridge.SessionStore().read(session_id)
+        self.assertEqual(state["axis"], "spec")
+        self.assertEqual(state["model"], "spec-model-two")
+        self.assertEqual(state["effort"], "high")
+
+
 class RecoveryTests(FakePaneTestCase):
     """A driver killed mid-review is recovered, not restarted.
 
@@ -1958,6 +2183,27 @@ class MachineLogTests(FakePaneTestCase):
             *arguments,
         )
 
+    def resume_argv(self, session_id, *arguments, axis="spec"):
+        return (
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", axis,
+            "--resume-session", session_id,
+            "--timeout", "5",
+            "--startup-timeout", "5",
+            "--machine-log", str(self.machine_log),
+            "--ticket", self.TICKET,
+            *arguments,
+        )
+
+    def completed_spec_session(self):
+        self.codex.finish("round one findings", axis="spec")
+        code = self.main(*self.review_argv(axis="spec"))
+        self.assertEqual(code, 0)
+        session_id = self.stored_session()["reviewSessionId"]
+        self.calls_file.unlink(missing_ok=True)
+        return session_id
+
     def reviews(self):
         """Every `review` call the bridge made, read back as the flags it passed."""
         if not self.calls_file.exists():
@@ -2002,6 +2248,98 @@ class MachineLogTests(FakePaneTestCase):
 
         self.assertEqual(code, 0)
         self.assertPair(self.reviews())
+
+    def test_both_axes_with_different_models_leave_a_vendor_only_lane(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(
+                "--spec-model", "spec-model", axis="both"
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [record["lane"] for record in self.reviews()],
+            ["codex", "codex"],
+        )
+
+    def test_both_axes_with_the_same_axis_model_leave_that_model_in_the_lane(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(
+                "--standards-model",
+                "shared-axis-model",
+                "--spec-model",
+                "shared-axis-model",
+                axis="both",
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [record["lane"] for record in self.reviews()],
+            ["codex shared-axis-model", "codex shared-axis-model"],
+        )
+
+    def test_single_axis_override_leaves_its_model_in_the_lane(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(
+                "--spec-model", "spec-model", axis="spec"
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [record["lane"] for record in self.reviews()],
+            ["codex spec-model", "codex spec-model"],
+        )
+
+    def test_resumed_axis_override_leaves_its_model_in_the_lane(self):
+        session_id = self.completed_spec_session()
+        self.codex.finish("round two clear", axis="spec")
+
+        code = self.main(
+            *self.resume_argv(
+                session_id, "--spec-model", "resumed-spec-model"
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [record["lane"] for record in self.reviews()],
+            ["codex resumed-spec-model", "codex resumed-spec-model"],
+        )
+
+    def test_resume_without_model_flags_uses_the_model_saved_in_the_handle(self):
+        session_id = self.completed_spec_session()
+        self.codex.finish("round two clear", axis="spec")
+
+        code = self.main(*self.resume_argv(session_id))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [record["lane"] for record in self.reviews()],
+            [f"codex {self.MODEL}", f"codex {self.MODEL}"],
+        )
+
+    def test_resume_rejects_a_different_axis_before_writing_running(self):
+        session_id = self.completed_spec_session()
+        panes_before = list(self.codex.launched_panes)
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = self.main(
+                *self.resume_argv(session_id, axis="standards")
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("axis 'spec'", stderr.getvalue())
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(self.codex.launched_panes, panes_before)
 
     def test_a_review_with_no_log_configured_writes_nothing(self):
         self.codex.finish("no findings")
