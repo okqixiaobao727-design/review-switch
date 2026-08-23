@@ -340,16 +340,44 @@ class InvocationOwner:
         return dataclasses.asdict(self)
 
 
-def canonical_worktree_root(cwd):
-    result = subprocess.run(
-        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+def run_git(cwd, *arguments):
+    return subprocess.run(
+        ["git", "-C", cwd, *arguments],
         text=True,
         capture_output=True,
         check=False,
     )
+
+
+def canonical_worktree_root(cwd):
+    result = run_git(cwd, "rev-parse", "--show-toplevel")
     if result.returncode == 0 and result.stdout.strip():
         return str(pathlib.Path(result.stdout.strip()).resolve())
     return str(pathlib.Path(cwd).resolve())
+
+
+def resolve_fixed_point(cwd, fixed_point):
+    result = run_git(
+        cwd, "rev-parse", "--verify", f"{fixed_point}^{{commit}}"
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"fixed point did not resolve: {fixed_point}")
+    return result.stdout.strip()
+
+
+def ensure_nonempty_diff(cwd, fixed_point):
+    result = run_git(
+        cwd, "diff", "--quiet", f"{fixed_point}...HEAD", "--"
+    )
+    if result.returncode == 0:
+        raise RuntimeError(
+            f"three-dot diff is empty: git diff {fixed_point}...HEAD"
+        )
+    if result.returncode != 1:
+        detail = result.stderr.strip() or "git diff failed"
+        raise RuntimeError(
+            f"three-dot diff could not be read for {fixed_point}: {detail}"
+        )
 
 
 def tmux_server_identity(value):
@@ -610,53 +638,178 @@ class AppServerClient:
             )
 
 
-# The whole review request, stated here rather than delegated to a skill name:
-# this reviewer is a different vendor's session, where a name from this side
-# resolves to nothing. Same contract as the `rounds` block in
-# dispatch/templates/shapes.toml, which the reviewed child carries in its first
-# turn; the two copies are the two ends of one review.
-ROUNDS_CONTRACT = (
-    "Rounds contract. Classify each finding on two axes: standards — style, "
-    "naming, convention, anything that leaves behaviour intact — and spec — "
-    "correctness, security, deviation from the spec or ticket. The caller fixes "
-    "the standards findings it accepts in one pass; spec findings that required "
-    "fixes earn one re-review, scoped to exactly those fixes. A spec finding "
-    "still open after that re-review, or a finding reopened once it was ruled "
-    "on, ends the review: state the disagreement with both positions, which the "
-    "caller escalates to its coordinator rather than opening another round."
-)
+STANDARDS_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Diff: git diff {fixed_point}...HEAD
+Commits:
+{commit_list}
+Standards sources: {standards_files}
+
+Smell baseline (applies even when the repo documents nothing; the repo overrides; every smell is a judgement call; skip anything tooling enforces):
+- Mysterious Name: a function, variable, or type whose name doesn't reveal what it does or holds. → rename it; if no honest name comes, the design's murky.
+- Duplicated Code: the same logic shape appears in more than one hunk or file in the change. → extract the shared shape, call it from both.
+- Feature Envy: a method that reaches into another object's data more than its own. → move the method onto the data it envies.
+- Data Clumps: the same few fields or params keep travelling together (a type wanting to be born). → bundle them into one type, pass that.
+- Primitive Obsession: a primitive or string standing in for a domain concept that deserves its own type. → give the concept its own small type.
+- Repeated Switches: the same switch/if-cascade on the same type recurs across the change. → replace with polymorphism, or one map both sites share.
+- Shotgun Surgery: one logical change forces scattered edits across many files in the diff. → gather what changes together into one module.
+- Divergent Change: one file or module is edited for several unrelated reasons. → split so each module changes for one reason.
+- Speculative Generality: abstraction, parameters, or hooks added for needs the spec doesn't have. → delete it; inline back until a real need shows.
+- Message Chains: long a.b().c().d() navigation the caller shouldn't depend on. → hide the walk behind one method on the first object.
+- Middle Man: a class or function that mostly just delegates onward. → cut it, call the real target direct.
+- Refused Bequest: a subclass or implementer that ignores or overrides most of what it inherits. → drop the inheritance, use composition.
+
+Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."""
 
 
-def build_review_prompt(target, bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        f"Review {target} and report your findings. You are in an interactive TUI "
-        "with full local access. If the originating issue or spec cannot be "
-        "fetched, treat it as no spec available: run the standards axis and "
-        "report the spec axis as skipped. Report on the code as it stands; this "
-        f"is a review-only task.\n\n{ROUNDS_CONTRACT}"
+def with_trailing_newline(text):
+    return text if text.endswith("\n") else f"{text}\n"
+
+
+def build_standards_brief(fixed_point, commit_list, standards_files):
+    return STANDARDS_BRIEF_TEMPLATE.format(
+        fixed_point=fixed_point,
+        commit_list=with_trailing_newline(commit_list),
+        standards_files=(
+            ", ".join(standards_files)
+            if standards_files
+            else "none documented; baseline only"
+        ),
     )
 
 
-def build_followup_prompt(target, bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        f"Continue this review thread with the updated {target}. Compare it with "
-        "the findings already in this thread, and say for each earlier finding "
-        "whether it is now resolved. This is the one re-review the contract "
-        "allows, so scope it to those fixes. Report on the code as it stands; "
-        f"this is a review-only task.\n\n{ROUNDS_CONTRACT}"
+SPEC_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Diff: git diff {fixed_point}...HEAD
+Commits:
+{commit_list}
+Spec:
+{spec_contents}
+Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."""
+
+
+def build_spec_brief(fixed_point, commit_list, spec_contents):
+    return SPEC_BRIEF_TEMPLATE.format(
+        fixed_point=fixed_point,
+        commit_list=with_trailing_newline(commit_list),
+        spec_contents=with_trailing_newline(spec_contents),
     )
 
 
-def build_prompt(args, bridge_id, followup=False):
+@dataclasses.dataclass(frozen=True)
+class ReviewPreparation:
+    fixed_point: str
+    resolved_fixed_point: str
+    commit_list: str
+    spec_source: str
+    spec_contents: str | None
+    standards_files: tuple[str, ...]
+    code_graph_used: bool = False
+
+    def brief(self, axis):
+        if axis == "standards":
+            return build_standards_brief(
+                self.fixed_point, self.commit_list, self.standards_files
+            )
+        if axis == "spec":
+            if self.spec_contents is None:
+                raise RuntimeError("spec source was not provided for the spec axis")
+            return build_spec_brief(
+                self.fixed_point, self.commit_list, self.spec_contents
+            )
+        raise RuntimeError("axis 'both' requires the two-pane fan-out")
+
+    def report(self):
+        return {
+            "fixedPoint": self.resolved_fixed_point,
+            "specSource": self.spec_source,
+            "standardsFiles": list(self.standards_files),
+            "codeGraphUsed": self.code_graph_used,
+        }
+
+
+def read_commit_list(cwd, fixed_point):
+    result = run_git(cwd, "log", f"{fixed_point}..HEAD", "--oneline")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "git log failed"
+        raise RuntimeError(f"commit list could not be read: {detail}")
+    return result.stdout
+
+
+def find_standards_files(repo_root):
+    root = pathlib.Path(repo_root)
+    documented = [
+        path
+        for path in (
+            "CODING_STANDARDS.md",
+            "CONTRIBUTING.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+        )
+        if (root / path).is_file()
+    ]
+    documented.extend(
+        path.relative_to(root).as_posix()
+        for path in sorted((root / "docs" / "agents").glob("*.md"))
+        if path.is_file()
+    )
+    return tuple(documented)
+
+
+def read_spec(repo_root, reference):
+    if reference is None:
+        return "not provided", None
+    candidate = pathlib.Path(reference)
+    if not candidate.is_absolute():
+        candidate = pathlib.Path(repo_root) / candidate
+    if candidate.is_file():
+        try:
+            return reference, candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError(
+                f"spec file could not be read: {reference}: {error}"
+            ) from error
+    if "/" in reference or candidate.suffix:
+        raise RuntimeError(f"spec file not found: {reference}")
+    result = subprocess.run(
+        ["gh", "issue", "view", reference, "--comments"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "gh issue view failed"
+        raise RuntimeError(f"spec issue could not be read: {reference}: {detail}")
+    return reference, result.stdout
+
+
+def prepare_review(args):
+    repo_root = canonical_worktree_root(args.cwd)
+    source, contents = read_spec(repo_root, args.spec)
+    return ReviewPreparation(
+        fixed_point=args.base,
+        resolved_fixed_point=args.resolved_base,
+        commit_list=read_commit_list(args.cwd, args.base),
+        spec_source=source,
+        spec_contents=contents,
+        standards_files=find_standards_files(repo_root),
+    )
+
+
+def preparation_report(args):
+    return args.preparation.report() if args.preparation is not None else None
+
+
+def build_prompt(args, bridge_id):
     if args.browser_probe:
         return build_browser_probe_prompt(bridge_id)
     if args.probe:
         return build_probe_prompt(bridge_id)
-    if followup:
-        return build_followup_prompt(args.target, bridge_id)
-    return build_review_prompt(args.target, bridge_id)
+    return (
+        f"[claude-tui-review-bridge:{bridge_id}]\n"
+        f"{args.preparation.brief(args.axis)}"
+    )
 
 
 def build_probe_prompt(bridge_id):
@@ -1279,11 +1432,12 @@ async def run_new_review(args, owner, store):
                 runtime_dir,
                 pane_id,
                 thread_id,
-                args.target,
+                args.base,
                 args.model,
                 args.effort,
                 marker,
             )
+            state["preparation"] = preparation_report(args)
             # The record goes down before the pane is told to attach. Handing
             # over first would let a driver killed in between leave a live pane
             # running a review that `--recover-session` can no longer find.
@@ -1372,7 +1526,7 @@ async def run_existing_review(args, owner, store):
     apply_session_model_choice(args, state)
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(args, bridge_id, followup=True)
+    prompt = build_prompt(args, bridge_id)
     # On disk before the turn is awaited, for the same reason the first review
     # writes its record early: a driver killed mid-turn must leave a marker the
     # recovery path can wait on.
@@ -1416,9 +1570,9 @@ async def run_recovered_review(args, owner, store):
         client = await connect_existing_session(state)
         if client is None:
             continue
-        # The record's own target, so the turn that is already in flight is
+        # The record's own fixed point, so the turn already in flight is
         # reported as what it actually reviews.
-        args.target = state["target"]
+        args.base = state["target"]
         try:
             thread, turn = await wait_for_review(
                 client,
@@ -1439,6 +1593,13 @@ async def run_recovered_review(args, owner, store):
 async def run_bridge(args, review=None):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
+    probe = args.probe or args.browser_probe
+    if not args.recover_session and not probe:
+        args.resolved_base = resolve_fixed_point(args.cwd, args.base)
+        ensure_nonempty_diff(args.cwd, args.base)
+        args.preparation = prepare_review(args)
+    elif probe:
+        args.preparation = None
     owner = resolve_owner(args)
     store = SessionStore()
     # The lock stays process-scoped: it serialises concurrent calls from one
@@ -1460,7 +1621,9 @@ async def run_bridge(args, review=None):
                 args, owner, store
             )
         final_message = final_agent_message(turn)
-        update_session_after_turn(state, turn, args.target)
+        update_session_after_turn(state, turn, args.base)
+        if not args.recover_session:
+            state["preparation"] = preparation_report(args)
         store.write(state["reviewSessionId"], state)
         cleanup_required = should_cleanup_session(turn, final_message)
         if cleanup_required:
@@ -1478,6 +1641,7 @@ async def run_bridge(args, review=None):
         "turnId": turn.get("id"),
         "paneId": state["paneId"],
         "finalMessage": final_message,
+        "preparation": state.get("preparation"),
     }
     print(json.dumps(output, ensure_ascii=False))
     succeeded = turn.get("status") == "completed" and bool(output["finalMessage"])
@@ -1488,7 +1652,14 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description="Launch or resume an interactive Codex TUI review."
     )
-    parser.add_argument("target", nargs="?")
+    parser.add_argument("--base", help="fixed point for the three-dot diff")
+    parser.add_argument("--spec", help="issue reference or file path for the spec")
+    parser.add_argument(
+        "--axis",
+        choices=("standards", "spec", "both"),
+        default="both",
+        help="review axis to run (default: both)",
+    )
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
@@ -1536,14 +1707,10 @@ def parse_args(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.recover_session:
-        # Recovery names no target and no session: the owner tuple is the
-        # lookup key, and the target comes from the record it finds.
-        if args.target:
-            parser.error("--recover-session takes no target")
         if args.resume_session:
             parser.error("--recover-session and --resume-session are exclusive")
-    elif not args.target:
-        parser.error("the target to review is required")
+    elif not (args.probe or args.browser_probe) and not args.base:
+        parser.error("--base is required")
     return args
 
 
