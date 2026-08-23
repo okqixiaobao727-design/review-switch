@@ -75,6 +75,7 @@ MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
 # The vendor half of the lane this bridge reviews in. The model half is whatever
 # the lineage was pinned to, so the lane needs no argument of its own.
 REVIEW_VENDOR = "codex"
+CODE_GRAPH_CLI = "code-review-graph"
 # The four disjoint counters a `session-cost` line carries, in the machine log's
 # own spelling.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
@@ -383,6 +384,38 @@ def ensure_nonempty_diff(cwd, fixed_point):
         )
 
 
+def resolve_main_checkout(cwd):
+    result = run_git(
+        cwd,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return str(pathlib.Path(result.stdout.strip()).parent)
+
+
+def has_uncommitted_changes(cwd):
+    result = run_git(cwd, "status", "--porcelain")
+    return result.returncode != 0 or bool(result.stdout.strip())
+
+
+def review_graph_base(cwd, main_checkout, fixed_point):
+    if pathlib.Path(cwd).resolve() == pathlib.Path(main_checkout).resolve():
+        return fixed_point
+    result = run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    tip = result.stdout.strip()
+    if tip == "HEAD":
+        result = run_git(cwd, "rev-parse", "HEAD")
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        tip = result.stdout.strip()
+    return f"{fixed_point}...{tip}"
+
+
 def tmux_server_identity(value):
     parts = value.rsplit(",", 2)
     if len(parts) != 3 or not parts[0] or not parts[1]:
@@ -666,6 +699,110 @@ def with_trailing_newline(text):
     return text if text.endswith("\n") else f"{text}\n"
 
 
+def build_navigation_block(graph_result, repo_root):
+    root = pathlib.Path(repo_root).resolve()
+
+    def navigation_fields(node):
+        path = pathlib.Path(node["file_path"])
+        if path.is_absolute():
+            path = path.resolve().relative_to(root)
+        return (
+            path.as_posix(),
+            node["line_start"],
+            node["line_end"],
+            node["name"],
+        )
+
+    priorities = graph_result["review_priorities"]
+    priority_fields = {navigation_fields(node) for node in priorities}
+    ordered = priorities + [
+        node
+        for node in graph_result["changed_functions"]
+        if navigation_fields(node) not in priority_fields
+    ]
+    lines = []
+    for node in ordered:
+        path, line_start, line_end, name = navigation_fields(node)
+        lines.append(f"{path}:{line_start}–{line_end}  {name}")
+    return "\n".join(lines) or None
+
+
+def append_navigation_block(brief, navigation_block):
+    if navigation_block is None:
+        return brief
+    return (
+        f"{brief}\n\n"
+        "Start here (from the code graph; the diff is the full scope):\n"
+        f"{navigation_block}"
+    )
+
+
+def read_code_graph_navigation(cwd, fixed_point):
+    if has_uncommitted_changes(cwd):
+        return None
+    main_checkout = resolve_main_checkout(cwd)
+    if main_checkout is None:
+        return None
+    executable = shutil.which(CODE_GRAPH_CLI)
+    if executable is None:
+        return None
+    graph_base = review_graph_base(cwd, main_checkout, fixed_point)
+    if graph_base is None:
+        return None
+
+    common_arguments = ["--base", graph_base, "--repo", main_checkout]
+    try:
+        status = subprocess.run(
+            [executable, "status", "--json", "--repo", main_checkout],
+            cwd=main_checkout,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if status.returncode != 0:
+            return None
+        status_result = json.loads(status.stdout)
+        if not isinstance(status_result, dict):
+            return None
+        graph_exists = any(
+            status_result.get(field)
+            for field in (
+                "nodes",
+                "files",
+                "last_updated",
+                "built_on_branch",
+                "built_at_commit",
+            )
+        )
+        if not graph_exists:
+            return None
+        update = subprocess.run(
+            [executable, "update", "--brief", *common_arguments],
+            cwd=main_checkout,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if update.returncode != 0:
+            return None
+        detection = subprocess.run(
+            [executable, "detect-changes", *common_arguments],
+            cwd=main_checkout,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    if detection.returncode != 0:
+        return None
+    try:
+        result = json.loads(detection.stdout)
+        return build_navigation_block(result, main_checkout)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def build_standards_brief(fixed_point, commit_list, standards_files):
     return STANDARDS_BRIEF_TEMPLATE.format(
         fixed_point=fixed_point,
@@ -704,12 +841,16 @@ class ReviewPreparation:
     spec_source: str
     spec_contents: str | None
     standards_files: tuple[str, ...]
+    navigation_block: str | None = None
     code_graph_used: bool = False
 
     def brief(self, axis):
         if axis == "standards":
-            return build_standards_brief(
-                self.fixed_point, self.commit_list, self.standards_files
+            return append_navigation_block(
+                build_standards_brief(
+                    self.fixed_point, self.commit_list, self.standards_files
+                ),
+                self.navigation_block,
             )
         if axis == "spec":
             if self.spec_contents is None:
@@ -717,8 +858,11 @@ class ReviewPreparation:
                     "spec source was not provided; run with --axis standards "
                     "when no spec exists"
                 )
-            return build_spec_brief(
-                self.fixed_point, self.commit_list, self.spec_contents
+            return append_navigation_block(
+                build_spec_brief(
+                    self.fixed_point, self.commit_list, self.spec_contents
+                ),
+                self.navigation_block,
             )
         raise RuntimeError("axis 'both' requires the two-pane fan-out")
 
@@ -790,6 +934,7 @@ def read_spec(repo_root, reference):
 def prepare_review(args):
     repo_root = canonical_worktree_root(args.cwd)
     source, contents = read_spec(repo_root, args.spec)
+    navigation_block = read_code_graph_navigation(repo_root, args.base)
     return ReviewPreparation(
         fixed_point=args.base,
         resolved_fixed_point=args.resolved_base,
@@ -797,6 +942,8 @@ def prepare_review(args):
         spec_source=source,
         spec_contents=contents,
         standards_files=find_standards_files(repo_root),
+        navigation_block=navigation_block,
+        code_graph_used=navigation_block is not None,
     )
 
 

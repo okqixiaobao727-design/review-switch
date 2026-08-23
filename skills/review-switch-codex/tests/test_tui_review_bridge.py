@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -475,6 +476,75 @@ class BridgeContractTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
 
+    def test_code_graph_result_is_trimmed_to_the_navigation_contract(self):
+        graph_result = {
+            "risk_score": 0.93,
+            "test_gaps": [{"name": "late_change"}],
+            "context_savings": {"estimated_tokens_saved": 1200},
+            "changed_functions": [
+                {
+                    "file_path": "/workspace/project/src/later.py",
+                    "line_start": 30,
+                    "line_end": 35,
+                    "name": "late_change",
+                    "risk_score": 0.12,
+                },
+                {
+                    "file_path": "/workspace/project/src/first.py",
+                    "line_start": 5,
+                    "line_end": 9,
+                    "name": "read_first",
+                    "risk_score": 0.93,
+                },
+            ],
+            "review_priorities": [
+                {
+                    "file_path": "/workspace/project/src/first.py",
+                    "line_start": 5,
+                    "line_end": 9,
+                    "name": "read_first",
+                    "risk_score": 0.93,
+                }
+            ],
+        }
+
+        block = self.bridge.build_navigation_block(
+            graph_result, "/workspace/project"
+        )
+
+        self.assertEqual(
+            block,
+            "src/first.py:5–9  read_first\n"
+            "src/later.py:30–35  late_change",
+        )
+        for excluded in ("risk_score", "test_gaps", "context_savings"):
+            self.assertNotIn(excluded, block)
+
+    def test_navigation_keeps_every_changed_function_without_a_cap(self):
+        changed_functions = [
+            {
+                "file_path": f"/workspace/project/src/change_{index}.py",
+                "line_start": index + 1,
+                "line_end": index + 1,
+                "name": f"change_{index}",
+            }
+            for index in range(12)
+        ]
+
+        block = self.bridge.build_navigation_block(
+            {
+                "changed_functions": changed_functions,
+                "review_priorities": [],
+            },
+            "/workspace/project",
+        )
+
+        self.assertEqual(len(block.splitlines()), len(changed_functions))
+        self.assertEqual(
+            block.splitlines()[-1],
+            "src/change_11.py:12–12  change_11",
+        )
+
     def test_parser_accepts_the_review_preparation_inputs(self):
         args = self.bridge.parse_args(
             [
@@ -562,6 +632,28 @@ The feature must keep the contract.
 
 Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words.""",
         )
+
+    def test_both_axis_briefs_receive_the_identical_navigation_block(self):
+        preparation = self.bridge.ReviewPreparation(
+            fixed_point="base-ref",
+            resolved_fixed_point="abc123",
+            commit_list="def456 feature change",
+            spec_source="spec.md",
+            spec_contents="Feature spec.",
+            standards_files=("AGENTS.md",),
+            navigation_block=(
+                "src/first.py:5–9  read_first\n"
+                "src/later.py:30–35  late_change"
+            ),
+        )
+        expected_suffix = (
+            "\n\nStart here (from the code graph; the diff is the full scope):\n"
+            "src/first.py:5–9  read_first\n"
+            "src/later.py:30–35  late_change"
+        )
+
+        self.assertTrue(preparation.brief("standards").endswith(expected_suffix))
+        self.assertTrue(preparation.brief("spec").endswith(expected_suffix))
 
     def test_standards_brief_names_the_documented_fallback(self):
         brief = self.bridge.build_standards_brief(
@@ -1045,6 +1137,68 @@ class FakePaneTestCase(unittest.TestCase):
         values.update(overrides)
         return base_args(**values)
 
+    def install_graph_stub(self, graph_result, graph_status=None):
+        graph_bin = self.root / "graph-bin"
+        graph_bin.mkdir()
+        call_log = self.root / "graph-calls.jsonl"
+        executable = graph_bin / "code-review-graph"
+        encoded_result = json.dumps(graph_result)
+        encoded_status = json.dumps(
+            graph_status
+            if graph_status is not None
+            else {
+                "nodes": 1,
+                "files": 1,
+                "built_at_commit": "graph-built-commit",
+            }
+        )
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json\n"
+            "import os\n"
+            "import pathlib\n"
+            "import sys\n"
+            "with pathlib.Path(os.environ['GRAPH_CALL_LOG']).open(\n"
+            "    'a', encoding='utf-8'\n"
+            ") as stream:\n"
+            "    stream.write(json.dumps({\n"
+            "        'argv': sys.argv[1:],\n"
+            "        'cwd': os.getcwd(),\n"
+            "        'dataDirEnv': os.environ.get('CRG_DATA_DIR'),\n"
+            "    }) + '\\n')\n"
+            "if sys.argv[1] == 'status':\n"
+            f"    print({encoded_status!r})\n"
+            "elif sys.argv[1] == 'detect-changes':\n"
+            f"    print({encoded_result!r})\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        self.enter(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": f"{graph_bin}{os.pathsep}{os.environ['PATH']}",
+                    "GRAPH_CALL_LOG": str(call_log),
+                },
+                clear=False,
+            )
+        )
+        return call_log
+
+    def use_graphless_path(self):
+        graphless_bin = self.root / "graphless-bin"
+        graphless_bin.mkdir()
+        git = shutil.which("git")
+        self.assertIsNotNone(git)
+        (graphless_bin / "git").symlink_to(git)
+        self.enter(
+            mock.patch.dict(
+                os.environ,
+                {"PATH": str(graphless_bin)},
+                clear=False,
+            )
+        )
+
     def run_bridge(self, args):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -1073,6 +1227,263 @@ class FakePaneTestCase(unittest.TestCase):
 
 
 class PreparationTests(FakePaneTestCase):
+    def test_the_graph_cli_runs_once_and_its_navigation_reaches_the_brief(self):
+        (self.worktree / ".code-review-graph").mkdir()
+        call_log = self.install_graph_stub(
+            {
+                "risk_score": 0.93,
+                "test_gaps": [{"name": "feature"}],
+                "context_savings": {"estimated_tokens_saved": 1200},
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                        "risk_score": 0.93,
+                    }
+                ],
+                "review_priorities": [],
+            }
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        calls = [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "update", "detect-changes"],
+        )
+        for call in calls:
+            self.assertEqual(
+                pathlib.Path(
+                    call["argv"][call["argv"].index("--repo") + 1]
+                ).resolve(),
+                self.worktree.resolve(),
+            )
+            self.assertEqual(
+                pathlib.Path(call["cwd"]).resolve(), self.worktree.resolve()
+            )
+        for call in calls[1:]:
+            self.assertEqual(
+                call["argv"][call["argv"].index("--base") + 1],
+                self.fixed_point,
+            )
+        self.assertIn("--json", calls[0]["argv"])
+        self.assertIn("--brief", calls[1]["argv"])
+        self.assertNotIn("--brief", calls[2]["argv"])
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn(
+            "Start here (from the code graph; the diff is the full scope):\n"
+            "feature.py:1–1  feature",
+            prompt,
+        )
+        for excluded in ("risk_score", "test_gaps", "context_savings"):
+            self.assertNotIn(excluded, prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
+    def test_an_empty_graph_result_contributes_no_navigation(self):
+        (self.worktree / ".code-review-graph").mkdir()
+        self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []}
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertIs(output["preparation"]["codeGraphUsed"], False)
+
+    def test_the_cli_resolves_a_graph_outside_the_main_checkout(self):
+        external_graph = self.root / "external-graph"
+        external_graph.mkdir()
+        self.enter(
+            mock.patch.dict(
+                os.environ,
+                {"CRG_DATA_DIR": str(external_graph)},
+                clear=False,
+            )
+        )
+        call_log = self.install_graph_stub(
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                    }
+                ],
+                "review_priorities": [],
+            }
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="spec"))
+
+        calls = [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "update", "detect-changes"],
+        )
+        for call in calls:
+            self.assertEqual(call["dataDirEnv"], str(external_graph))
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn("feature.py:1–1  feature", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
+    def test_a_main_checkout_with_no_graph_is_treated_as_unavailable(self):
+        call_log = self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []},
+            graph_status={
+                "nodes": 0,
+                "files": 0,
+                "last_updated": None,
+                "built_on_branch": None,
+                "built_at_commit": None,
+            },
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        calls = [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual([call["argv"][0] for call in calls], ["status"])
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertIs(output["preparation"]["codeGraphUsed"], False)
+
+    def test_an_unreadable_graph_status_contributes_no_navigation(self):
+        call_log = self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []},
+            graph_status=[],
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="spec"))
+
+        calls = [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual([call["argv"][0] for call in calls], ["status"])
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertIs(output["preparation"]["codeGraphUsed"], False)
+
+    def test_an_absent_graph_cli_leaves_the_brief_unchanged(self):
+        (self.worktree / ".code-review-graph").mkdir()
+        self.use_graphless_path()
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertFalse(output["preparation"]["codeGraphUsed"])
+
+    def test_a_dirty_worktree_never_queries_or_mentions_the_graph(self):
+        (self.worktree / ".code-review-graph").mkdir()
+        call_log = self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []}
+        )
+        (self.worktree / "pending.txt").write_text(
+            "uncommitted\n", encoding="utf-8"
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertFalse(call_log.exists())
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertFalse(output["preparation"]["codeGraphUsed"])
+
+    def test_a_linked_worktree_queries_the_graph_at_the_main_checkout(self):
+        main_checkout = self.worktree
+        linked_worktree = self.root / "linked-worktree"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_checkout),
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature-graph",
+                str(linked_worktree),
+                "HEAD",
+            ],
+            check=True,
+        )
+        (main_checkout / ".code-review-graph").mkdir()
+        self.worktree = linked_worktree
+        self.worktree_root = str(linked_worktree)
+        call_log = self.install_graph_stub(
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(main_checkout / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                    }
+                ],
+                "review_priorities": [],
+            }
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="spec"))
+
+        calls = [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+        expected_base = f"{self.fixed_point}...feature-graph"
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "update", "detect-changes"],
+        )
+        for call in calls:
+            self.assertEqual(
+                pathlib.Path(call["cwd"]).resolve(), main_checkout.resolve()
+            )
+            self.assertEqual(
+                pathlib.Path(
+                    call["argv"][call["argv"].index("--repo") + 1]
+                ).resolve(),
+                main_checkout.resolve(),
+            )
+        for call in calls[1:]:
+            self.assertEqual(
+                call["argv"][call["argv"].index("--base") + 1],
+                expected_base,
+            )
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn("feature.py:1–1  feature", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
     def test_an_unresolvable_fixed_point_fails_before_a_pane_opens(self):
         with mock.patch.object(
             self.bridge,
