@@ -31,8 +31,8 @@ python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py --reco
 
 When a review was started but its JSON result was lost — the command was killed, its output never
 arrived, or no `reviewSessionId` is held for a review known to have started — recover rather than
-start a second one: recovery re-attaches to the live review this tmux pane and worktree already
-owns, waits out the turn in flight, and prints the same per-axis JSON shape. Exit
+start a second one: recovery re-attaches to every live review axis this tmux pane and worktree
+already own, waits out the turns in flight, and prints each per-axis result with `recovered` true. Exit
 code 3 means no live review belongs here, and it is the only result that licenses a first review;
 starting one while the old pane lives reviews and bills the same change twice.
 
@@ -43,7 +43,8 @@ unless a follow-up passes a new value. Valid effort values differ per model, so 
 requested model actually supports.
 
 Parse the bridge's single JSON result through `axes`; a single-axis result has exactly one axis
-entry, and a two-axis result has `standards` and `spec`:
+entry, and a two-axis result has `standards` and `spec`. A recovered axis additionally has
+`recovered == true`, confirming that its result came from the turn already in flight:
 
 - `status == "completed"`: retain each axis's `reviewSessionId` and return its non-empty
   `finalMessage` under that axis. The Bridge has already closed every pane; the records keep the
