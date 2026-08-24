@@ -2,11 +2,12 @@
 # Black-box suite for the review adjudicator hook: PreToolUse JSON on stdin plus environment in,
 # decision JSON on stdout. Nothing here reaches into the script's internals.
 #
-# Case inventory is the decision table in review-switch/spec-122.md: coordinator standdown across
-# all four governed targets, bare-plugin denies under both configs, matching-lane allows,
-# mismatched-lane denies, and the codex-fallback exception.
+# Case inventory is the decision table the Adjudicator now holds: coordinator standdown across
+# both governed targets, the plugin reviewer denied whatever it is called with, and the
+# Dispatcher — the one skill left — allowed. Every case runs with no reviewer configuration in
+# reach, because the Adjudicator reads none: the Dispatcher is where that file is read.
 #
-# Run: bash review-switch/hook/tests/test-review-adjudicator.sh
+# Run: bash hook/tests/test-review-adjudicator.sh
 # ADJUDICATOR_UNDER_TEST overrides the script under test (defaults to the sibling copy).
 
 set -uo pipefail
@@ -22,24 +23,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-printf 'codex\n' >"$test_dir/reviewer-codex"
-printf 'cc\n' >"$test_dir/reviewer-cc"
+# A home with no reviewer configuration in it, and a config path that names nothing. A
+# decision that changes when these change would be a decision read from a file.
+mkdir -p "$test_dir/home"
 
 failures=0
 cases=0
 
-# run <reviewer-config: codex|cc|missing> <coordinator> <skill> <args>
+# run <coordinator> <skill> <args>
 run() {
-  local config=$1 coordinator=$2 skill=$3 args=$4 reviewer_file
-  case "$config" in
-    codex) reviewer_file="$test_dir/reviewer-codex" ;;
-    cc) reviewer_file="$test_dir/reviewer-cc" ;;
-    missing) reviewer_file="$test_dir/no-such-file" ;;
-    *) printf 'unknown config: %s\n' "$config" >&2; exit 2 ;;
-  esac
+  local coordinator=$1 skill=$2 args=$3
   jq -n --arg skill "$skill" --arg args "$args" \
     '{hook_event_name: "PreToolUse", tool_name: "Skill", tool_input: {skill: $skill, args: $args}}' \
-  | REVIEW_COORDINATOR="$coordinator" CODE_REVIEWER_FILE="$reviewer_file" bash "$adjudicator"
+  | REVIEW_COORDINATOR="$coordinator" HOME="$test_dir/home" \
+    CODE_REVIEWER_FILE="$test_dir/home/no-such-file" bash "$adjudicator"
 }
 
 fail() {
@@ -47,7 +44,7 @@ fail() {
   failures=$((failures + 1))
 }
 
-# expect_allow <name> <config> <coordinator> <skill> <args>
+# expect_allow <name> <coordinator> <skill> <args>
 expect_allow() {
   local name=$1; shift
   local out status
@@ -62,14 +59,14 @@ expect_allow() {
   fi
 }
 
-# expect_deny <name> <config> <coordinator> <skill> <args> -- <substring>...
+# expect_deny <name> <coordinator> <skill> <args> -- <substring>...
 expect_deny() {
   local name=$1; shift
-  local config=$1 coordinator=$2 skill=$3 args=$4; shift 4
+  local coordinator=$1 skill=$2 args=$3; shift 3
   [ "${1:-}" = "--" ] && shift
   local out decision reason
   cases=$((cases + 1))
-  out=$(run "$config" "$coordinator" "$skill" "$args")
+  out=$(run "$coordinator" "$skill" "$args")
   decision=$(jq -r '.hookSpecificOutput.permissionDecision // ""' <<<"$out" 2>/dev/null)
   if [ "$decision" != "deny" ]; then
     fail "$name: expected permissionDecision deny, got: $out"
@@ -90,68 +87,40 @@ expect_deny() {
 plugin=mattpocock-skills:code-review
 
 # --- Row 1: a coordinator owns review here; every governed target stands down -----------------
-for target in "$plugin" review-switch review-switch-cc review-switch-codex; do
-  expect_deny "standdown/$target" codex orchestrate "$target" "" -- \
+for target in "$plugin" review-switch; do
+  expect_deny "standdown/$target" orchestrate "$target" "" -- \
     "orchestrate" "already given to this session"
 done
 
-# The standdown holds whatever this machine is configured for.
-expect_deny "standdown/cc-config" cc orchestrate "$plugin" "" -- "orchestrate"
+# Any coordinator name works: the Adjudicator reads non-emptiness only.
+expect_deny "standdown/third-party" third-party-runner review-switch "" -- "third-party-runner"
 
-# Any coordinator name works: review-switch reads non-emptiness only.
-expect_deny "standdown/third-party" codex third-party-runner review-switch-cc "" -- \
-  "third-party-runner"
+# What the caller wrote in the args changes nothing about a standdown.
+expect_deny "standdown/with-args" orchestrate "$plugin" "review the branch" -- "orchestrate"
 
-# The cc lane's sanctioned forward does not survive a coordinator either.
-expect_deny "standdown/sentinel-forward" cc orchestrate "$plugin" "via=review-switch" -- \
-  "orchestrate"
+# --- Row 2: a manual session; the plugin reviewer is denied whatever it carries ----------------
+expect_deny "plugin/bare" "" "$plugin" "review the branch" -- "/review-switch"
+expect_deny "plugin/no-args" "" "$plugin" "" -- "/review-switch"
 
-# --- Row 2: manual session, bare plugin reviewer, both configs --------------------------------
-expect_deny "bare-plugin/codex" codex "" "$plugin" "review the branch" -- \
-  "codex" "/review-switch"
-expect_deny "bare-plugin/cc" cc "" "$plugin" "review the branch" -- \
-  "cc" "/review-switch"
-# A missing config file reads as the cc lane, and a bare call is still refused.
-expect_deny "bare-plugin/missing-config" missing "" "$plugin" "" -- "cc" "/review-switch"
+# The retired sentinels open nothing: they are ordinary words in the args now.
+expect_deny "plugin/retired-forward" "" "$plugin" "review the branch via=review-switch" -- \
+  "/review-switch"
+expect_deny "plugin/retired-fallback" "" "$plugin" "via=review-switch via=codex-fallback" -- \
+  "/review-switch"
+expect_deny "plugin/retired-router" "" "$plugin" "via=code-review-router" -- "/review-switch"
 
-# A sentinel is a whole argument, so a string that merely contains one is still a bare call.
-expect_deny "bare-plugin/prefixed-sentinel" cc "" "$plugin" "notvia=review-switch" -- "/review-switch"
-expect_deny "bare-plugin/suffixed-sentinel" cc "" "$plugin" "via=review-switch-evil" -- "/review-switch"
+# --- Row 3: the Dispatcher is the one skill left, and it is what every deny points at ---------
+expect_allow "dispatcher/with-target" "" review-switch "review the branch"
+expect_allow "dispatcher/no-target" "" review-switch ""
+expect_allow "dispatcher/reviewer-named" "" review-switch "review the branch --reviewer codex"
 
-# The retired router's sentinel opens nothing: on either lane it reads as a bare call.
-expect_deny "bare-plugin/retired-sentinel" cc "" "$plugin" "via=code-review-router" -- "/review-switch"
-expect_deny "bare-plugin/retired-sentinel-fallback" codex "" "$plugin" \
-  "via=code-review-router via=codex-fallback" -- "/review-switch"
-
-# The same holds for the fallback exception: only the exact token opens the Claude lane.
-expect_deny "fallback/lookalike" codex "" "$plugin" "via=review-switch via=codex-fallback-evil" -- \
-  "/review-switch-codex"
-
-# --- Row 3: manual session, lane matching the configured reviewer ------------------------------
-expect_allow "lane-match/codex" codex "" review-switch-codex "review the branch"
-expect_allow "lane-match/cc" cc "" review-switch-cc "review the branch"
-expect_allow "lane-match/cc-forward" cc "" "$plugin" "review the branch via=review-switch"
-expect_allow "lane-match/missing-config" missing "" review-switch-cc ""
-
-# The dispatcher itself is always allowed — it is what every deny points at.
-expect_allow "dispatcher/codex" codex "" review-switch "review the branch"
-expect_allow "dispatcher/cc" cc "" review-switch ""
-
-# Skills outside the family are none of the adjudicator's business, and the plugin reviewer is
+# Skills outside the family are none of the Adjudicator's business, and the plugin reviewer is
 # governed under its qualified name only.
-expect_allow "ungoverned/other-skill" codex "" orchestrate ""
-expect_allow "ungoverned/bare-name" codex "" code-review ""
-
-# --- Row 4: manual session, lane contradicting the configured reviewer -------------------------
-expect_deny "lane-mismatch/cc-under-codex" codex "" review-switch-cc "review the branch" -- \
-  "/review-switch-codex"
-expect_deny "lane-mismatch/codex-under-cc" cc "" review-switch-codex "review the branch" -- \
-  "/review-switch-cc"
-expect_deny "lane-mismatch/forward-under-codex" codex "" "$plugin" "via=review-switch" -- \
-  "/review-switch-codex"
-
-# --- Exception: the Codex lane's hard-error fallback to the Claude lane ------------------------
-expect_allow "fallback/codex" codex "" "$plugin" "review the branch via=review-switch via=codex-fallback"
+expect_allow "ungoverned/other-skill" "" orchestrate ""
+expect_allow "ungoverned/bare-name" "" code-review ""
+# The lane skills are gone; their names govern nothing.
+expect_allow "ungoverned/retired-cc-lane" "" review-switch-cc "review the branch"
+expect_allow "ungoverned/retired-codex-lane" "" review-switch-codex "review the branch"
 
 if [ "$failures" -eq 0 ]; then
   printf 'ok: %d cases\n' "$cases"

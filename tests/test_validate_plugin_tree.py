@@ -59,7 +59,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
         self.addCleanup(self.tree.close)
 
     def assert_rejects(self, text, mentioning):
-        self.tree.write("skills/review-switch-codex/tests/residue-fixture.txt", text)
+        self.tree.write("bridge/tests/residue-fixture.txt", text)
         result = run_validator(self.tree.root)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(mentioning, result.stdout + result.stderr)
@@ -98,7 +98,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
 
     def test_non_monetary_numbers_are_accepted(self):
         self.tree.write(
-            "skills/review-switch-codex/tests/residue-fixture.txt",
+            "bridge/tests/residue-fixture.txt",
             "Retry until the amount of pending waves reaches 0.\n"
             "The reviewer costs about 3 rounds of context.\n"
             "Set the price of admission: 2 approvals.\n"
@@ -115,7 +115,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
 
     def test_identifier_rule_is_inert_without_local_file(self):
         self.tree.write(
-            "skills/review-switch-codex/tests/residue-fixture.txt",
+            "bridge/tests/residue-fixture.txt",
             f"ssh {FIXTURE_IDENTIFIER} hostname\n",
         )
         result = run_validator(self.tree.root)
@@ -128,7 +128,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
 
     def test_nested_shipped_tests_directory_is_scanned(self):
         self.tree.write(
-            "skills/review-switch-codex/tests/residue-fixture.txt",
+            "bridge/tests/residue-fixture.txt",
             f"{PRIVATE_ENV_TOKEN}\n",
         )
         result = run_validator(self.tree.root)
@@ -158,7 +158,7 @@ class ValidatePluginTreeTests(unittest.TestCase):
     def test_configured_identifier_matches_whole_tokens_only(self):
         self.tree.write(IDENTIFIERS_FILE, f"{FIXTURE_IDENTIFIER}\n")
         self.tree.write(
-            "skills/review-switch-codex/tests/residue-fixture.txt",
+            "bridge/tests/residue-fixture.txt",
             f"ssh {FIXTURE_IDENTIFIER}name hostname\n"
             f"ssh {FIXTURE_IDENTIFIER}-2 hostname\n",
         )

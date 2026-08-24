@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 
-"""Interactive Codex TUI code-review channel for a Claude session.
+"""Code-review channel between a caller and the reviewing vendor it named.
 
-Round one starts a review lineage in its own tmux pane; round two resumes that
-thread, and `--recover-session` re-attaches to the turn a killed driver left in
-flight.
+Round one starts a review lineage; a round the Rounds Contract still allows
+resumes it, and `--recover-session` re-attaches to the review a killed driver
+left in flight. That contract is held here rather than stated anywhere: every
+result names the one action its caller is permitted next, and a resume past the
+cap is refused. A fresh lineage is always available.
 
-Given `--machine-log` and `--ticket`, every call also leaves the run's machine
-log the pair of `review` lines the contract describes — `running` on entry and
-`returned` on exit — so the dashboard's review annotation appears and disappears
-with no operator action and no model token spent (ADR-0001).
+Preparation and delivery are separate: preparation fills one Axis Brief per
+requested axis, and the Lane `--reviewer` names takes one brief and gives back
+that axis's result. A reviewer this bridge has no Lane for is refused by name
+before any of it opens. `codex` drives an interactive TUI lineage in a tmux pane
+of its own; `claude` drives a headless process and needs no tmux (ADR-0003).
+
+A caller that wants a review's start, each axis's cost, and its end observed
+hands in the commands to run at those points, and gets them run with this
+review's own facts in their environment. Pass none and nothing extra runs. The
+whole contact surface is this command, its result, and those hooks: nothing here
+reads a caller's configuration or names a caller's vocabulary (ADR-0002).
 """
 
 import argparse
@@ -35,13 +44,9 @@ try:
     import aiohttp
 except ImportError as error:
     raise SystemExit(
-        "tui_review_bridge requires Python package 'aiohttp'. "
+        "review_bridge requires Python package 'aiohttp'. "
         "Install it for the Python interpreter used by Claude Code."
     ) from error
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import launch_hook  # noqa: E402  — a sibling asset, reached from this file's own directory
-
 
 TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 # A thread's MCP servers announce themselves on the connection that started the
@@ -69,16 +74,60 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Recovery found nothing to re-attach to, which is a different answer from a
 # failed review: it is the one result that licenses starting a first review.
 NO_LIVE_SESSION_EXIT = 3
-# The log's own writer, so the `review` event's shape and its closed set of
-# states stay the log's alone: this bridge names the event, never spells it.
-MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
-# The vendor half of the lane this bridge reviews in. The model half is whatever
-# the lineage was pinned to, so the lane needs no argument of its own.
-REVIEW_VENDOR = "codex"
+# The reviewing vendor a caller names on `--reviewer`. The model is whatever the
+# lineage was pinned to, so the reviewer names the vendor and nothing else.
+REVIEWER_CODEX = "codex"
+REVIEWER_CLAUDE = "claude"
 CODE_GRAPH_CLI = "code-review-graph"
-# The four disjoint counters a `session-cost` line carries, in the machine log's
-# own spelling.
+# The four disjoint counters one axis's spend is reported as.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
+# The four points in a review's life a caller may hand one command for, each
+# mapped to when its command fires. The point's own name is both the option it
+# arrives on and the `REVIEW_EVENT` its command is handed, so a caller reading
+# either knows the other.
+CHILD_LAUNCH = "child-launch"
+REVIEW_START = "review-start"
+AXIS_END = "axis-end"
+REVIEW_END = "review-end"
+HOOK_POINTS = {
+    CHILD_LAUNCH: "once per launched reviewer process or pane",
+    REVIEW_START: (
+        "once per invocation, after preparation succeeds and before any Lane opens"
+    ),
+    AXIS_END: "once per started axis, on every exit path that axis can take",
+    REVIEW_END: "once per invocation, on every exit path",
+}
+HOOK_TIMEOUT_SECONDS = 30
+EVENT_VAR = "REVIEW_EVENT"
+COST_DETAIL_VAR = "REVIEW_COST_DETAIL"
+# One environment variable per counter, spelled from the counter itself so the
+# two cannot drift apart.
+COUNTER_VARS = {name: f"REVIEW_{name.upper()}_TOKENS" for name in COUNTERS}
+# Every variable some point sets. All of them leave the inherited environment
+# before this review's own facts go in, so a review run from inside another
+# review's hook cannot pass that review's facts off as this one's — the counters
+# and `REVIEW_COST_DETAIL` above all, which are answers to the same question and
+# never both true. A caller's own variables, this prefix included, are untouched.
+HOOK_VARS = frozenset({
+    EVENT_VAR,
+    COST_DETAIL_VAR,
+    "REVIEW_CHILD_CWD",
+    "REVIEW_CHILD_TMUX_TARGET",
+    "REVIEW_REVIEWER",
+    "REVIEW_MODEL",
+    "REVIEW_AXES",
+    "REVIEW_AXIS",
+    "REVIEW_STATUS",
+    "REVIEW_SESSION",
+    *COUNTER_VARS.values(),
+})
+# What a review that never reached a result of its own is: the result contract's
+# spelling for a failure, which is what both status-carrying points use.
+FAILED_STATUS = "failed"
+# A resume this contract has no round left for. Held apart from a failure: no
+# Lane opened, so nothing was reviewed and nothing was billed.
+REFUSED_STATUS = "refused"
+NO_THREAD_DETAIL = "this axis started no thread to read a cost from"
 # Where Codex keeps the rollout of every thread it has run, one JSONL file per
 # thread under a dated tree, each filename ending in the thread's own id.
 CODEX_HOME_ENV_VAR = "CODEX_HOME"
@@ -105,85 +154,110 @@ class NoLiveSessionError(RuntimeError):
     """No live review session belongs to the caller's owner identity."""
 
 
-class ReviewEvent:
-    """The pair of `review` lines one bridge call leaves in the run's machine log.
+def hook_command(args, point):
+    """The command this caller handed in for one point, or empty where it handed none."""
+    return getattr(args, hook_destination(point), None) or ""
 
-    Each axis thread that actually starts also leaves its own `session-cost`
-    line, so every line names one truthful session lineage and resolved model.
 
-    Both the log path and the ticket are optional everywhere they appear, and a
-    call given neither writes nothing: `--log` is optional on dispatch, and a run
-    without one still reviews normally.
+def hook_destination(point):
+    """The attribute one point's command arrives under, from the point's own name."""
+    return "on_" + point.replace("-", "_")
+
+
+def run_hook(args, point, **facts):
+    """Run the caller's command for one point of this review, if it handed one in.
+
+    The command is the caller's own, so it may carry whatever correlation token
+    that caller needs; all this adds is facts this review owns, in the
+    environment, plus the point's name in `REVIEW_EVENT`. It runs once, in the
+    reviewed working directory, with its output discarded and a bound on how long
+    it may take.
+
+    Observation must never change what a review returns, so a command that fails,
+    times out, or is not installed is swallowed here: the caller's exit status and
+    the JSON object it reads are the same either way.
     """
+    command = hook_command(args, point)
+    if not command:
+        return
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in HOOK_VARS
+    }
+    environment[EVENT_VAR] = point
+    environment.update(facts)
+    try:
+        subprocess.run(
+            command,
+            shell=True,
+            cwd=args.cwd,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HOOK_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
 
-    def __init__(self, log, ticket, model, vendor=REVIEW_VENDOR):
-        # Absolute where the path enters, before it is forwarded to the writer
-        # (ADR-0007), so what this bridge records cannot be moved by anyone's
-        # working directory. Symlinks are left alone: the operator's own name for
-        # the run directory is the one to log under.
-        self.log = os.path.abspath(log) if log else None
-        self.ticket = ticket
-        # Vendor then model, separated by a space: the annotation row prints the
-        # field verbatim after collapsing whitespace, so this is the spelling the
-        # dashboard shows.
-        self.lane = " ".join(part for part in (vendor, model) if part)
-        # A review leaves one cost line per started axis thread, whether it came
-        # back with figures or with the reason there are none.
-        self.costed = False
 
-    def write(self, state):
-        """Append one end of this review; returns nothing, and fails at nothing.
+def hook_child_launch(args, tmux_target=""):
+    """Name the reviewer child that just launched, and the window it runs in."""
+    run_hook(
+        args,
+        CHILD_LAUNCH,
+        REVIEW_CHILD_CWD=str(args.cwd),
+        REVIEW_CHILD_TMUX_TARGET=tmux_target,
+    )
 
-        A review that succeeded must not be reported as a failure because its
-        bookkeeping could not be written, so every way the append can go wrong is
-        swallowed here: the caller's exit status and the JSON object the reviewed
-        child reads are the same either way.
-        """
-        if not self.log or not self.ticket:
-            return
-        try:
-            subprocess.run(
-                [
-                    sys.executable, str(MACHINE_LOG), "--log", str(self.log),
-                    "review", "--ticket", str(self.ticket), "--lane", self.lane,
-                    "--state", state,
-                ],
-                capture_output=True, text=True, check=False,
-            )
-        except OSError:
-            pass
 
-    def cost(self, session, model, counters, detail):
-        """Append this review's one `session-cost` line; returns nothing, and fails at nothing.
+def hook_review_start(args, model):
+    """Name the review about to open: its reviewer, its model, and its axes."""
+    run_hook(
+        args,
+        REVIEW_START,
+        REVIEW_REVIEWER=args.reviewer,
+        REVIEW_MODEL=model or "",
+        REVIEW_AXES=",".join(requested_axes(args)),
+    )
 
-        Lane-tagged, so a review's spend is told apart from the implementing
-        child's, and written through the log's own writer, which holds the
-        figures-or-diagnosis rule: `counters` are the four disjoint totals, or
-        `None` with `detail` saying why nobody could tell.
 
-        Accounting must never fail a review, so every way this can go wrong is
-        swallowed here, exactly as the `review` pair's write is.
-        """
-        if not self.log or not self.ticket:
-            return
-        self.costed = True
-        command = [
-            sys.executable, str(MACHINE_LOG), "--log", str(self.log),
-            "session-cost", "--ticket", str(self.ticket),
-            "--executor", REVIEW_VENDOR, "--model", model or "", "--lane", self.lane,
-        ]
-        if session:
-            command += ["--session", str(session)]
-        if counters is None:
-            command += ["--detail", detail]
-        else:
-            for name in COUNTERS:
-                command += [f"--{name.replace('_', '-')}-tokens", str(counters[name])]
-            command += ["--total-tokens", str(sum(counters.values()))]
-        try:
-            subprocess.run(command, capture_output=True, text=True, check=False)
-        except OSError:
-            pass
+def cost_facts(counters, detail):
+    """One axis's spend: the four disjoint counters, or why there are none.
+
+    A figure invented out of a contradiction is worse than the diagnosis that
+    says the rollout could not be read, so the two never arrive together.
+    """
+    if counters is None:
+        return {COST_DETAIL_VAR: detail or ""}
+    return {COUNTER_VARS[name]: str(counters[name]) for name in COUNTERS}
+
+
+def hook_axis_end(args, axis, status, session, cost):
+    """End one axis: how it finished, and what its own reviewer spent.
+
+    What an axis spent is the Lane's to read — a rollout on one Lane, a printed
+    result on the other — so it arrives here already read, as the counters or as
+    the reason there are none. The model reported is the one the reviewer
+    resolved to and nothing else: the alias the caller asked for is already
+    theirs to remember.
+    """
+    counters, model, detail = cost
+    run_hook(
+        args,
+        AXIS_END,
+        REVIEW_AXIS=axis,
+        REVIEW_STATUS=status,
+        REVIEW_SESSION=session or "",
+        REVIEW_MODEL=model or "",
+        **cost_facts(counters, detail),
+    )
+
+
+def hook_review_end(args, status):
+    """Close this review out, whichever way it left."""
+    run_hook(args, REVIEW_END, REVIEW_STATUS=status)
 
 
 def codex_sessions_root(environment=None):
@@ -211,7 +285,7 @@ def find_rollout(root, thread_id):
 
 
 def rollout_counters(usage):
-    """Codex's cumulative counters as the machine log's four disjoint ones, or `None`.
+    """Codex's cumulative counters as the four disjoint ones an axis ends with, or `None`.
 
     Codex counts its cached tokens inside `input_tokens`, so they come back out
     here, and its reasoning tokens inside `output_tokens`, where they stay: the
@@ -249,7 +323,7 @@ def harvest_rollout(root, thread_id):
 
     A read of a file the lane already wrote, so it costs no model token and drives
     nothing. `counters` is `None` when the figures could not be read, and `detail`
-    then says why, which is the diagnosis the `session-cost` line carries instead.
+    then says why, which is the diagnosis the axis ends with instead.
 
     The **last** cumulative count is the answer: every turn appends one, and a
     resumed round two appends to the same file, so one read covers a whole review
@@ -303,32 +377,6 @@ def harvest_rollout(root, thread_id):
     return counters, model, None
 
 
-def resumed_thread_id(args):
-    """The thread a resumed call was about to review, or `None` when it names none.
-
-    A failed round still spent tokens in that thread, and the id is what keeps its rollout out of
-    a same-vendor child's figures, so the diagnosis row names it wherever the record survives.
-    """
-    if not getattr(args, "resume_session", None):
-        return None
-    try:
-        return SessionStore().read(args.resume_session).get("threadId")
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-
-def record_review_cost(review, thread_id):
-    """Leave this review's one `session-cost` line, harvested from its own rollout.
-
-    The model recorded is the one the thread resolved to and nothing else: the
-    caller's alias is already in the lane when every requested axis names the
-    same one. Mixed-model calls leave the lane vendor-only; each thread's model
-    field remains the per-axis truth either way.
-    """
-    counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
-    review.cost(thread_id, model, counters, detail)
-
-
 @dataclasses.dataclass(frozen=True)
 class InvocationOwner:
     tmux_server: str
@@ -343,6 +391,10 @@ class InvocationOwner:
 
     def to_dict(self):
         return dataclasses.asdict(self)
+
+
+def printable_git_command(arguments):
+    return " ".join(("git", *arguments))
 
 
 def run_git(cwd, *arguments):
@@ -361,27 +413,79 @@ def canonical_worktree_root(cwd):
     return str(pathlib.Path(cwd).resolve())
 
 
-def resolve_fixed_point(cwd, fixed_point):
-    result = run_git(
-        cwd, "rev-parse", "--verify", f"{fixed_point}^{{commit}}"
-    )
-    if result.returncode != 0 or not result.stdout.strip():
+@dataclasses.dataclass(frozen=True)
+class ReviewScope:
+    """The fixed point to the working tree as it stands, committed or not.
+
+    The tree is read live rather than snapshotted, so a Scope holds only as
+    long as the tree does; the Axis Brief asks for it to be left alone
+    (ADR-0004).
+    """
+
+    fixed_point: str
+    resolved_fixed_point: str
+    fork_point: str
+
+    UNTRACKED_ARGUMENTS = ("ls-files", "--others", "--exclude-standard")
+
+    @property
+    def diff_arguments(self):
+        """A diff of the tree against the fork point: committed, staged, and unstaged."""
+        return ("diff", self.fork_point)
+
+    @property
+    def emptiness_arguments(self):
+        """The same diff, asked only whether it is empty; --quiet must precede the rev."""
+        return ("diff", "--quiet", self.fork_point, "--")
+
+    @property
+    def diff_command(self):
+        return printable_git_command(self.diff_arguments)
+
+    @property
+    def untracked_command(self):
+        """The new files no diff can show, which is why the brief prints two lines."""
+        return printable_git_command(self.UNTRACKED_ARGUMENTS)
+
+
+def resolve_review_scope(cwd, fixed_point):
+    """The Scope a review runs over, or the failure that the fixed point is not one."""
+    resolved = run_git(cwd, "rev-parse", "--verify", f"{fixed_point}^{{commit}}")
+    fork = run_git(cwd, "merge-base", fixed_point, "HEAD")
+    if (
+        resolved.returncode != 0
+        or not resolved.stdout.strip()
+        or fork.returncode != 0
+        or not fork.stdout.strip()
+    ):
         raise RuntimeError(f"fixed point did not resolve: {fixed_point}")
-    return result.stdout.strip()
-
-
-def ensure_nonempty_diff(cwd, fixed_point):
-    result = run_git(
-        cwd, "diff", "--quiet", f"{fixed_point}...HEAD", "--"
+    return ReviewScope(
+        fixed_point=fixed_point,
+        resolved_fixed_point=resolved.stdout.strip(),
+        fork_point=fork.stdout.strip(),
     )
-    if result.returncode == 0:
+
+
+def ensure_scope_holds_work(cwd, scope):
+    """Raises when the tree matches the fixed point, which is nothing to review."""
+    diff = run_git(cwd, *scope.emptiness_arguments)
+    if diff.returncode == 1:
+        return
+    if diff.returncode != 0:
+        detail = diff.stderr.strip() or "git diff failed"
         raise RuntimeError(
-            f"three-dot diff is empty: git diff {fixed_point}...HEAD"
+            f"review scope could not be read for {scope.fixed_point}: {detail}"
         )
-    if result.returncode != 1:
-        detail = result.stderr.strip() or "git diff failed"
+    untracked = run_git(cwd, *scope.UNTRACKED_ARGUMENTS)
+    if untracked.returncode != 0:
+        detail = untracked.stderr.strip() or "git ls-files failed"
         raise RuntimeError(
-            f"three-dot diff could not be read for {fixed_point}: {detail}"
+            f"review scope could not be read for {scope.fixed_point}: {detail}"
+        )
+    if not untracked.stdout.strip():
+        raise RuntimeError(
+            "nothing to review: the working tree matches the fixed point "
+            f"{scope.fixed_point}"
         )
 
 
@@ -435,6 +539,22 @@ def resolve_owner(args, environment=None):
     return InvocationOwner(
         tmux_server=tmux_server_identity(tmux_value),
         origin_pane=origin_pane,
+        worktree_root=canonical_worktree_root(args.cwd),
+    )
+
+
+def lane_owner(args, lane):
+    """The identity this call's sessions belong to, tmux half filled or not.
+
+    The tuple is the Bridge's and every Lane is keyed by it. A Lane with no
+    window has no tmux half to fill, which is also what keeps a headless Lane's
+    records and a codex Lane's from ever matching each other's owner.
+    """
+    if lane.NEEDS_TMUX:
+        return resolve_owner(args)
+    return InvocationOwner(
+        tmux_server="",
+        origin_pane="",
         worktree_root=canonical_worktree_root(args.cwd),
     )
 
@@ -517,15 +637,20 @@ class SessionStore:
             )
         return state
 
-    def find_by_owner(self, owner):
-        """Returns every recoverable record this owner wrote, newest turn first.
+    def remove(self, session_id):
+        """Take back a record whose review never began; missing is already done."""
+        self.state_path(session_id).unlink(missing_ok=True)
 
-        The record is written before the turn is awaited, so a session whose
+    def find_by_owner(self, owner, required=()):
+        """Returns every record this owner wrote carrying `required`, newest first.
+
+        The record is written before the review is awaited, so a session whose
         driver died mid-review is already on disk under the same owner tuple the
-        resume path validates. A record without a `marker` predates recovery and
-        names no turn to wait on, so it is not recoverable; so is anything
-        unreadable or written by another version, which is skipped rather than
-        raised — one damaged file must not hide a healthy session.
+        resume path validates. What makes a record reachable again is the Lane's
+        to say, and it says so as the fields it needs to find its reviewer with:
+        a record missing one of them names nothing to wait on. Anything
+        unreadable or written by another version is skipped rather than raised —
+        one damaged file must not hide a healthy session.
         """
         found = []
         for path in sorted(self.root.glob("*.json")):
@@ -539,7 +664,7 @@ class SessionStore:
                 continue
             if state.get("owner") != owner.to_dict():
                 continue
-            if not state.get("marker") or not state.get("threadId"):
+            if any(not state.get(field) for field in required):
                 continue
             found.append(state)
         found.sort(key=lambda state: state.get("updatedAt") or 0, reverse=True)
@@ -555,7 +680,8 @@ def owner_lock(store, owner):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError(
-                "Another review bridge call is already running for this tmux pane"
+                "Another review bridge call is already running for "
+                + ("this tmux pane" if owner.origin_pane else "this worktree")
             ) from error
         yield
     finally:
@@ -674,7 +800,8 @@ class AppServerClient:
 
 STANDARDS_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff {fixed_point}...HEAD
+Diff: {diff_command}
+New files not in that diff: {untracked_command}
 Commits:
 {commit_list}
 Standards sources: {standards_files}
@@ -804,9 +931,10 @@ def read_code_graph_navigation(cwd, fixed_point):
         return None
 
 
-def build_standards_brief(fixed_point, commit_list, standards_files):
+def build_standards_brief(scope, commit_list, standards_files):
     return STANDARDS_BRIEF_TEMPLATE.format(
-        fixed_point=fixed_point,
+        diff_command=scope.diff_command,
+        untracked_command=scope.untracked_command,
         commit_list=with_trailing_newline(commit_list),
         standards_files=(
             ", ".join(standards_files)
@@ -818,7 +946,8 @@ def build_standards_brief(fixed_point, commit_list, standards_files):
 
 SPEC_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff {fixed_point}...HEAD
+Diff: {diff_command}
+New files not in that diff: {untracked_command}
 Commits:
 {commit_list}
 Spec:
@@ -826,9 +955,10 @@ Spec:
 Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."""
 
 
-def build_spec_brief(fixed_point, commit_list, spec_contents):
+def build_spec_brief(scope, commit_list, spec_contents):
     return SPEC_BRIEF_TEMPLATE.format(
-        fixed_point=fixed_point,
+        diff_command=scope.diff_command,
+        untracked_command=scope.untracked_command,
         commit_list=with_trailing_newline(commit_list),
         spec_contents=with_trailing_newline(spec_contents),
     )
@@ -836,8 +966,7 @@ def build_spec_brief(fixed_point, commit_list, spec_contents):
 
 @dataclasses.dataclass(frozen=True)
 class ReviewPreparation:
-    fixed_point: str
-    resolved_fixed_point: str
+    scope: ReviewScope
     commit_list: str
     spec_source: str
     spec_contents: str | None
@@ -846,10 +975,19 @@ class ReviewPreparation:
     code_graph_used: bool = False
 
     def brief(self, axis):
+        """This axis's Axis Brief, ready for whichever Lane delivers it."""
+        return AxisBrief(axis=axis, text=self.brief_text(axis))
+
+    def briefs(self, axes):
+        """One Axis Brief per axis, in the order a review runs them."""
+        return tuple(self.brief(axis) for axis in axes)
+
+    def brief_text(self, axis):
+        """The text of one axis's brief, or the failure that there is none."""
         if axis == "standards":
             return append_navigation_block(
                 build_standards_brief(
-                    self.fixed_point, self.commit_list, self.standards_files
+                    self.scope, self.commit_list, self.standards_files
                 ),
                 self.navigation_block,
             )
@@ -861,7 +999,7 @@ class ReviewPreparation:
                 )
             return append_navigation_block(
                 build_spec_brief(
-                    self.fixed_point, self.commit_list, self.spec_contents
+                    self.scope, self.commit_list, self.spec_contents
                 ),
                 self.navigation_block,
             )
@@ -869,11 +1007,24 @@ class ReviewPreparation:
 
     def report(self):
         return {
-            "fixedPoint": self.resolved_fixed_point,
+            "fixedPoint": self.scope.resolved_fixed_point,
             "specSource": self.spec_source,
             "standardsFiles": list(self.standards_files),
             "codeGraphUsed": self.code_graph_used,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisBrief:
+    """The prompt one Lane receives for one axis.
+
+    Preparation fills a brief and delivery reads one; a Lane changes who reads a
+    brief, never what it says, which is what makes a finding on one Lane a
+    finding on the other (ADR-0003).
+    """
+
+    axis: str
+    text: str
 
 
 def read_commit_list(cwd, fixed_point):
@@ -933,12 +1084,17 @@ def read_spec(repo_root, reference):
 
 
 def prepare_review(args):
+    """Everything every requested axis needs, or the failure that there is not.
+
+    Each requested axis's brief is built here rather than where its Lane opens,
+    so an axis that cannot be briefed fails preparation — before this review is
+    reported started, and before any pane exists to tear down.
+    """
     repo_root = canonical_worktree_root(args.cwd)
     source, contents = read_spec(repo_root, args.spec)
     navigation_block = read_code_graph_navigation(repo_root, args.base)
-    return ReviewPreparation(
-        fixed_point=args.base,
-        resolved_fixed_point=args.resolved_base,
+    preparation = ReviewPreparation(
+        scope=args.scope,
         commit_list=read_commit_list(args.cwd, args.base),
         spec_source=source,
         spec_contents=contents,
@@ -946,43 +1102,34 @@ def prepare_review(args):
         navigation_block=navigation_block,
         code_graph_used=navigation_block is not None,
     )
+    for axis in requested_axes(args):
+        preparation.brief(axis)
+    return preparation
 
 
 def preparation_report(args):
     return args.preparation.report() if args.preparation is not None else None
 
 
-def build_prompt(args, bridge_id):
-    if args.browser_probe:
-        return build_browser_probe_prompt(bridge_id)
-    if args.probe:
-        return build_probe_prompt(bridge_id)
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        f"{args.preparation.brief(args.axis)}"
-    )
+def build_prompt(brief, bridge_id):
+    """One brief as the turn that carries it, marked so its own turn can be found again."""
+    return f"[claude-tui-review-bridge:{bridge_id}]\n{brief.text}"
 
 
-def build_probe_prompt(bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        "This is a bridge health probe. Do not run commands, read files, or call "
-        "tools. Reply with exactly: TUI_REVIEW_BRIDGE_OK"
-    )
-
-
-def build_browser_probe_prompt(bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        "This is an authorized end-to-end browser-control probe. Use the installed "
-        "Browser control skill and its browser runtime. Do not use curl, web search, "
-        "Playwright CLI, or another HTTP client. Automatically open "
-        "https://example.com in the runtime-selected browser, read the page title "
-        "and visible h1 text, then close only the tab created for this probe. Report "
-        "the selected browser backend, title, h1, and whether cleanup succeeded. If "
-        "browser connection or control fails, report the exact failure without "
-        "substituting another method."
-    )
+PROBE_BRIEF = (
+    "This is a bridge health probe. Do not run commands, read files, or call "
+    "tools. Reply with exactly: TUI_REVIEW_BRIDGE_OK"
+)
+BROWSER_PROBE_BRIEF = (
+    "This is an authorized end-to-end browser-control probe. Use the installed "
+    "Browser control skill and its browser runtime. Do not use curl, web search, "
+    "Playwright CLI, or another HTTP client. Automatically open "
+    "https://example.com in the runtime-selected browser, read the page title "
+    "and visible h1 text, then close only the tab created for this probe. Report "
+    "the selected browser backend, title, h1, and whether cleanup succeeded. If "
+    "browser connection or control fails, report the exact failure without "
+    "substituting another method."
+)
 
 
 def read_log_tail(path, limit=4000):
@@ -1013,15 +1160,6 @@ def terminate_process(process):
         process.wait(timeout=3)
 
 
-def child_session_env(hook):
-    """Environment for the Codex processes this bridge spawns.
-
-    A review child is a child launch like any other, so it carries whatever the
-    project's on-child-launch hook adds — nothing, until a project configures it.
-    """
-    return hook.child_env()
-
-
 def model_config_overrides(args):
     """`-c` overrides pinning model/effort, or nothing when neither was chosen.
 
@@ -1049,6 +1187,127 @@ def resolve_axis_choice(args, axis, choice):
     return getattr(args, choice, None)
 
 
+# ---------------------------------------------------------------------------
+# The Rounds Contract.
+#
+# The cap on one review lineage, held here and enforced rather than stated, so
+# that it holds without depending on a reviewing model reading and obeying it.
+# Standards findings are fixed in one pass and earn no re-review; spec findings
+# that required fixes earn exactly one, scoped to those fixes. Every result
+# names the one action its caller is permitted next, which is the only channel
+# that reaches a child with no skill of ours to read.
+#
+# What escalation *is* stays the caller's: nothing here names the act, only the
+# moment.
+# ---------------------------------------------------------------------------
+#: The one axis whose findings earn a re-review.
+SPEC_AXIS = "spec"
+#: How many rounds the spec axis earns: the first, and the one re-review.
+SPEC_AXIS_ROUNDS = 2
+#: How many rounds every other axis earns, the standards axis above all.
+SINGLE_ROUND = 1
+NEXT_FIX_AND_STOP = "fix and stop"
+NEXT_FIX_THEN_ONE_RE_REVIEW = "fix then one re-review"
+NEXT_ESCALATE = "escalate"
+
+
+def rounds_per_lineage(axis):
+    """How many rounds one lineage of this axis earns."""
+    return SPEC_AXIS_ROUNDS if axis == SPEC_AXIS else SINGLE_ROUND
+
+
+def rounds_had(state):
+    """How many rounds this lineage has had.
+
+    A review that reached no record of its own had the round it was in, and a
+    record written before the count existed is a lineage that had exactly one.
+    """
+    return state.get("rounds", SINGLE_ROUND) if state else SINGLE_ROUND
+
+
+def next_action(axis, rounds):
+    """The one action a caller is permitted next on this lineage."""
+    if rounds < rounds_per_lineage(axis):
+        return NEXT_FIX_THEN_ONE_RE_REVIEW
+    if rounds > SINGLE_ROUND:
+        # The re-review this lineage earned has been had, and a finding that
+        # survived it has no further round to go to.
+        return NEXT_ESCALATE
+    return NEXT_FIX_AND_STOP
+
+
+def refusal_for(state):
+    """The refusal this lineage's next round gets, or `None` when it has one.
+
+    The lineage's own record decides the axis, which is what makes the cap per
+    lineage: a lineage that reached its cap exhausts itself and no other, and a
+    fresh review is always available.
+    """
+    axis = state["axis"]
+    rounds = rounds_had(state)
+    allowed = rounds_per_lineage(axis)
+    if rounds < allowed:
+        return None
+    return {
+        "status": REFUSED_STATUS,
+        "axes": {
+            axis: {
+                "status": REFUSED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": state["reviewSessionId"],
+                "reason": (
+                    f"a {axis} axis earns {allowed} round(s) per review "
+                    f"lineage, and this one has had {rounds}"
+                ),
+                "next": NEXT_ESCALATE,
+            }
+        },
+        "preparation": None,
+    }
+
+
+def refuse_resume_past_cap(args, owner, store):
+    """The refusal a resume gets before anything is prepared, or `None`.
+
+    Read before preparation and before any Lane opens, so a resume the contract
+    plainly has no round for costs its caller nothing. This is the early answer
+    and not the binding one: the copy read here may already have been overtaken
+    by a sibling call, so the round itself is granted under the lock instead.
+
+    Whose session it is is settled first. A handle belonging to another owner is
+    not this caller's to be told anything about, its rounds included.
+    """
+    if args.recover_session or not args.resume_session:
+        return None
+    state = args.resume_state or store.read(args.resume_session)
+    validate_session_owner(state, owner)
+    return refusal_for(state)
+
+
+def grant_round(args, owner, store):
+    """Take this resume's round, or the refusal that its lineage has none left.
+
+    Read from disk and written back here, under the owner's lock and before the
+    reviewer is launched. Both halves belong here. Reading: the copy a caller
+    arrived with predates any round a sibling call has since taken, and a cap
+    decided on that copy is a cap two calls can pass at once. Writing: a round
+    consumed but never recorded is one the contract cannot hold the next call
+    to, so the round is spent when it is granted rather than when it succeeds —
+    a resume that then fails has still had it, and a fresh lineage is the way
+    back.
+
+    Returns the record the Lane resumes, and the refusal that it may not.
+    """
+    state = store.read(args.resume_session)
+    validate_session_owner(state, owner)
+    refusal = refusal_for(state)
+    if refusal is not None:
+        return state, refusal
+    state["rounds"] = rounds_had(state) + 1
+    store.write(state["reviewSessionId"], state)
+    return state, None
+
+
 def validate_resume_axis(args, state):
     """Reject a caller axis that disagrees with the axis owned by the resume handle."""
     saved_axis = state["axis"]
@@ -1060,7 +1319,7 @@ def validate_resume_axis(args, state):
 
 
 def resume_state_for_review(args):
-    """Read and validate a resumed handle before its machine-log `running` event."""
+    """Read and validate a resumed handle before this review is reported started."""
     if not args.resume_session:
         return None
     state = SessionStore().read(args.resume_session)
@@ -1068,13 +1327,41 @@ def resume_state_for_review(args):
     return state
 
 
-def review_event_model(args, resume_state=None):
-    """Return the model shared by requested axes, including a resumed axis's saved pin."""
+def requested_axes(args):
+    """The axes this call asked for, in the order a review runs them."""
+    return ("standards", "spec") if args.axis == "both" else (args.axis,)
+
+
+def axis_brief(args, axis):
+    """One axis's Brief: what preparation filled, or a probe's fixed text.
+
+    A health probe is prepared for nothing and carries no axis of its own, so it
+    brings its own text and delivers whatever `--axis` says as a single Lane.
+    """
+    if args.browser_probe:
+        return AxisBrief(axis=axis, text=BROWSER_PROBE_BRIEF)
+    if args.probe:
+        return AxisBrief(axis=axis, text=PROBE_BRIEF)
+    return args.preparation.brief(axis)
+
+
+def axis_briefs(args):
+    """Every Brief this call delivers, in the order a review runs them."""
+    if args.probe or args.browser_probe:
+        return (axis_brief(args, args.axis),)
+    return args.preparation.briefs(requested_axes(args))
+
+
+def review_start_model(args, resume_state=None):
+    """The model every requested axis shares, including a resumed axis's saved pin.
+
+    Axes pinned to different models share none, and a review that starts on more
+    than one model can name no single one truthfully.
+    """
     if resume_state is not None:
         selected = resolve_axis_choice(args, resume_state["axis"], "model")
         return selected if selected is not None else resume_state.get("model")
-    axes = ("standards", "spec") if args.axis == "both" else (args.axis,)
-    models = [resolve_axis_choice(args, axis, "model") for axis in axes]
+    models = [resolve_axis_choice(args, axis, "model") for axis in requested_axes(args)]
     return models[0] if all(model == models[0] for model in models[1:]) else None
 
 
@@ -1083,7 +1370,6 @@ def run_pane(args):
     socket_path = runtime_dir / "app-server.sock"
     log_path = runtime_dir / "app-server.log"
     log_file = log_path.open("a", encoding="utf-8")
-    child_env = child_session_env(launch_hook.load_hook(args.cwd))
     app_server_command = [
         "codex",
         "app-server",
@@ -1103,7 +1389,6 @@ def run_pane(args):
     app_server = subprocess.Popen(
         app_server_command,
         cwd=args.cwd,
-        env=child_env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -1264,8 +1549,13 @@ def launch_pane(args, runtime_dir):
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "tmux split-window failed")
-    pane_id = result.stdout.strip()
-    launch_hook.load_hook(args.cwd).run(args.cwd, tmux_target=pane_id)
+    return result.stdout.strip()
+
+
+def open_child_pane(args, runtime_dir):
+    """Open this axis's pane, and tell the caller's hook which child it got."""
+    pane_id = launch_pane(args, runtime_dir)
+    hook_child_launch(args, tmux_target=pane_id)
     return pane_id
 
 
@@ -1540,6 +1830,8 @@ def session_state(
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
         "axis": axis,
+        # Rounds this lineage has had, which the Rounds Contract caps.
+        "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
         "runtimeDir": str(runtime_dir),
         "socketPath": str(runtime_dir / "app-server.sock"),
@@ -1611,6 +1903,10 @@ class AxisCompleted:
     state: dict
     turn: dict
 
+    @property
+    def thread_id(self):
+        return self.state["threadId"]
+
 
 @dataclasses.dataclass(frozen=True)
 class AxisFailure:
@@ -1627,19 +1923,25 @@ class AxisRunError(Exception):
         self.reason = reason
 
 
-def launch_axis(args, axis, tmux_target, split_direction):
+def axis_arguments(args, axis):
+    """This call's arguments as one axis sees them, with that axis's choices pinned."""
     axis_args = argparse.Namespace(**vars(args))
     axis_args.axis = axis
     for choice in ("model", "effort"):
         setattr(axis_args, choice, resolve_axis_choice(args, axis, choice))
+    return axis_args
+
+
+def launch_axis(args, brief, tmux_target, split_direction):
+    axis_args = axis_arguments(args, brief.axis)
     axis_args.tmux_target = tmux_target
     axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(axis_args, bridge_id)
+    prompt = build_prompt(brief, bridge_id)
     runtime_dir = make_runtime(prompt)
     try:
-        pane_id = launch_pane(axis_args, runtime_dir)
+        pane_id = open_child_pane(axis_args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -1709,37 +2011,6 @@ async def drive_terminal_axis(launch, owner, store):
     return result
 
 
-async def run_new_review(args, owner, store):
-    launch = launch_axis(
-        args, args.axis, owner.origin_pane, "horizontal"
-    )
-    return await drive_terminal_axis(launch, owner, store)
-
-
-async def run_new_reviews(args, owner, store):
-    if args.preparation is not None:
-        args.preparation.brief("spec")
-    launches = []
-    try:
-        standards = launch_axis(
-            args, "standards", owner.origin_pane, "horizontal"
-        )
-        launches.append(standards)
-        spec = launch_axis(
-            args, "spec", standards.pane_id, "vertical"
-        )
-        launches.append(spec)
-    except Exception:
-        for launch in launches:
-            cleanup_pane(launch.pane_id, launch.runtime_dir)
-        raise
-
-    completed = await asyncio.gather(
-        *(drive_terminal_axis(launch, owner, store) for launch in launches)
-    )
-    return dict(zip(("standards", "spec"), completed, strict=True))
-
-
 async def connect_existing_session(state):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -1762,7 +2033,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
     runtime_dir = make_runtime(prompt)
     args.tmux_target = owner.origin_pane
     try:
-        pane_id = launch_pane(args, runtime_dir)
+        pane_id = open_child_pane(args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -1804,8 +2075,8 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
         await client.__aexit__(None, None, None)
 
 
-async def run_existing_review(args, owner, store):
-    state = getattr(args, "_resume_state", None)
+async def run_existing_review(args, brief, owner, store):
+    state = args.resume_state
     if state is None:
         state = store.read(args.resume_session)
     validate_resume_axis(args, state)
@@ -1813,7 +2084,7 @@ async def run_existing_review(args, owner, store):
     apply_session_model_choice(args, state)
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(args, bridge_id)
+    prompt = build_prompt(brief, bridge_id)
     # On disk before the turn is awaited, for the same reason the first review
     # writes its record early: a driver killed mid-turn must leave a marker the
     # recovery path can wait on.
@@ -1883,7 +2154,12 @@ async def run_recovered_reviews(args, owner, store):
         return AxisCompleted(state, turn)
 
     recovered = await asyncio.gather(
-        *(recover(state) for state in store.find_by_owner(owner))
+        *(
+            recover(state)
+            for state in store.find_by_owner(
+                owner, required=CodexLane.RECOVERABLE_FIELDS
+            )
+        )
     )
     live = [run for run in recovered if run is not None]
     if live:
@@ -1894,83 +2170,795 @@ async def run_recovered_reviews(args, owner, store):
     )
 
 
-async def run_bridge(args, review=None):
+class Lane:
+    """The seam every Lane is reached through, and the half every Lane shares.
+
+    Preparation is finished by the time a Lane is opened, so a Lane takes one
+    Axis Brief and gives back that axis's result; everything that is a vendor's
+    rather than the review's lives on the far side of this seam. What every Lane
+    does alike — whose sessions these are, how an axis ends, what a recovered
+    review was prepared from — is here; what only one vendor does is not.
+    """
+
+    #: Whether this Lane's reviewer runs in a tmux pane of the caller's server.
+    NEEDS_TMUX = False
+    #: What an axis that reached no reviewer of its own spent, which is nothing
+    #: readable. Each Lane names the reason its own reviewer could not be read.
+    NO_COST = (None, None, "this axis reached no reviewer to read a cost from")
+
+    def __init__(self, args, owner, store):
+        self.args = args
+        self.owner = owner
+        self.store = store
+
+    def axis_cost(self, run):
+        """What one axis spent, read wherever this Lane's reviewer records it."""
+        raise NotImplementedError
+
+    def end_axis(self, axis, result, run):
+        """End an axis this Lane drove to a result of its own."""
+        hook_axis_end(
+            self.args,
+            axis,
+            result["status"],
+            result["reviewSessionId"],
+            self.axis_cost(run),
+        )
+
+    def end_launched_axis(self, axis):
+        """End an axis that opened its reviewer and never got a result of its own.
+
+        A sibling axis failing to open tears this one down before it could report
+        anything, and the point still owes the caller one end for the child it
+        was told about.
+        """
+        hook_axis_end(self.args, axis, FAILED_STATUS, None, self.NO_COST)
+
+    def recovered_preparation(self, runs):
+        """What a recovered review was prepared from, read back off its own records."""
+        return next(
+            (
+                run.state.get("preparation")
+                for run in runs
+                if run.state is not None
+            ),
+            None,
+        )
+
+
+class CodexLane(Lane):
+    """Delivery to the codex reviewer: one Codex TUI pane per axis.
+
+    Everything that is codex's rather than the review's — panes, threads,
+    app-server connections, the record on disk — lives on this side of the seam.
+    """
+
+    name = REVIEWER_CODEX
+    NEEDS_TMUX = True
+    NO_COST = (None, None, NO_THREAD_DETAIL)
+    #: What a record must carry for a recovering caller to find its turn again.
+    RECOVERABLE_FIELDS = ("marker", "threadId")
+
+    def __init__(self, args, owner, store):
+        super().__init__(args, owner, store)
+        # Pane layout: the first axis splits off the caller's own pane to its
+        # right, and each further axis splits off the one before it, downwards.
+        self.previous_pane = None
+
+    def open(self, brief):
+        """Open one axis's pane, ready to be driven."""
+        launch = launch_axis(
+            self.args,
+            brief,
+            self.previous_pane or self.owner.origin_pane,
+            "vertical" if self.previous_pane else "horizontal",
+        )
+        self.previous_pane = launch.pane_id
+        return launch
+
+    def discard(self, launch):
+        """Tear down an axis that opened but will never be driven."""
+        cleanup_pane(launch.pane_id, launch.runtime_dir)
+
+    async def deliver(self, launch):
+        """Drive one opened axis to a result of its own."""
+        return await drive_terminal_axis(launch, self.owner, self.store)
+
+    async def resume(self, brief):
+        """Put one more turn to the lineage a resume handle names."""
+        return await run_existing_review(self.args, brief, self.owner, self.store)
+
+    async def recover(self):
+        """Re-attach to every axis this owner already has running."""
+        return await run_recovered_reviews(self.args, self.owner, self.store)
+
+    def settle(self, run):
+        """Close one axis out: its record written, its pane down, its result returned."""
+        args = self.args
+        handed_back = args.recover_session or args.resume_session
+        if isinstance(run, AxisFailure):
+            if handed_back:
+                cleanup_pane(
+                    run.state.get("paneId") if run.state else None,
+                    run.state.get("runtimeDir") if run.state else None,
+                )
+            return {
+                "status": FAILED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": (
+                    run.state["reviewSessionId"] if run.state else None
+                ),
+                "reason": run.reason,
+            }
+        state, turn = run.state, run.turn
+        final_message = final_agent_message(turn)
+        target = state["target"] if args.recover_session else args.base
+        update_session_after_turn(state, turn, target)
+        if not args.recover_session:
+            state["preparation"] = preparation_report(args)
+        self.store.write(state["reviewSessionId"], state)
+        if handed_back:
+            cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
+        return axis_result(state, turn, final_message)
+
+    def axis_cost(self, run):
+        """What an axis spent, read from the Codex rollout its own thread wrote."""
+        if run.thread_id is None:
+            return self.NO_COST
+        return harvest_rollout(codex_sessions_root(), run.thread_id)
+
+
+# A headless reviewer has nobody to answer a permission prompt, so the mode is
+# not a caller-tunable option.
+CLAUDE_PERMISSION_MODE = "bypassPermissions"
+# Which Claude login the reviewer spends on. Claude Code scopes login state to
+# this variable, so setting it is what routes the spend. The value arrives
+# already resolved to a profile directory: this bridge reads no account registry.
+CLAUDE_CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
+CLAUDE_BINARY_ENV_VAR = "CODE_REVIEW_CLAUDE_BINARY"
+# The one JSON object a headless reviewer prints, and everything else it said.
+CLAUDE_RESULT_FILENAME = "result.json"
+CLAUDE_LOG_FILENAME = "claude.log"
+# What a headless result's `usage` object calls each of the four counters. Claude
+# reports its cached tokens beside the input count rather than inside it, so the
+# four arrive already disjoint.
+CLAUDE_USAGE_FIELDS = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "cache_creation": "cache_creation_input_tokens",
+}
+NO_RESULT_DETAIL = "this axis returned no result to read a cost from"
+NO_USAGE_DETAIL = "this axis's result reported no usage to read a cost from"
+# How often a recovering caller looks to see whether the reviewer it adopted has
+# exited. It did not start that process, so waiting on it is polling or nothing.
+CLAUDE_EXIT_POLL_SECONDS = 0.25
+
+
+def resolve_claude_binary(explicit=None, environment=None):
+    """Absolute path of the real `claude` executable.
+
+    The launch below is an argv list with no shell, so a `claude` *shell
+    function* is already out of the picture. Resolving symlinks as well means a
+    wrapper script dropped on PATH cannot intercept the reviewer either.
+    """
+    environment = os.environ if environment is None else environment
+    candidate = explicit or environment.get(CLAUDE_BINARY_ENV_VAR)
+    if not candidate:
+        candidate = shutil.which("claude", path=environment.get("PATH"))
+    if not candidate:
+        raise RuntimeError("Cannot find the claude executable")
+    resolved = pathlib.Path(candidate).resolve()
+    if not resolved.is_file():
+        raise RuntimeError(f"claude executable does not exist: {resolved}")
+    return str(resolved)
+
+
+def build_claude_command(binary, prompt, model, effort, resume_id):
+    """The exact argv handed to one headless reviewer, in a stable order."""
+    command = [
+        binary,
+        "-p",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        CLAUDE_PERMISSION_MODE,
+    ]
+    if model:
+        command.extend(["--model", model])
+    if effort:
+        command.extend(["--effort", effort])
+    if resume_id:
+        command.extend(["-r", resume_id])
+    command.append(prompt)
+    return command
+
+
+def claude_child_environment(account):
+    """The reviewer's environment, or `None` to inherit the caller's untouched.
+
+    An account is a profile directory, and naming one overrides whatever login
+    the caller happens to be on, so a review billed to one account is not a hole
+    in it. A call that names none inherits the caller's login exactly as it
+    stands: the default home spelled out explicitly is a login that can fail
+    where the inherited one works.
+    """
+    if not account:
+        return None
+    return {**os.environ, CLAUDE_CONFIG_HOME_ENV_VAR: account}
+
+
+def claude_process_alive(pid):
+    """True while the reviewer a record names is still running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def terminate_claude(pid):
+    """Take down a reviewer and whatever it started, and fail at nothing."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        return
+
+
+class ClaudeProcess:
+    """One headless reviewer, seen only through what its driver may do to it."""
+
+    def __init__(self, process):
+        self.process = process
+
+    @property
+    def pid(self):
+        return self.process.pid
+
+    async def wait(self, timeout):
+        await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout)
+
+    def kill(self):
+        terminate_claude(self.pid)
+
+
+def launch_claude(args, command, runtime_dir):
+    """Start this axis's reviewer, in a session of its own.
+
+    A session of its own is what makes this Lane recoverable: a driver that dies
+    leaves the reviewer running and its result still on its way to the file it
+    prints into, which is the promise the codex Lane's pane makes too.
+    """
+    result_path = runtime_dir / CLAUDE_RESULT_FILENAME
+    log_path = runtime_dir / CLAUDE_LOG_FILENAME
+    try:
+        with open(result_path, "wb") as printed, open(log_path, "wb") as said:
+            process = subprocess.Popen(
+                command,
+                cwd=args.cwd,
+                env=claude_child_environment(args.account),
+                stdin=subprocess.DEVNULL,
+                stdout=printed,
+                stderr=said,
+                start_new_session=True,
+            )
+    except OSError as error:
+        raise RuntimeError(f"Cannot launch headless Claude: {error}") from error
+    return ClaudeProcess(process)
+
+
+def open_child_process(args, command, runtime_dir):
+    """Start this axis's reviewer, and tell the caller's hook which child it got."""
+    process = launch_claude(args, command, runtime_dir)
+    hook_child_launch(args)
+    return process
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeResult:
+    """The one JSON object a headless reviewer prints, in the parts a Lane reads."""
+
+    session_id: str
+    result: str
+    is_error: bool
+    subtype: str
+    permission_denials: list
+    payload: dict
+
+
+def read_claude_result(path):
+    """What the reviewer printed, or the failure that it printed no result."""
+    try:
+        text = pathlib.Path(path).read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    except OSError as error:
+        raise RuntimeError(
+            f"the reviewer's result could not be read: {error}"
+        ) from error
+    if not text:
+        raise RuntimeError("the reviewer produced no output")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"the reviewer's output is not JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("the reviewer's output is not a JSON object")
+    if not payload.get("session_id"):
+        raise RuntimeError("the reviewer's output carries no session id")
+    denials = payload.get("permission_denials") or []
+    if not isinstance(denials, list):
+        denials = [denials]
+    return ClaudeResult(
+        session_id=payload["session_id"],
+        result=payload.get("result") or "",
+        is_error=bool(payload.get("is_error")),
+        subtype=payload.get("subtype") or "",
+        permission_denials=denials,
+        payload=payload,
+    )
+
+
+def claude_usage(payload):
+    """The four disjoint counters one axis billed, or `None` when it reported none.
+
+    All four or nothing: a `usage` object missing one of them is not a partial
+    answer, it is a shape this bridge does not recognise, and billing an axis for
+    three of its four counters would understate it without saying so.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    counters = {}
+    for name, field in CLAUDE_USAGE_FIELDS.items():
+        value = usage.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        counters[name] = value
+    return counters
+
+
+def claude_resolved_model(payload):
+    """The model one axis ran on, or `None` when its result named no single one.
+
+    The per-model breakdown is keyed by the model that was billed, so an alias
+    like `opus` is resolved to the id behind it. More than one key is an axis
+    that ran on more than one model, which no single id describes.
+    """
+    billed = payload.get("modelUsage")
+    if isinstance(billed, dict) and len(billed) == 1:
+        return next(iter(billed))
+    return None
+
+
+def claude_axis_cost(parsed):
+    """What one axis spent, read from the result its own reviewer printed."""
+    counters = claude_usage(parsed.payload)
+    model = claude_resolved_model(parsed.payload)
+    return counters, model, None if counters else NO_USAGE_DETAIL
+
+
+def claude_failure_reason(parsed):
+    """Why this axis's report is not one, or `None` when it is."""
+    if parsed.is_error:
+        return f"the reviewer ended in error: {parsed.subtype or 'unknown'}"
+    if not parsed.result:
+        return "review completed without a final message"
+    if parsed.permission_denials:
+        return (
+            f"the reviewer was denied {len(parsed.permission_denials)} "
+            "permission(s), so its report covers less than it was asked to review"
+        )
+    return None
+
+
+def claude_axis_result(state, parsed):
+    """One axis's result, in the shape every Lane returns it."""
+    reason = claude_failure_reason(parsed)
+    result = {
+        "status": FAILED_STATUS if reason else "completed",
+        "finalMessage": parsed.result,
+        "reviewSessionId": state["reviewSessionId"],
+    }
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def headless_session_state(
+    session_id, owner, runtime_dir, pid, target, model, effort, axis
+):
+    """The record one headless axis leaves: the reviewer, and where it prints."""
+    now = time.time()
+    return {
+        "version": SESSION_STATE_VERSION,
+        "reviewSessionId": session_id,
+        "axis": axis,
+        # Rounds this lineage has had, which the Rounds Contract caps.
+        "rounds": SINGLE_ROUND,
+        "owner": owner.to_dict(),
+        "runtimeDir": str(runtime_dir),
+        "resultPath": str(pathlib.Path(runtime_dir) / CLAUDE_RESULT_FILENAME),
+        "pid": pid,
+        # The lineage this axis's next round resumes; it has none until the
+        # reviewer has printed the session it ran under.
+        "claudeSessionId": None,
+        "target": target,
+        "model": model,
+        "effort": effort,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def result_awaits(path):
+    """True when a reviewer that is no longer running left a result behind."""
+    try:
+        return pathlib.Path(path).stat().st_size > 0
+    except OSError:
+        return False
+
+
+async def wait_for_claude_exit(pid, timeout):
+    """Wait out a reviewer this caller never started, which is polling or nothing."""
+    deadline = time.monotonic() + timeout
+    while claude_process_alive(pid):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"the reviewer was still running after {timeout}s"
+            )
+        await asyncio.sleep(CLAUDE_EXIT_POLL_SECONDS)
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeLaunch:
+    """One axis's reviewer, started, recorded, and not yet waited on."""
+
+    args: argparse.Namespace
+    brief: AxisBrief
+    command: list
+    runtime_dir: pathlib.Path
+    process: object
+    state: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeRun:
+    """One axis this Lane drove, whether or not it reached a report."""
+
+    state: dict
+    parsed: ClaudeResult | None = None
+    reason: str = ""
+
+
+class ClaudeLane(Lane):
+    """Delivery to the claude reviewer: one headless process per axis.
+
+    There is no pane and no thread on this side of the seam: `claude -p` prints
+    one JSON object and exits, so what this Lane owns is a process, the file that
+    object lands in, and the record naming both. A review here needs no tmux,
+    which is this Lane's dependency rather than a difference in the review
+    (ADR-0003).
+    """
+
+    name = REVIEWER_CLAUDE
+    NO_COST = (None, None, NO_RESULT_DETAIL)
+    #: What a record must carry for a recovering caller to reach its reviewer.
+    RECOVERABLE_FIELDS = ("pid", "resultPath")
+    NO_LIVE_SESSION = (
+        "No live review session for this worktree. "
+        "Nothing to recover; start a review instead."
+    )
+
+    def open(self, brief):
+        """Start one axis's reviewer, recorded and ready to be waited on.
+
+        The record goes down here rather than where the waiting starts, because
+        the reviewer is already running by the time this returns: a driver killed
+        in between would otherwise leave a live reviewer that `--recover-session`
+        can no longer find.
+        """
+        axis_args = axis_arguments(self.args, brief.axis)
+        launch = self.launch(
+            axis_args, brief, axis_args.model, axis_args.effort, None
+        )
+        state = headless_session_state(
+            str(uuid.uuid4()),
+            self.owner,
+            launch.runtime_dir,
+            launch.process.pid,
+            self.args.base,
+            axis_args.model,
+            axis_args.effort,
+            brief.axis,
+        )
+        state["preparation"] = preparation_report(self.args)
+        self.store.write(state["reviewSessionId"], state)
+        return dataclasses.replace(launch, state=state)
+
+    def launch(self, axis_args, brief, model, effort, resume_id):
+        """Put one brief to a reviewer of this axis's own, new lineage or resumed."""
+        command = build_claude_command(
+            resolve_claude_binary(self.args.claude_binary),
+            brief.text,
+            model,
+            effort,
+            resume_id,
+        )
+        runtime_dir = make_runtime(brief.text)
+        try:
+            process = open_child_process(axis_args, command, runtime_dir)
+        except Exception:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+            raise
+        return ClaudeLaunch(
+            axis_args, brief, command, runtime_dir, process, None
+        )
+
+    def discard(self, launch):
+        """Tear down an axis that started but will never be waited on.
+
+        Its record goes with it: a review that never began is not one a later
+        caller should find a handle to.
+        """
+        launch.process.kill()
+        if launch.state is not None:
+            self.store.remove(launch.state["reviewSessionId"])
+        shutil.rmtree(launch.runtime_dir, ignore_errors=True)
+
+    async def deliver(self, launch):
+        """Drive one started axis to a result of its own."""
+        return await self.drive(launch, launch.state)
+
+    async def drive(self, launch, state):
+        """Wait this axis's reviewer out and read what it printed.
+
+        Nothing here throws the reviewer's output away: what it printed stays on
+        disk, under a record that still names it, until the result reaches the
+        caller. A driver that dies with the report already read has therefore
+        thrown nothing away either — the report is still there to be recovered.
+        """
+        try:
+            await launch.process.wait(self.args.timeout)
+            parsed = read_claude_result(
+                launch.runtime_dir / CLAUDE_RESULT_FILENAME
+            )
+        except TimeoutError:
+            # Nothing else will wait on this reviewer, so it is stopped rather
+            # than left running at the caller's expense.
+            launch.process.kill()
+            return ClaudeRun(
+                state,
+                reason=(
+                    f"the reviewer did not finish within {self.args.timeout}s"
+                ),
+            )
+        except Exception as error:
+            return ClaudeRun(state, reason=str(error) or type(error).__name__)
+        return ClaudeRun(state, parsed=parsed)
+
+    async def resume(self, brief):
+        """Put one more turn to the lineage a resume handle names."""
+        state = self.args.resume_state
+        if state is None:
+            state = self.store.read(self.args.resume_session)
+        validate_resume_axis(self.args, state)
+        validate_session_owner(state, self.owner)
+        apply_session_model_choice(self.args, state)
+        launch = self.launch(
+            axis_arguments(self.args, state["axis"]),
+            brief,
+            state["model"],
+            state["effort"],
+            state.get("claudeSessionId"),
+        )
+        state["runtimeDir"] = str(launch.runtime_dir)
+        state["resultPath"] = str(
+            launch.runtime_dir / CLAUDE_RESULT_FILENAME
+        )
+        state["pid"] = launch.process.pid
+        state["updatedAt"] = time.time()
+        # On disk before the turn is awaited, for the same reason a first review
+        # writes its record early: a driver killed mid-review must leave a
+        # reviewer the recovery path can still find.
+        self.store.write(state["reviewSessionId"], state)
+        return await self.drive(dataclasses.replace(launch, state=state), state)
+
+    def recoverable(self):
+        """Every record of this owner's that still names a reviewer to wait on.
+
+        A reviewer outlives its driver, so what survives that death is the
+        record, the process, and the file the result lands in. A record whose
+        runtime directory is gone was settled and is nobody's to recover; one
+        whose reviewer has exited without printing anything is nothing to wait
+        on either.
+        """
+        return [
+            state
+            for state in self.store.find_by_owner(
+                self.owner, required=self.RECOVERABLE_FIELDS
+            )
+            if pathlib.Path(state["runtimeDir"]).is_dir()
+            and (
+                claude_process_alive(state["pid"])
+                or result_awaits(state["resultPath"])
+            )
+        ]
+
+    async def recover(self):
+        """Re-attach to every axis this owner already has running.
+
+        The caller reaching here has lost the handle its driver was going to
+        print. This starts no reviewer: it finds the owner's live ones and waits
+        on the results already on their way. With none it raises
+        `NoLiveSessionError` rather than falling back to a first review.
+        """
+        states = self.recoverable()
+        if not states:
+            raise NoLiveSessionError(self.NO_LIVE_SESSION)
+        runs = await asyncio.gather(*(self.rejoin(state) for state in states))
+        return {run.state["axis"]: run for run in runs}
+
+    async def rejoin(self, state):
+        """Wait out one reviewer this call adopted, and read what it printed."""
+        try:
+            await wait_for_claude_exit(state["pid"], self.args.timeout)
+            parsed = read_claude_result(state["resultPath"])
+        except TimeoutError as error:
+            # This call adopted the reviewer and is now giving up on it, and
+            # nobody else is coming: settling this axis is what makes its record
+            # unrecoverable, so the reviewer must not outlive it.
+            terminate_claude(state["pid"])
+            return ClaudeRun(state, reason=str(error))
+        except Exception as error:
+            return ClaudeRun(state, reason=str(error) or type(error).__name__)
+        return ClaudeRun(state, parsed=parsed)
+
+    def settle(self, run):
+        """Close one axis out: its record written, its files gone, its result returned.
+
+        The files go last and only here, once this axis's result is the caller's:
+        a record left naming a runtime directory that is no longer there is
+        exactly how a settled review says it is nobody's to recover.
+        """
+        state = run.state
+        if run.parsed is None:
+            self.let_go_of_runtime(state)
+            return {
+                "status": FAILED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": state["reviewSessionId"],
+                "reason": run.reason,
+            }
+        state["claudeSessionId"] = run.parsed.session_id
+        state["updatedAt"] = time.time()
+        if not self.args.recover_session:
+            state["target"] = self.args.base
+            state["preparation"] = preparation_report(self.args)
+        self.store.write(state["reviewSessionId"], state)
+        result = claude_axis_result(state, run.parsed)
+        self.let_go_of_runtime(state)
+        return result
+
+    def let_go_of_runtime(self, state):
+        """Drop what this axis's reviewer left on disk, now nothing needs it."""
+        shutil.rmtree(state["runtimeDir"], ignore_errors=True)
+
+    def axis_cost(self, run):
+        """What an axis spent, read from the result its own reviewer printed."""
+        if run.parsed is None:
+            return self.NO_COST
+        return claude_axis_cost(run.parsed)
+
+
+# Every reviewing vendor there is a Lane for, keyed by the name `--reviewer`
+# takes. The keys are the argument's accepted values, so a Lane cannot be
+# reachable by a name the command line rejects, or rejected by one it accepts.
+LANES = {CodexLane.name: CodexLane, ClaudeLane.name: ClaudeLane}
+
+
+def resolve_lane(args, store):
+    """The Lane this call named, under the owner identity it runs as.
+
+    Both are resolved before any of the Lane opens, so a reviewer there is no
+    Lane for, and a Lane whose dependencies this caller has not got, are each
+    refused by name rather than part way through a review.
+    """
+    lane = LANES.get(args.reviewer)
+    if lane is None:
+        known = ", ".join(sorted(LANES))
+        raise RuntimeError(
+            f"Unknown reviewer for --reviewer: {args.reviewer!r}; "
+            f"known reviewers: {known}"
+        )
+    return lane(args, lane_owner(args, lane), store)
+
+
+async def deliver_briefs(args, lane, briefs):
+    """Every requested axis's result, delivered concurrently through one Lane.
+
+    Every axis is opened before any is driven, so a Lane that cannot open them
+    all opens none: a review that would be half delivered is no review at all,
+    and the axes that did open are torn down before their turns begin.
+    """
+    launches = []
+    try:
+        for brief in briefs:
+            launches.append(lane.open(brief))
+    except Exception:
+        for brief, launch in zip(briefs, launches, strict=False):
+            lane.discard(launch)
+            lane.end_launched_axis(brief.axis)
+        raise
+    runs = await asyncio.gather(*(lane.deliver(launch) for launch in launches))
+    return {brief.axis: run for brief, run in zip(briefs, runs, strict=True)}
+
+
+def report_refusal(args, refusal):
+    """Give the caller the refusal and nothing else; no Lane opened."""
+    print(json.dumps(refusal, ensure_ascii=False))
+    args.status = refusal["status"]
+    return 1
+
+
+async def run_bridge(args):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
+    store = SessionStore()
+    # Resolved before a resumed handle is looked at, because whose session it is
+    # decides whether this caller may be told anything about it at all.
+    lane = resolve_lane(args, store)
+    refusal = refuse_resume_past_cap(args, lane.owner, store)
+    if refusal is not None:
+        return report_refusal(args, refusal)
     probe = args.probe or args.browser_probe
     if not args.recover_session and not probe:
-        args.resolved_base = resolve_fixed_point(args.cwd, args.base)
-        ensure_nonempty_diff(args.cwd, args.base)
+        args.scope = resolve_review_scope(args.cwd, args.base)
+        ensure_scope_holds_work(args.cwd, args.scope)
         args.preparation = prepare_review(args)
     elif probe:
         args.preparation = None
-    owner = resolve_owner(args)
-    store = SessionStore()
+    # Preparation has succeeded and no Lane has opened yet, which is what this
+    # point promises: a review that failed before here never started.
+    hook_review_start(args, review_start_model(args, args.resume_state))
     # The lock stays process-scoped: it serialises concurrent calls from one
     # pane, and a driver that dies releases it. Duplicate prevention across a
     # driver's death is the recovery path's job, not a longer-lived lock's — a
     # lock that outlived its holder would also have to be reaped, and would
     # block the very recovery call that clears the duplicate.
-    with owner_lock(store, owner):
+    with owner_lock(store, lane.owner):
         if args.recover_session:
-            runs = await run_recovered_reviews(args, owner, store)
+            runs = await lane.recover()
         elif args.resume_session:
-            resumed = await run_existing_review(args, owner, store)
-            runs = {resumed.state["axis"]: resumed}
-        elif args.axis == "both" and not probe:
-            runs = await run_new_reviews(args, owner, store)
+            # The binding answer, and the only one that spends a round: the
+            # record is re-read and written back here, where the lock keeps two
+            # callers from taking the same round.
+            args.resume_state, refusal = grant_round(args, lane.owner, store)
+            if refusal is not None:
+                return report_refusal(args, refusal)
+            runs = {args.axis: await lane.resume(axis_brief(args, args.axis))}
         else:
-            runs = {args.axis: await run_new_review(args, owner, store)}
+            runs = await deliver_briefs(args, lane, axis_briefs(args))
 
         results = {}
         for axis, run in runs.items():
-            if isinstance(run, AxisFailure):
-                if args.recover_session or args.resume_session:
-                    cleanup_pane(
-                        run.state.get("paneId") if run.state else None,
-                        run.state.get("runtimeDir") if run.state else None,
-                    )
-                result = {
-                    "status": "failed",
-                    "finalMessage": "",
-                    "reviewSessionId": (
-                        run.state["reviewSessionId"] if run.state else None
-                    ),
-                    "reason": run.reason,
-                }
-            else:
-                state = run.state
-                turn = run.turn
-                final_message = final_agent_message(turn)
-                target = state["target"] if args.recover_session else args.base
-                update_session_after_turn(state, turn, target)
-                if not args.recover_session:
-                    state["preparation"] = preparation_report(args)
-                store.write(state["reviewSessionId"], state)
-                if args.recover_session or args.resume_session:
-                    cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
-                result = axis_result(state, turn, final_message)
+            result = lane.settle(run)
+            # Named here rather than in either Lane: what a caller may do next
+            # is the review's answer, and both Lanes give the same one.
+            result["next"] = next_action(axis, rounds_had(run.state))
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result
-    if review is not None:
-        # Once the turn has settled, so the rollout's last cumulative count is
-        # the whole of what this review spent.
-        for run in runs.values():
-            state = run.state
-            thread_id = (
-                run.thread_id
-                if isinstance(run, AxisFailure)
-                else state["threadId"]
-            )
-            if thread_id is not None:
-                record_review_cost(review, thread_id)
+    # Once every turn has settled, so each rollout's last cumulative count is the
+    # whole of what its axis spent.
+    for axis, run in runs.items():
+        lane.end_axis(axis, results[axis], run)
     if args.recover_session:
-        states = [run.state for run in runs.values()]
-        preparation = next(
-            (state.get("preparation") for state in states if state is not None),
-            None,
-        )
+        preparation = lane.recovered_preparation(runs.values())
     else:
         preparation = preparation_report(args)
     output = {
@@ -1986,15 +2974,24 @@ async def run_bridge(args, review=None):
         "preparation": preparation,
     }
     print(json.dumps(output, ensure_ascii=False))
+    args.status = output["status"]
     succeeded = output["status"] == "completed"
     return 0 if succeeded else 1
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Launch or resume an interactive Codex TUI review."
+        description="Launch or resume a code review on the Lane --reviewer names."
     )
-    parser.add_argument("--base", help="fixed point for the three-dot diff")
+    parser.add_argument(
+        "--reviewer",
+        required=True,
+        choices=tuple(LANES),
+        help="reviewing vendor this review is delivered to",
+    )
+    parser.add_argument(
+        "--base", help="fixed point the Review Scope runs from"
+    )
     parser.add_argument("--spec", help="issue reference or file path for the spec")
     parser.add_argument(
         "--axis",
@@ -2010,29 +3007,37 @@ def build_parser():
     parser.add_argument("--sandbox", default="danger-full-access")
     parser.add_argument("--approval", default="never")
     parser.add_argument(
-        "--model", help="Codex model for this review lineage (default: Codex config)"
+        "--model",
+        help="model for this review lineage (default: the reviewer's own config)",
     )
     parser.add_argument(
         "--effort",
-        help="Reasoning effort for this review lineage (default: Codex config)",
+        help="reasoning effort for this review lineage (default: the reviewer's "
+             "own config)",
     )
     parser.add_argument(
         "--standards-model",
-        help="Codex model for the standards axis (default: --model)",
+        help="model for the standards axis (default: --model)",
     )
     parser.add_argument(
         "--standards-effort",
-        help="Reasoning effort for the standards axis (default: --effort)",
+        help="reasoning effort for the standards axis (default: --effort)",
     )
     parser.add_argument(
         "--spec-model",
-        help="Codex model for the spec axis (default: --model)",
+        help="model for the spec axis (default: --model)",
     )
     parser.add_argument(
         "--spec-effort",
-        help="Reasoning effort for the spec axis (default: --effort)",
+        help="reasoning effort for the spec axis (default: --effort)",
     )
     parser.add_argument("--network", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--account",
+        help="profile directory the reviewer is launched under, on a Lane whose "
+             "reviewer has one; without it the reviewer inherits the caller's "
+             "own login",
+    )
     parser.add_argument("--resume-session")
     parser.add_argument(
         "--recover-session",
@@ -2043,19 +3048,15 @@ def build_parser():
             "there is none)"
         ),
     )
-    parser.add_argument(
-        "--machine-log",
-        help="the run's machine log, where this review's `review` event pair is "
-             "appended; the pair is written only when this and --ticket are "
-             "both given",
-    )
-    parser.add_argument(
-        "--ticket",
-        help="the ticket this review is for, as the machine log spells it; the "
-             "review's event pair is written only when this and --machine-log "
-             "are both given",
-    )
+    for point, fires in HOOK_POINTS.items():
+        parser.add_argument(
+            f"--on-{point}",
+            help=f"command to run {fires}, in the reviewed working directory "
+                 f"with this review's facts in its environment (default: "
+                 f"nothing runs)",
+        )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
+    parser.add_argument("--claude-binary", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
     return parser
@@ -2091,40 +3092,29 @@ def main():
         args = build_pane_parser().parse_args(sys.argv[2:])
         return run_pane(args)
     args = parse_args()
+    # A review no result was ever reached for is a failed one, until the result
+    # itself says otherwise.
+    args.status = FAILED_STATUS
+    args.resume_state = None
+    # The end point straddles the whole call, so it fires on every exit path this
+    # bridge controls — a review that failed, timed out, or raised included,
+    # including one that failed before any Lane opened.
     try:
-        args._resume_state = resume_state_for_review(args)
-    except (OSError, RuntimeError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
-    # The pair straddles the whole call, so the `returned` line is written on
-    # every exit path this bridge controls — a review that failed, timed out, or
-    # raised included. A row claiming a review that is no longer running is worse
-    # than no row at all.
-    review = ReviewEvent(
-        args.machine_log,
-        args.ticket,
-        review_event_model(args, args._resume_state),
-    )
-    review.write("running")
-    try:
-        return asyncio.run(run_bridge(args, review))
-    except NoLiveSessionError as error:
-        print(str(error), file=sys.stderr)
-        return NO_LIVE_SESSION_EXIT
-    except (AppServerError, OSError, RuntimeError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
+        try:
+            args.resume_state = resume_state_for_review(args)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        try:
+            return asyncio.run(run_bridge(args))
+        except NoLiveSessionError as error:
+            print(str(error), file=sys.stderr)
+            return NO_LIVE_SESSION_EXIT
+        except (AppServerError, OSError, RuntimeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
     finally:
-        # A resumed lineage may spend before the call returns enough state to
-        # harvest it. A first review that never started a thread has no session
-        # cost line: there is no lineage or spend to name truthfully.
-        resume_thread = resumed_thread_id(args)
-        if not review.costed and resume_thread:
-            review.cost(
-                resume_thread, None, None,
-                "this review returned no result to read a cost from",
-            )
-        review.write("returned")
+        hook_review_end(args, args.status)
 
 
 if __name__ == "__main__":
