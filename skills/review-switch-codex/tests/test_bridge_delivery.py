@@ -178,8 +178,11 @@ class DeliveryContractTests(unittest.TestCase):
 
     def test_review_prompts_carry_the_axis_brief_and_no_rounds_contract(self):
         preparation = self.bridge.ReviewPreparation(
-            fixed_point="main",
-            resolved_fixed_point="abc123",
+            scope=self.bridge.ReviewScope(
+                fixed_point="main",
+                resolved_fixed_point="abc123",
+                fork_point="fed321",
+            ),
             commit_list="def456 feature change",
             spec_source="docs/feature.md",
             spec_contents="Feature spec.",
@@ -199,7 +202,12 @@ class DeliveryContractTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, prompt)
         self.assertIn("Read-only review", prompt)
-        self.assertIn("Diff: git diff main...HEAD", prompt)
+        self.assertIn("Diff: git diff fed321", prompt)
+        self.assertIn(
+            "New files not in that diff: "
+            "git ls-files --others --exclude-standard",
+            prompt,
+        )
 
 
 class ReviewDeliveryTests(FakePaneTestCase):
