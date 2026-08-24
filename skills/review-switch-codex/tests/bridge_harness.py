@@ -30,9 +30,20 @@ def load_bridge():
     return module
 
 
+class StaticBrief:
+    """One Axis Brief, in the shape a Lane reads it."""
+
+    def __init__(self, axis):
+        self.axis = axis
+        self.text = f"Read-only {axis} review"
+
+
 class StaticPreparation:
     def brief(self, axis):
-        return f"Read-only {axis} review"
+        return StaticBrief(axis)
+
+    def briefs(self, axes):
+        return tuple(self.brief(axis) for axis in axes)
 
     def report(self):
         return {
@@ -45,6 +56,7 @@ class StaticPreparation:
 
 def base_args(**overrides):
     values = {
+        "reviewer": "codex",
         "base": "main",
         "spec": "docs/feature.md",
         "axis": "standards",

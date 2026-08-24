@@ -6,6 +6,11 @@ Round one starts a review lineage in its own tmux pane; round two resumes that
 thread, and `--recover-session` re-attaches to the turn a killed driver left in
 flight.
 
+Preparation and delivery are separate: preparation fills one Axis Brief per
+requested axis, and the Lane `--reviewer` names takes one brief and gives back
+that axis's result. A reviewer this bridge has no Lane for is refused by name
+before any of it opens.
+
 A caller that wants a review's start, each axis's cost, and its end observed
 hands in the commands to run at those points, and gets them run with this
 review's own facts in their environment. Pass none and nothing extra runs. The
@@ -66,9 +71,9 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Recovery found nothing to re-attach to, which is a different answer from a
 # failed review: it is the one result that licenses starting a first review.
 NO_LIVE_SESSION_EXIT = 3
-# The reviewing vendor this bridge delivers to. The model is whatever the
-# lineage was pinned to, so the reviewer needs no argument of its own.
-REVIEW_VENDOR = "codex"
+# The reviewing vendor a caller names on `--reviewer`. The model is whatever the
+# lineage was pinned to, so the reviewer names the vendor and nothing else.
+REVIEWER_CODEX = "codex"
 CODE_GRAPH_CLI = "code-review-graph"
 # The four disjoint counters one axis's spend is reported as.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
@@ -205,7 +210,7 @@ def hook_review_start(args, model):
     run_hook(
         args,
         REVIEW_START,
-        REVIEW_REVIEWER=REVIEW_VENDOR,
+        REVIEW_REVIEWER=args.reviewer,
         REVIEW_MODEL=model or "",
         REVIEW_AXES=",".join(requested_axes(args)),
     )
@@ -241,17 +246,6 @@ def hook_axis_end(args, axis, status, session, thread_id):
         REVIEW_SESSION=session or "",
         REVIEW_MODEL=model or "",
         **cost_facts(counters, detail),
-    )
-
-
-def end_axis_run(args, axis, result, run):
-    """End an axis this review drove to a result of its own."""
-    hook_axis_end(
-        args,
-        axis,
-        result["status"],
-        result["reviewSessionId"],
-        run.thread_id if isinstance(run, AxisFailure) else run.state["threadId"],
     )
 
 
@@ -904,6 +898,15 @@ class ReviewPreparation:
     code_graph_used: bool = False
 
     def brief(self, axis):
+        """This axis's Axis Brief, ready for whichever Lane delivers it."""
+        return AxisBrief(axis=axis, text=self.brief_text(axis))
+
+    def briefs(self, axes):
+        """One Axis Brief per axis, in the order a review runs them."""
+        return tuple(self.brief(axis) for axis in axes)
+
+    def brief_text(self, axis):
+        """The text of one axis's brief, or the failure that there is none."""
         if axis == "standards":
             return append_navigation_block(
                 build_standards_brief(
@@ -932,6 +935,19 @@ class ReviewPreparation:
             "standardsFiles": list(self.standards_files),
             "codeGraphUsed": self.code_graph_used,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisBrief:
+    """The prompt one Lane receives for one axis.
+
+    Preparation fills a brief and delivery reads one; a Lane changes who reads a
+    brief, never what it says, which is what makes a finding on one Lane a
+    finding on the other (ADR-0003).
+    """
+
+    axis: str
+    text: str
 
 
 def read_commit_list(cwd, fixed_point):
@@ -1019,37 +1035,25 @@ def preparation_report(args):
     return args.preparation.report() if args.preparation is not None else None
 
 
-def build_prompt(args, bridge_id):
-    if args.browser_probe:
-        return build_browser_probe_prompt(bridge_id)
-    if args.probe:
-        return build_probe_prompt(bridge_id)
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        f"{args.preparation.brief(args.axis)}"
-    )
+def build_prompt(brief, bridge_id):
+    """One brief as the turn that carries it, marked so its own turn can be found again."""
+    return f"[claude-tui-review-bridge:{bridge_id}]\n{brief.text}"
 
 
-def build_probe_prompt(bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        "This is a bridge health probe. Do not run commands, read files, or call "
-        "tools. Reply with exactly: TUI_REVIEW_BRIDGE_OK"
-    )
-
-
-def build_browser_probe_prompt(bridge_id):
-    return (
-        f"[claude-tui-review-bridge:{bridge_id}]\n"
-        "This is an authorized end-to-end browser-control probe. Use the installed "
-        "Browser control skill and its browser runtime. Do not use curl, web search, "
-        "Playwright CLI, or another HTTP client. Automatically open "
-        "https://example.com in the runtime-selected browser, read the page title "
-        "and visible h1 text, then close only the tab created for this probe. Report "
-        "the selected browser backend, title, h1, and whether cleanup succeeded. If "
-        "browser connection or control fails, report the exact failure without "
-        "substituting another method."
-    )
+PROBE_BRIEF = (
+    "This is a bridge health probe. Do not run commands, read files, or call "
+    "tools. Reply with exactly: TUI_REVIEW_BRIDGE_OK"
+)
+BROWSER_PROBE_BRIEF = (
+    "This is an authorized end-to-end browser-control probe. Use the installed "
+    "Browser control skill and its browser runtime. Do not use curl, web search, "
+    "Playwright CLI, or another HTTP client. Automatically open "
+    "https://example.com in the runtime-selected browser, read the page title "
+    "and visible h1 text, then close only the tab created for this probe. Report "
+    "the selected browser backend, title, h1, and whether cleanup succeeded. If "
+    "browser connection or control fails, report the exact failure without "
+    "substituting another method."
+)
 
 
 def read_log_tail(path, limit=4000):
@@ -1129,6 +1133,26 @@ def resume_state_for_review(args):
 def requested_axes(args):
     """The axes this call asked for, in the order a review runs them."""
     return ("standards", "spec") if args.axis == "both" else (args.axis,)
+
+
+def axis_brief(args, axis):
+    """One axis's Brief: what preparation filled, or a probe's fixed text.
+
+    A health probe is prepared for nothing and carries no axis of its own, so it
+    brings its own text and delivers whatever `--axis` says as a single Lane.
+    """
+    if args.browser_probe:
+        return AxisBrief(axis=axis, text=BROWSER_PROBE_BRIEF)
+    if args.probe:
+        return AxisBrief(axis=axis, text=PROBE_BRIEF)
+    return args.preparation.brief(axis)
+
+
+def axis_briefs(args):
+    """Every Brief this call delivers, in the order a review runs them."""
+    if args.probe or args.browser_probe:
+        return (axis_brief(args, args.axis),)
+    return args.preparation.briefs(requested_axes(args))
 
 
 def review_start_model(args, resume_state=None):
@@ -1680,6 +1704,10 @@ class AxisCompleted:
     state: dict
     turn: dict
 
+    @property
+    def thread_id(self):
+        return self.state["threadId"]
+
 
 @dataclasses.dataclass(frozen=True)
 class AxisFailure:
@@ -1696,16 +1724,16 @@ class AxisRunError(Exception):
         self.reason = reason
 
 
-def launch_axis(args, axis, tmux_target, split_direction):
+def launch_axis(args, brief, tmux_target, split_direction):
     axis_args = argparse.Namespace(**vars(args))
-    axis_args.axis = axis
+    axis_args.axis = brief.axis
     for choice in ("model", "effort"):
-        setattr(axis_args, choice, resolve_axis_choice(args, axis, choice))
+        setattr(axis_args, choice, resolve_axis_choice(args, brief.axis, choice))
     axis_args.tmux_target = tmux_target
     axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(axis_args, bridge_id)
+    prompt = build_prompt(brief, bridge_id)
     runtime_dir = make_runtime(prompt)
     try:
         pane_id = open_child_pane(axis_args, runtime_dir)
@@ -1778,36 +1806,6 @@ async def drive_terminal_axis(launch, owner, store):
     return result
 
 
-async def run_new_review(args, owner, store):
-    launch = launch_axis(
-        args, args.axis, owner.origin_pane, "horizontal"
-    )
-    return await drive_terminal_axis(launch, owner, store)
-
-
-async def run_new_reviews(args, owner, store):
-    launches = []
-    try:
-        standards = launch_axis(
-            args, "standards", owner.origin_pane, "horizontal"
-        )
-        launches.append(standards)
-        spec = launch_axis(
-            args, "spec", standards.pane_id, "vertical"
-        )
-        launches.append(spec)
-    except Exception:
-        for launch in launches:
-            cleanup_pane(launch.pane_id, launch.runtime_dir)
-            end_launched_axis(args, launch.args.axis)
-        raise
-
-    completed = await asyncio.gather(
-        *(drive_terminal_axis(launch, owner, store) for launch in launches)
-    )
-    return dict(zip(("standards", "spec"), completed, strict=True))
-
-
 async def connect_existing_session(state):
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
@@ -1872,7 +1870,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
         await client.__aexit__(None, None, None)
 
 
-async def run_existing_review(args, owner, store):
+async def run_existing_review(args, brief, owner, store):
     state = args.resume_state
     if state is None:
         state = store.read(args.resume_session)
@@ -1881,7 +1879,7 @@ async def run_existing_review(args, owner, store):
     apply_session_model_choice(args, state)
     bridge_id = str(uuid.uuid4())
     marker = f"[claude-tui-review-bridge:{bridge_id}]"
-    prompt = build_prompt(args, bridge_id)
+    prompt = build_prompt(brief, bridge_id)
     # On disk before the turn is awaited, for the same reason the first review
     # writes its record early: a driver killed mid-turn must leave a marker the
     # recovery path can wait on.
@@ -1962,6 +1960,145 @@ async def run_recovered_reviews(args, owner, store):
     )
 
 
+class CodexLane:
+    """Delivery to the codex reviewer: one Codex TUI pane per axis.
+
+    The seam every Lane is reached through. Preparation is finished by the time
+    one is opened, so a Lane takes one Axis Brief and gives back that axis's
+    result; everything that is codex's rather than the review's — panes, threads,
+    app-server connections, the record on disk — lives on this side of it.
+    """
+
+    name = REVIEWER_CODEX
+
+    def __init__(self, args, owner, store):
+        self.args = args
+        self.owner = owner
+        self.store = store
+        # Pane layout: the first axis splits off the caller's own pane to its
+        # right, and each further axis splits off the one before it, downwards.
+        self.previous_pane = None
+
+    def open(self, brief):
+        """Open one axis's pane, ready to be driven."""
+        launch = launch_axis(
+            self.args,
+            brief,
+            self.previous_pane or self.owner.origin_pane,
+            "vertical" if self.previous_pane else "horizontal",
+        )
+        self.previous_pane = launch.pane_id
+        return launch
+
+    def discard(self, launch):
+        """Tear down an axis that opened but will never be driven."""
+        cleanup_pane(launch.pane_id, launch.runtime_dir)
+
+    async def deliver(self, launch):
+        """Drive one opened axis to a result of its own."""
+        return await drive_terminal_axis(launch, self.owner, self.store)
+
+    async def resume(self, brief):
+        """Put one more turn to the lineage a resume handle names."""
+        return await run_existing_review(self.args, brief, self.owner, self.store)
+
+    async def recover(self):
+        """Re-attach to every axis this owner already has running."""
+        return await run_recovered_reviews(self.args, self.owner, self.store)
+
+    def settle(self, run):
+        """Close one axis out: its record written, its pane down, its result returned."""
+        args = self.args
+        handed_back = args.recover_session or args.resume_session
+        if isinstance(run, AxisFailure):
+            if handed_back:
+                cleanup_pane(
+                    run.state.get("paneId") if run.state else None,
+                    run.state.get("runtimeDir") if run.state else None,
+                )
+            return {
+                "status": FAILED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": (
+                    run.state["reviewSessionId"] if run.state else None
+                ),
+                "reason": run.reason,
+            }
+        state, turn = run.state, run.turn
+        final_message = final_agent_message(turn)
+        target = state["target"] if args.recover_session else args.base
+        update_session_after_turn(state, turn, target)
+        if not args.recover_session:
+            state["preparation"] = preparation_report(args)
+        self.store.write(state["reviewSessionId"], state)
+        if handed_back:
+            cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
+        return axis_result(state, turn, final_message)
+
+    def end_axis(self, axis, result, run):
+        """End an axis this Lane drove to a result of its own.
+
+        What an axis spent is read from the Codex rollout its thread wrote, which
+        is why the point is reported from here rather than from the harness.
+        """
+        hook_axis_end(
+            self.args,
+            axis,
+            result["status"],
+            result["reviewSessionId"],
+            run.thread_id,
+        )
+
+    def recovered_preparation(self, runs):
+        """What a recovered review was prepared from, read back off its own records."""
+        return next(
+            (
+                run.state.get("preparation")
+                for run in runs
+                if run.state is not None
+            ),
+            None,
+        )
+
+
+# Every reviewing vendor there is a Lane for, keyed by the name `--reviewer`
+# takes. The keys are the argument's accepted values, so a Lane cannot be
+# reachable by a name the command line rejects, or rejected by one it accepts.
+LANES = {CodexLane.name: CodexLane}
+
+
+def resolve_lane(args, owner, store):
+    """The Lane this call named, before any of it opens."""
+    lane = LANES.get(args.reviewer)
+    if lane is None:
+        known = ", ".join(sorted(LANES))
+        raise RuntimeError(
+            f"Unknown reviewer for --reviewer: {args.reviewer!r}; "
+            f"known reviewers: {known}"
+        )
+    return lane(args, owner, store)
+
+
+async def deliver_briefs(args, lane, briefs):
+    """Every requested axis's result, delivered concurrently through one Lane.
+
+    Every axis is opened before any is driven, so a Lane that cannot open them
+    all opens none: a review that would be half delivered is no review at all,
+    and the axes that did open are torn down before their turns begin.
+    """
+    launches = []
+    try:
+        for brief in briefs:
+            launches.append(lane.open(brief))
+    except Exception:
+        for brief, launch in zip(briefs, launches, strict=False):
+            lane.discard(launch)
+            end_launched_axis(args, brief.axis)
+        raise
+    runs = await asyncio.gather(*(lane.deliver(launch) for launch in launches))
+    return {brief.axis: run for brief, run in zip(briefs, runs, strict=True)}
+
+
 async def run_bridge(args):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
@@ -1977,6 +2114,7 @@ async def run_bridge(args):
     hook_review_start(args, review_start_model(args, args.resume_state))
     owner = resolve_owner(args)
     store = SessionStore()
+    lane = resolve_lane(args, owner, store)
     # The lock stays process-scoped: it serialises concurrent calls from one
     # pane, and a driver that dies releases it. Duplicate prevention across a
     # driver's death is the recovery path's job, not a longer-lived lock's — a
@@ -1984,56 +2122,24 @@ async def run_bridge(args):
     # block the very recovery call that clears the duplicate.
     with owner_lock(store, owner):
         if args.recover_session:
-            runs = await run_recovered_reviews(args, owner, store)
+            runs = await lane.recover()
         elif args.resume_session:
-            resumed = await run_existing_review(args, owner, store)
-            runs = {resumed.state["axis"]: resumed}
-        elif args.axis == "both" and not probe:
-            runs = await run_new_reviews(args, owner, store)
+            runs = {args.axis: await lane.resume(axis_brief(args, args.axis))}
         else:
-            runs = {args.axis: await run_new_review(args, owner, store)}
+            runs = await deliver_briefs(args, lane, axis_briefs(args))
 
         results = {}
         for axis, run in runs.items():
-            if isinstance(run, AxisFailure):
-                if args.recover_session or args.resume_session:
-                    cleanup_pane(
-                        run.state.get("paneId") if run.state else None,
-                        run.state.get("runtimeDir") if run.state else None,
-                    )
-                result = {
-                    "status": "failed",
-                    "finalMessage": "",
-                    "reviewSessionId": (
-                        run.state["reviewSessionId"] if run.state else None
-                    ),
-                    "reason": run.reason,
-                }
-            else:
-                state = run.state
-                turn = run.turn
-                final_message = final_agent_message(turn)
-                target = state["target"] if args.recover_session else args.base
-                update_session_after_turn(state, turn, target)
-                if not args.recover_session:
-                    state["preparation"] = preparation_report(args)
-                store.write(state["reviewSessionId"], state)
-                if args.recover_session or args.resume_session:
-                    cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
-                result = axis_result(state, turn, final_message)
+            result = lane.settle(run)
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result
     # Once every turn has settled, so each rollout's last cumulative count is the
     # whole of what its axis spent.
     for axis, run in runs.items():
-        end_axis_run(args, axis, results[axis], run)
+        lane.end_axis(axis, results[axis], run)
     if args.recover_session:
-        states = [run.state for run in runs.values()]
-        preparation = next(
-            (state.get("preparation") for state in states if state is not None),
-            None,
-        )
+        preparation = lane.recovered_preparation(runs.values())
     else:
         preparation = preparation_report(args)
     output = {
@@ -2057,6 +2163,12 @@ async def run_bridge(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Launch or resume an interactive Codex TUI review."
+    )
+    parser.add_argument(
+        "--reviewer",
+        required=True,
+        choices=tuple(LANES),
+        help="reviewing vendor this review is delivered to",
     )
     parser.add_argument("--base", help="fixed point for the three-dot diff")
     parser.add_argument("--spec", help="issue reference or file path for the spec")

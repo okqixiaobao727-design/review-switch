@@ -94,7 +94,12 @@ class LifecycleHookTests(FakePaneTestCase):
         )
 
     def main(self, *arguments):
-        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
+        argv = [
+            "tui_review_bridge.py",
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            *arguments,
+        ]
         stdout = io.StringIO()
         with mock.patch.object(sys, "argv", argv):
             with contextlib.redirect_stdout(stdout):

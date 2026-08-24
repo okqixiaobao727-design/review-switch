@@ -88,8 +88,8 @@ class McpReadinessGateTests(unittest.TestCase):
         self.runtime_dirs = []
         self.cleaned = []
 
-    def run_new_review(self, client, startup_timeout=5):
-        """Drive run_new_review with everything but the gate faked out."""
+    def deliver_one_axis(self, client, startup_timeout=5):
+        """Drive one axis through the codex Lane with everything but the gate faked out."""
 
         def fake_launch_pane(args, runtime_dir):
             self.runtime_dirs.append(pathlib.Path(runtime_dir))
@@ -112,9 +112,9 @@ class McpReadinessGateTests(unittest.TestCase):
             pane_exists=lambda pane_id: True,
             cleanup_pane=lambda pane, runtime: self.cleaned.append(pane),
         ):
-            return asyncio.run(
-                self.bridge.run_new_review(args, self.owner, self.store)
-            )
+            lane = self.bridge.CodexLane(args, self.owner, self.store)
+            brief = self.bridge.axis_brief(args, args.axis)
+            return asyncio.run(lane.deliver(lane.open(brief)))
 
     def test_the_turn_waits_until_every_announced_server_has_settled(self):
         client = GateClient([
@@ -123,7 +123,7 @@ class McpReadinessGateTests(unittest.TestCase):
             {"beta": "ready"},
         ])
 
-        self.run_new_review(client)
+        self.deliver_one_axis(client)
 
         self.assertEqual(
             client.startup_when_turn_started,
@@ -135,7 +135,7 @@ class McpReadinessGateTests(unittest.TestCase):
         """`resume` refuses a thread with no rollout, so this order matters."""
         client = GateClient([{"alpha": "ready"}])
 
-        self.run_new_review(client)
+        self.deliver_one_axis(client)
 
         handoff = self.runtime_dirs[0] / self.bridge.THREAD_HANDOFF_FILENAME
         self.assertEqual(handoff.read_text(encoding="utf-8"), "thread-new")
@@ -145,7 +145,7 @@ class McpReadinessGateTests(unittest.TestCase):
     def test_the_review_thread_carries_unattended_session_policy(self):
         client = GateClient([{"alpha": "ready"}])
 
-        self.run_new_review(client)
+        self.deliver_one_axis(client)
 
         self.assertEqual(client.thread_start_params["approvalPolicy"], "never")
         self.assertEqual(client.thread_start_params["sandbox"], "danger-full-access")
@@ -159,7 +159,7 @@ class McpReadinessGateTests(unittest.TestCase):
         """
         client = GateClient([{"alpha": "ready"}])
 
-        self.run_new_review(client)
+        self.deliver_one_axis(client)
 
         self.assertFalse(
             self.store.handoff_done_at_write,
@@ -228,7 +228,7 @@ class McpReadinessGateTests(unittest.TestCase):
     def test_a_gate_that_times_out_tears_the_pane_down(self):
         client = GateClient([{"alpha": "starting"}])
 
-        failure = self.run_new_review(client, startup_timeout=0.2)
+        failure = self.deliver_one_axis(client, startup_timeout=0.2)
 
         self.assertIsInstance(failure, self.bridge.AxisFailure)
         self.assertIn("Timed out waiting for Codex MCP", failure.reason)

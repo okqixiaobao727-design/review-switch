@@ -165,8 +165,28 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             "src/later.py:30–35  late_change"
         )
 
-        self.assertTrue(preparation.brief("standards").endswith(expected_suffix))
-        self.assertTrue(preparation.brief("spec").endswith(expected_suffix))
+        self.assertTrue(
+            preparation.brief("standards").text.endswith(expected_suffix)
+        )
+        self.assertTrue(preparation.brief("spec").text.endswith(expected_suffix))
+
+    def test_preparation_yields_one_axis_brief_per_requested_axis(self):
+        args = base_args(axis="both")
+
+        briefs = self.bridge.axis_briefs(args)
+
+        self.assertEqual([brief.axis for brief in briefs], ["standards", "spec"])
+        self.assertEqual(
+            [brief.text for brief in briefs],
+            ["Read-only standards review", "Read-only spec review"],
+        )
+
+    def test_one_requested_axis_yields_that_axis_brief_alone(self):
+        args = base_args(axis="spec")
+
+        briefs = self.bridge.axis_briefs(args)
+
+        self.assertEqual([brief.axis for brief in briefs], ["spec"])
 
     def test_standards_brief_names_the_documented_fallback(self):
         brief = self.bridge.build_standards_brief(

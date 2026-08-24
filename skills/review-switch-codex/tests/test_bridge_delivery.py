@@ -185,8 +185,9 @@ class DeliveryContractTests(unittest.TestCase):
             spec_contents="Feature spec.",
             standards_files=("AGENTS.md",),
         )
+        args = base_args(preparation=preparation, axis="standards")
         prompt = self.bridge.build_prompt(
-            base_args(preparation=preparation), "bridge-1"
+            self.bridge.axis_brief(args, "standards"), "bridge-1"
         )
 
         for marker in (
@@ -200,6 +201,109 @@ class DeliveryContractTests(unittest.TestCase):
             self.assertNotIn(marker, prompt)
         self.assertIn("Read-only review", prompt)
         self.assertIn("Diff: git diff main...HEAD", prompt)
+
+
+class DeliveredAxis:
+    """What a stub Lane hands back for one axis."""
+
+    thread_id = None
+
+    def __init__(self, axis):
+        self.axis = axis
+
+
+class RecordingLane:
+    """A Lane that records the briefs it is handed and answers with fixed results.
+
+    Standing in for the codex Lane proves the harness reaches its reviewer only
+    through the seam: nothing outside this class opens a pane or writes a record.
+    """
+
+    instances = []
+
+    def __init__(self, args, owner, store):
+        self.args = args
+        self.owner = owner
+        self.store = store
+        self.briefs = []
+        self.ended = []
+        RecordingLane.instances.append(self)
+
+    def open(self, brief):
+        self.briefs.append(brief)
+        return brief
+
+    def discard(self, brief):
+        raise AssertionError("an axis was discarded that had opened cleanly")
+
+    async def deliver(self, brief):
+        return DeliveredAxis(brief.axis)
+
+    def settle(self, run):
+        return {
+            "status": "completed",
+            "finalMessage": f"{run.axis} report",
+            "reviewSessionId": f"session-{run.axis}",
+        }
+
+    def end_axis(self, axis, result, run):
+        self.ended.append((axis, result["status"]))
+
+
+class DeliverySeamTests(FakePaneTestCase):
+    """What the shared harness hands the Lane, and what it takes back."""
+
+    def setUp(self):
+        super().setUp()
+        RecordingLane.instances = []
+
+    def use_recording_lane(self):
+        self.enter(
+            mock.patch.dict(self.bridge.LANES, {"codex": RecordingLane}, clear=True)
+        )
+
+    def test_each_requested_axis_reaches_the_lane_as_one_brief(self):
+        self.use_recording_lane()
+
+        code, output = self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(code, 0)
+        lane = RecordingLane.instances[0]
+        self.assertEqual([brief.axis for brief in lane.briefs], ["standards", "spec"])
+        self.assertIn("Standards sources:", lane.briefs[0].text)
+        self.assertIn("\nSpec:\n", lane.briefs[1].text)
+
+    def test_the_lane_result_is_the_result_the_run_reports(self):
+        self.use_recording_lane()
+
+        code, output = self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"], "standards report"
+        )
+        self.assertEqual(output["axes"]["spec"]["finalMessage"], "spec report")
+        self.assertEqual(
+            RecordingLane.instances[0].ended,
+            [("standards", "completed"), ("spec", "completed")],
+        )
+
+    def test_delivery_happens_only_inside_the_lane(self):
+        self.use_recording_lane()
+
+        self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(self.codex.launched_panes, [])
+        self.assertFalse(list(self.state_dir.glob("*.json")))
+
+    def test_an_unknown_reviewer_fails_before_any_lane_opens(self):
+        with self.assertRaises(RuntimeError) as raised:
+            self.run_bridge(self.args(reviewer="gemini"))
+
+        self.assertIn("gemini", str(raised.exception))
+        self.assertIn("codex", str(raised.exception))
+        self.assertEqual(self.codex.launched_panes, [])
 
 
 class ReviewDeliveryTests(FakePaneTestCase):

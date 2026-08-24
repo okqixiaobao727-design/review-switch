@@ -6,8 +6,9 @@ allowed-tools: Read, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git bran
 
 The Codex Lane is a thin coordinator. The Bridge owns review preparation: it pins the three-dot
 diff, reads the spec and standards, consults the optional code graph, and writes each Axis Brief.
-The Lane's only input work is the spec-reference discovery below. Hand the Bridge references,
-then apply the Rounds contract to its result.
+It then delivers each brief to the reviewing vendor `--reviewer` names, which on this lane is
+always `codex`. The Lane's only input work is the spec-reference discovery below. Hand the Bridge
+references, then apply the Rounds contract to its result.
 
 ## First review
 
@@ -30,6 +31,7 @@ Make one Bridge call from the repository being reviewed, with no session handle:
 
 ```bash
 python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py \
+  --reviewer codex \
   --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis '<AXIS>'
 ```
 
