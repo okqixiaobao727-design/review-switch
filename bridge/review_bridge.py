@@ -44,7 +44,7 @@ try:
     import aiohttp
 except ImportError as error:
     raise SystemExit(
-        "tui_review_bridge requires Python package 'aiohttp'. "
+        "review_bridge requires Python package 'aiohttp'. "
         "Install it for the Python interpreter used by Claude Code."
     ) from error
 

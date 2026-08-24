@@ -1,42 +1,85 @@
 # review-switch
 
-Review-Switch dispatches Claude Code reviews to a configured Claude plugin lane or an isolated
-Codex TUI lane, with an Adjudicator hook enforcing the selected route.
+Review-Switch runs one code review protocol and delivers it to the reviewing vendor you name:
+`claude` or `codex`. The review runs outside the session that asked for it, on both Lanes.
+
+`review-bridge` is the review. It pins the Review Scope — the fixed point to your working tree as
+it stands, committed or not — fetches the spec you name, gathers the standards sources, fills one
+Axis Brief per axis, and delivers each to its Lane. `--axis both` reviews Standards and Spec
+concurrently and returns the two reports separately.
 
 ## Install
 
 ```bash
 git clone https://github.com/okqixiaobao727-design/review-switch.git
 cd review-switch
-ln -sfn "$PWD/skills/review-switch"       "$HOME/.claude/skills/review-switch"
-ln -sfn "$PWD/skills/review-switch-cc"    "$HOME/.claude/skills/review-switch-cc"
-ln -sfn "$PWD/skills/review-switch-codex" "$HOME/.claude/skills/review-switch-codex"
+mkdir -p "$HOME/.claude/skills" "$HOME/.local/bin"
+ln -sfn "$PWD/skills/review-switch" "$HOME/.claude/skills/review-switch"
+ln -sfn "$PWD/bridge/review_bridge.py" "$HOME/.local/bin/review-bridge"
 ```
+
+The second link puts the Bridge on your `PATH` as `review-bridge`; use any directory on your
+`PATH` if `~/.local/bin` is not on yours.
 
 Register `hook/review-adjudicator.sh` as a Claude Code `PreToolUse` hook matching `Skill`.
 
-The CC Lane depends on the `mattpocock-skills` plugin and invokes
-`mattpocock-skills:code-review` directly.
+## Running a review
 
-The Codex Lane additionally needs `aiohttp` (`pip install aiohttp`) installed for the Python
-interpreter Claude Code runs, because its review bridge imports it. `code-review-graph` is an
-optional Codex Lane dependency: when its CLI and an existing graph are available, the Bridge adds
-navigation pointers to each Axis Brief; the review still runs without it. The CC Lane needs
-nothing beyond its plugin. Running the test suites additionally needs `pytest`.
+From the repository being reviewed:
 
-## Codex Lane
+```bash
+review-bridge --reviewer codex --base main --spec '#42' --axis both
+```
 
-The Codex Lane is a thin coordinator around one Bridge call. The Bridge prepares the review once
-from the fixed point, spec reference, and requested axis. An `axis=both` review opens two Codex TUI
-panes concurrently — Standards and Spec — then closes each pane when its turn ends and returns the
-two reports separately. The Lane preserves that separation and follows the action each axis's
-result names, which is where the Bridge's bounded Rounds contract reaches it.
+It prints one JSON object: a `preparation` receipt, and one entry per axis under `axes` carrying
+that axis's `status`, `finalMessage`, `reviewSessionId`, and `next` — the one action you are
+permitted after that result. `--model` and `--effort` pin the whole review;
+`--standards-model`, `--standards-effort`, `--spec-model`, and `--spec-effort` pin one axis at a
+time. Omit them and the vendor's own configuration applies. `--recover-session` re-attaches to a
+review whose driver died, and exits `3` when no live review belongs here. `--help` lists every
+option.
 
-## Skills
+The Bridge reads no configuration file of its own, so a review resolves the same way on every
+machine it is invoked from.
 
-- `/review-switch` selects the configured reviewer lane.
-- `/review-switch-cc` runs the Claude plugin reviewer.
-- `/review-switch-codex` runs the isolated Codex TUI reviewer.
+## The round cap
 
-Set `~/.claude/code-reviewer` to `codex` for the Codex Lane; a missing file or any other value
-selects the CC Lane.
+One lineage gets one standards pass and at most one spec re-review, scoped to the fixes the
+findings required. The Bridge holds that cap: it refuses a resume past it and reports `escalate`
+as the next permitted action. What escalation *is* is yours — a fresh review is always available.
+
+## Lifecycle Hooks
+
+A caller that wants a review observed hands in the commands to run: `--on-child-launch`,
+`--on-review-start`, `--on-axis-end`, and `--on-review-end`, each one command string. Each runs
+once in the reviewed working directory, with that point's facts in its environment as `REVIEW_*`
+variables. Pass none and nothing extra runs; a command that fails, hangs, or is missing leaves
+the review's result untouched.
+
+## Asking from inside a Claude session
+
+`/review-switch` is the Dispatcher, and the only skill this project installs. It resolves the
+Lane this machine is configured for, completes the fixed point and the spec reference, and calls
+`review-bridge` — the same command a terminal runs.
+
+Two files configure it, and the Dispatcher is the only thing that reads either:
+
+- `~/.claude/code-reviewer` — the exact value `codex` selects the codex Lane; any other value or
+  a missing file selects the claude Lane. A Lane you name when you ask overrides it.
+- `~/.claude/review-hooks/` — one file per lifecycle point, named `child-launch`,
+  `review-start`, `axis-end`, or `review-end`, each holding one command. A missing directory,
+  missing file, or blank file leaves that point unset.
+
+## Dependencies
+
+Both Lanes need Python 3.11+ with `aiohttp` (`pip install aiohttp`) installed for the interpreter
+that runs `review-bridge`, and `git`.
+
+- **codex Lane** — the `codex` CLI, and `tmux`: each axis is an interactive TUI lineage in a pane
+  of its own, torn down when its turn ends and left resumable.
+- **claude Lane** — the `claude` CLI. Each axis is a headless process, and no tmux is involved.
+
+`code-review-graph` is optional on either Lane: when its CLI and an existing graph are available,
+the Bridge adds navigation pointers to each Axis Brief. The review still runs without it.
+
+Running the test suites additionally needs `pytest`.
