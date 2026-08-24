@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from bridge_harness import (
+    CLAUDE_ROUND_ONE_USAGE,
     FakePaneTestCase,
     RESOLVED_MODEL,
     ROUND_ONE_COUNTERS,
@@ -63,16 +64,17 @@ COUNTER_VARS = {
 }
 
 
-class LifecycleHookTests(FakePaneTestCase):
-    """The four points a caller can hand a command for, and what each is told.
+class HookRecordingTestCase(FakePaneTestCase):
+    """A review driven from the command line with a real command at every point.
 
     The bridge learns no caller's vocabulary: a hook command is composed by the
     caller and carries whatever correlation token that caller needs, and the only
-    thing the bridge adds is facts it owns. So these tests hand in a real command
-    at each point and pin the firings and the environment they arrive with.
+    thing the bridge adds is facts it owns. So a test here hands in a real command
+    and pins the firings and the environment they arrive with.
     """
 
     MODEL = "gpt-5.6-luna"
+    REVIEWER = "codex"
 
     def setUp(self):
         super().setUp()
@@ -96,7 +98,7 @@ class LifecycleHookTests(FakePaneTestCase):
     def main(self, *arguments):
         argv = [
             "tui_review_bridge.py",
-            "--reviewer", "codex",
+            "--reviewer", self.REVIEWER,
             "--cwd", str(self.worktree),
             *arguments,
         ]
@@ -138,6 +140,10 @@ class LifecycleHookTests(FakePaneTestCase):
             record for record in self.firing_records()
             if record["REVIEW_EVENT"] == event
         ]
+
+
+class LifecycleHookTests(HookRecordingTestCase):
+    """The four points a caller can hand a command for, and what each is told."""
 
     def write_rollout(self, thread_id, usage):
         return write_rollout(
@@ -520,6 +526,75 @@ class LifecycleHookTests(FakePaneTestCase):
             self.firings_at("review-end")[0]["REVIEW_STATUS"], self.output["status"]
         )
         self.assertEqual(self.output["status"], "partially_completed")
+
+
+class HeadlessAxisCostTests(HookRecordingTestCase):
+    """What a headless axis is reported to have spent, at the same point.
+
+    Cost is per axis whichever Lane drove it, and each Lane reads it where its
+    own reviewer records it: a rollout on one, the result the reviewer printed on
+    the other. What a caller's command is handed is the same either way.
+    """
+
+    REVIEWER = "claude"
+
+    def test_a_costed_axis_carries_the_four_disjoint_counters(self):
+        self.claude.bill(CLAUDE_ROUND_ONE_USAGE, model="claude-opus-5-billed")
+        self.claude.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_AXIS"], "standards")
+        self.assertEqual(record["REVIEW_STATUS"], "completed")
+        self.assertEqual(record["REVIEW_MODEL"], "claude-opus-5-billed")
+        self.assertEqual(
+            {
+                name: int(record[variable])
+                for name, variable in COUNTER_VARS.items()
+            },
+            ROUND_ONE_COUNTERS,
+        )
+        self.assertNotIn("REVIEW_COST_DETAIL", record)
+
+    def test_an_axis_with_no_result_carries_the_reason_and_no_counters(self):
+        self.claude.error("standards", "the reviewer went away")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 1)
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_STATUS"], "failed")
+        self.assertTrue(record["REVIEW_COST_DETAIL"])
+        for variable in COUNTER_VARS.values():
+            self.assertNotIn(variable, record)
+
+    def test_a_result_that_reported_no_usage_carries_the_reason(self):
+        """A review that returned a report but no figures is not a costed axis."""
+        self.claude.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        self.assertTrue(record["REVIEW_COST_DETAIL"])
+        for variable in COUNTER_VARS.values():
+            self.assertNotIn(variable, record)
+
+    def test_a_headless_review_fires_each_point_once(self):
+        self.claude.finish("one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.events(),
+            ["review-start", "child-launch", "axis-end", "review-end"],
+        )
+        self.assertEqual(
+            self.firings_at("child-launch")[0]["REVIEW_CHILD_TMUX_TARGET"], ""
+        )
 
 
 if __name__ == "__main__":

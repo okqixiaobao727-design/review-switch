@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
-"""Interactive Codex TUI code-review channel for a Claude session.
+"""Code-review channel between a caller and the reviewing vendor it named.
 
-Round one starts a review lineage in its own tmux pane; round two resumes that
-thread, and `--recover-session` re-attaches to the turn a killed driver left in
-flight.
+Round one starts a review lineage; round two resumes it, and `--recover-session`
+re-attaches to the review a killed driver left in flight.
 
 Preparation and delivery are separate: preparation fills one Axis Brief per
 requested axis, and the Lane `--reviewer` names takes one brief and gives back
 that axis's result. A reviewer this bridge has no Lane for is refused by name
-before any of it opens.
+before any of it opens. `codex` drives an interactive TUI lineage in a tmux pane
+of its own; `claude` drives a headless process and needs no tmux (ADR-0003).
 
 A caller that wants a review's start, each axis's cost, and its end observed
 hands in the commands to run at those points, and gets them run with this
@@ -74,6 +74,7 @@ NO_LIVE_SESSION_EXIT = 3
 # The reviewing vendor a caller names on `--reviewer`. The model is whatever the
 # lineage was pinned to, so the reviewer names the vendor and nothing else.
 REVIEWER_CODEX = "codex"
+REVIEWER_CLAUDE = "claude"
 CODE_GRAPH_CLI = "code-review-graph"
 # The four disjoint counters one axis's spend is reported as.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
@@ -227,17 +228,16 @@ def cost_facts(counters, detail):
     return {COUNTER_VARS[name]: str(counters[name]) for name in COUNTERS}
 
 
-def hook_axis_end(args, axis, status, session, thread_id):
-    """End one axis: how it finished, and what its own thread spent.
+def hook_axis_end(args, axis, status, session, cost):
+    """End one axis: how it finished, and what its own reviewer spent.
 
-    The model reported is the one the thread resolved to and nothing else: the
-    alias the caller asked for is already theirs to remember. An axis that never
-    started a thread has no rollout to read, and says so.
+    What an axis spent is the Lane's to read — a rollout on one Lane, a printed
+    result on the other — so it arrives here already read, as the counters or as
+    the reason there are none. The model reported is the one the reviewer
+    resolved to and nothing else: the alias the caller asked for is already
+    theirs to remember.
     """
-    if thread_id is None:
-        counters, model, detail = None, None, NO_THREAD_DETAIL
-    else:
-        counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
+    counters, model, detail = cost
     run_hook(
         args,
         AXIS_END,
@@ -247,16 +247,6 @@ def hook_axis_end(args, axis, status, session, thread_id):
         REVIEW_MODEL=model or "",
         **cost_facts(counters, detail),
     )
-
-
-def end_launched_axis(args, axis):
-    """End an axis that opened its pane and never got a result of its own.
-
-    A sibling axis failing to launch tears this one down before it could report
-    anything, and the point still owes the caller one end for the child it was
-    told about.
-    """
-    hook_axis_end(args, axis, FAILED_STATUS, None, None)
 
 
 def hook_review_end(args, status):
@@ -547,6 +537,22 @@ def resolve_owner(args, environment=None):
     )
 
 
+def lane_owner(args, lane):
+    """The identity this call's sessions belong to, tmux half filled or not.
+
+    The tuple is the Bridge's and every Lane is keyed by it. A Lane with no
+    window has no tmux half to fill, which is also what keeps a headless Lane's
+    records and a codex Lane's from ever matching each other's owner.
+    """
+    if lane.NEEDS_TMUX:
+        return resolve_owner(args)
+    return InvocationOwner(
+        tmux_server="",
+        origin_pane="",
+        worktree_root=canonical_worktree_root(args.cwd),
+    )
+
+
 def validate_session_owner(state, owner):
     if state.get("owner") != owner.to_dict():
         raise RuntimeError(
@@ -625,15 +631,20 @@ class SessionStore:
             )
         return state
 
-    def find_by_owner(self, owner):
-        """Returns every recoverable record this owner wrote, newest turn first.
+    def remove(self, session_id):
+        """Take back a record whose review never began; missing is already done."""
+        self.state_path(session_id).unlink(missing_ok=True)
 
-        The record is written before the turn is awaited, so a session whose
+    def find_by_owner(self, owner, required=()):
+        """Returns every record this owner wrote carrying `required`, newest first.
+
+        The record is written before the review is awaited, so a session whose
         driver died mid-review is already on disk under the same owner tuple the
-        resume path validates. A record without a `marker` predates recovery and
-        names no turn to wait on, so it is not recoverable; so is anything
-        unreadable or written by another version, which is skipped rather than
-        raised — one damaged file must not hide a healthy session.
+        resume path validates. What makes a record reachable again is the Lane's
+        to say, and it says so as the fields it needs to find its reviewer with:
+        a record missing one of them names nothing to wait on. Anything
+        unreadable or written by another version is skipped rather than raised —
+        one damaged file must not hide a healthy session.
         """
         found = []
         for path in sorted(self.root.glob("*.json")):
@@ -647,7 +658,7 @@ class SessionStore:
                 continue
             if state.get("owner") != owner.to_dict():
                 continue
-            if not state.get("marker") or not state.get("threadId"):
+            if any(not state.get(field) for field in required):
                 continue
             found.append(state)
         found.sort(key=lambda state: state.get("updatedAt") or 0, reverse=True)
@@ -663,7 +674,8 @@ def owner_lock(store, owner):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError(
-                "Another review bridge call is already running for this tmux pane"
+                "Another review bridge call is already running for "
+                + ("this tmux pane" if owner.origin_pane else "this worktree")
             ) from error
         yield
     finally:
@@ -1782,11 +1794,17 @@ class AxisRunError(Exception):
         self.reason = reason
 
 
-def launch_axis(args, brief, tmux_target, split_direction):
+def axis_arguments(args, axis):
+    """This call's arguments as one axis sees them, with that axis's choices pinned."""
     axis_args = argparse.Namespace(**vars(args))
-    axis_args.axis = brief.axis
+    axis_args.axis = axis
     for choice in ("model", "effort"):
-        setattr(axis_args, choice, resolve_axis_choice(args, brief.axis, choice))
+        setattr(axis_args, choice, resolve_axis_choice(args, axis, choice))
+    return axis_args
+
+
+def launch_axis(args, brief, tmux_target, split_direction):
+    axis_args = axis_arguments(args, brief.axis)
     axis_args.tmux_target = tmux_target
     axis_args.split_direction = split_direction
     bridge_id = str(uuid.uuid4())
@@ -2007,7 +2025,12 @@ async def run_recovered_reviews(args, owner, store):
         return AxisCompleted(state, turn)
 
     recovered = await asyncio.gather(
-        *(recover(state) for state in store.find_by_owner(owner))
+        *(
+            recover(state)
+            for state in store.find_by_owner(
+                owner, required=CodexLane.RECOVERABLE_FIELDS
+            )
+        )
     )
     live = [run for run in recovered if run is not None]
     if live:
@@ -2018,21 +2041,77 @@ async def run_recovered_reviews(args, owner, store):
     )
 
 
-class CodexLane:
-    """Delivery to the codex reviewer: one Codex TUI pane per axis.
+class Lane:
+    """The seam every Lane is reached through, and the half every Lane shares.
 
-    The seam every Lane is reached through. Preparation is finished by the time
-    one is opened, so a Lane takes one Axis Brief and gives back that axis's
-    result; everything that is codex's rather than the review's — panes, threads,
-    app-server connections, the record on disk — lives on this side of it.
+    Preparation is finished by the time a Lane is opened, so a Lane takes one
+    Axis Brief and gives back that axis's result; everything that is a vendor's
+    rather than the review's lives on the far side of this seam. What every Lane
+    does alike — whose sessions these are, how an axis ends, what a recovered
+    review was prepared from — is here; what only one vendor does is not.
     """
 
-    name = REVIEWER_CODEX
+    #: Whether this Lane's reviewer runs in a tmux pane of the caller's server.
+    NEEDS_TMUX = False
+    #: What an axis that reached no reviewer of its own spent, which is nothing
+    #: readable. Each Lane names the reason its own reviewer could not be read.
+    NO_COST = (None, None, "this axis reached no reviewer to read a cost from")
 
     def __init__(self, args, owner, store):
         self.args = args
         self.owner = owner
         self.store = store
+
+    def axis_cost(self, run):
+        """What one axis spent, read wherever this Lane's reviewer records it."""
+        raise NotImplementedError
+
+    def end_axis(self, axis, result, run):
+        """End an axis this Lane drove to a result of its own."""
+        hook_axis_end(
+            self.args,
+            axis,
+            result["status"],
+            result["reviewSessionId"],
+            self.axis_cost(run),
+        )
+
+    def end_launched_axis(self, axis):
+        """End an axis that opened its reviewer and never got a result of its own.
+
+        A sibling axis failing to open tears this one down before it could report
+        anything, and the point still owes the caller one end for the child it
+        was told about.
+        """
+        hook_axis_end(self.args, axis, FAILED_STATUS, None, self.NO_COST)
+
+    def recovered_preparation(self, runs):
+        """What a recovered review was prepared from, read back off its own records."""
+        return next(
+            (
+                run.state.get("preparation")
+                for run in runs
+                if run.state is not None
+            ),
+            None,
+        )
+
+
+class CodexLane(Lane):
+    """Delivery to the codex reviewer: one Codex TUI pane per axis.
+
+    Everything that is codex's rather than the review's — panes, threads,
+    app-server connections, the record on disk — lives on this side of the seam.
+    """
+
+    name = REVIEWER_CODEX
+    NEEDS_TMUX = True
+    NO_COST = (None, None, NO_THREAD_DETAIL)
+    #: What a record must carry for a recovering caller to find its turn again.
+    RECOVERABLE_FIELDS = ("marker", "threadId")
+
+    def __init__(self, args, owner, store):
+        super().__init__(args, owner, store)
         # Pane layout: the first axis splits off the caller's own pane to its
         # right, and each further axis splits off the one before it, downwards.
         self.previous_pane = None
@@ -2093,40 +2172,571 @@ class CodexLane:
             cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
         return axis_result(state, turn, final_message)
 
-    def end_axis(self, axis, result, run):
-        """End an axis this Lane drove to a result of its own.
+    def axis_cost(self, run):
+        """What an axis spent, read from the Codex rollout its own thread wrote."""
+        if run.thread_id is None:
+            return self.NO_COST
+        return harvest_rollout(codex_sessions_root(), run.thread_id)
 
-        What an axis spent is read from the Codex rollout its thread wrote, which
-        is why the point is reported from here rather than from the harness.
+
+# A headless reviewer has nobody to answer a permission prompt, so the mode is
+# not a caller-tunable option.
+CLAUDE_PERMISSION_MODE = "bypassPermissions"
+# Which Claude login the reviewer spends on. Claude Code scopes login state to
+# this variable, so setting it is what routes the spend. The value arrives
+# already resolved to a profile directory: this bridge reads no account registry.
+CLAUDE_CONFIG_HOME_ENV_VAR = "CLAUDE_CONFIG_DIR"
+CLAUDE_BINARY_ENV_VAR = "CODE_REVIEW_CLAUDE_BINARY"
+# The one JSON object a headless reviewer prints, and everything else it said.
+CLAUDE_RESULT_FILENAME = "result.json"
+CLAUDE_LOG_FILENAME = "claude.log"
+# What a headless result's `usage` object calls each of the four counters. Claude
+# reports its cached tokens beside the input count rather than inside it, so the
+# four arrive already disjoint.
+CLAUDE_USAGE_FIELDS = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_input_tokens",
+    "cache_creation": "cache_creation_input_tokens",
+}
+NO_RESULT_DETAIL = "this axis returned no result to read a cost from"
+NO_USAGE_DETAIL = "this axis's result reported no usage to read a cost from"
+# How often a recovering caller looks to see whether the reviewer it adopted has
+# exited. It did not start that process, so waiting on it is polling or nothing.
+CLAUDE_EXIT_POLL_SECONDS = 0.25
+
+
+def resolve_claude_binary(explicit=None, environment=None):
+    """Absolute path of the real `claude` executable.
+
+    The launch below is an argv list with no shell, so a `claude` *shell
+    function* is already out of the picture. Resolving symlinks as well means a
+    wrapper script dropped on PATH cannot intercept the reviewer either.
+    """
+    environment = os.environ if environment is None else environment
+    candidate = explicit or environment.get(CLAUDE_BINARY_ENV_VAR)
+    if not candidate:
+        candidate = shutil.which("claude", path=environment.get("PATH"))
+    if not candidate:
+        raise RuntimeError("Cannot find the claude executable")
+    resolved = pathlib.Path(candidate).resolve()
+    if not resolved.is_file():
+        raise RuntimeError(f"claude executable does not exist: {resolved}")
+    return str(resolved)
+
+
+def build_claude_command(binary, prompt, model, effort, resume_id):
+    """The exact argv handed to one headless reviewer, in a stable order."""
+    command = [
+        binary,
+        "-p",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        CLAUDE_PERMISSION_MODE,
+    ]
+    if model:
+        command.extend(["--model", model])
+    if effort:
+        command.extend(["--effort", effort])
+    if resume_id:
+        command.extend(["-r", resume_id])
+    command.append(prompt)
+    return command
+
+
+def claude_child_environment(account):
+    """The reviewer's environment, or `None` to inherit the caller's untouched.
+
+    An account is a profile directory, and naming one overrides whatever login
+    the caller happens to be on, so a review billed to one account is not a hole
+    in it. A call that names none inherits the caller's login exactly as it
+    stands: the default home spelled out explicitly is a login that can fail
+    where the inherited one works.
+    """
+    if not account:
+        return None
+    return {**os.environ, CLAUDE_CONFIG_HOME_ENV_VAR: account}
+
+
+def claude_process_alive(pid):
+    """True while the reviewer a record names is still running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def terminate_claude(pid):
+    """Take down a reviewer and whatever it started, and fail at nothing."""
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        return
+
+
+class ClaudeProcess:
+    """One headless reviewer, seen only through what its driver may do to it."""
+
+    def __init__(self, process):
+        self.process = process
+
+    @property
+    def pid(self):
+        return self.process.pid
+
+    async def wait(self, timeout):
+        await asyncio.wait_for(asyncio.to_thread(self.process.wait), timeout)
+
+    def kill(self):
+        terminate_claude(self.pid)
+
+
+def launch_claude(args, command, runtime_dir):
+    """Start this axis's reviewer, in a session of its own.
+
+    A session of its own is what makes this Lane recoverable: a driver that dies
+    leaves the reviewer running and its result still on its way to the file it
+    prints into, which is the promise the codex Lane's pane makes too.
+    """
+    result_path = runtime_dir / CLAUDE_RESULT_FILENAME
+    log_path = runtime_dir / CLAUDE_LOG_FILENAME
+    try:
+        with open(result_path, "wb") as printed, open(log_path, "wb") as said:
+            process = subprocess.Popen(
+                command,
+                cwd=args.cwd,
+                env=claude_child_environment(args.account),
+                stdin=subprocess.DEVNULL,
+                stdout=printed,
+                stderr=said,
+                start_new_session=True,
+            )
+    except OSError as error:
+        raise RuntimeError(f"Cannot launch headless Claude: {error}") from error
+    return ClaudeProcess(process)
+
+
+def open_child_process(args, command, runtime_dir):
+    """Start this axis's reviewer, and tell the caller's hook which child it got."""
+    process = launch_claude(args, command, runtime_dir)
+    hook_child_launch(args)
+    return process
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeResult:
+    """The one JSON object a headless reviewer prints, in the parts a Lane reads."""
+
+    session_id: str
+    result: str
+    is_error: bool
+    subtype: str
+    permission_denials: list
+    payload: dict
+
+
+def read_claude_result(path):
+    """What the reviewer printed, or the failure that it printed no result."""
+    try:
+        text = pathlib.Path(path).read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    except OSError as error:
+        raise RuntimeError(
+            f"the reviewer's result could not be read: {error}"
+        ) from error
+    if not text:
+        raise RuntimeError("the reviewer produced no output")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"the reviewer's output is not JSON: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("the reviewer's output is not a JSON object")
+    if not payload.get("session_id"):
+        raise RuntimeError("the reviewer's output carries no session id")
+    denials = payload.get("permission_denials") or []
+    if not isinstance(denials, list):
+        denials = [denials]
+    return ClaudeResult(
+        session_id=payload["session_id"],
+        result=payload.get("result") or "",
+        is_error=bool(payload.get("is_error")),
+        subtype=payload.get("subtype") or "",
+        permission_denials=denials,
+        payload=payload,
+    )
+
+
+def claude_usage(payload):
+    """The four disjoint counters one axis billed, or `None` when it reported none.
+
+    All four or nothing: a `usage` object missing one of them is not a partial
+    answer, it is a shape this bridge does not recognise, and billing an axis for
+    three of its four counters would understate it without saying so.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    counters = {}
+    for name, field in CLAUDE_USAGE_FIELDS.items():
+        value = usage.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        counters[name] = value
+    return counters
+
+
+def claude_resolved_model(payload):
+    """The model one axis ran on, or `None` when its result named no single one.
+
+    The per-model breakdown is keyed by the model that was billed, so an alias
+    like `opus` is resolved to the id behind it. More than one key is an axis
+    that ran on more than one model, which no single id describes.
+    """
+    billed = payload.get("modelUsage")
+    if isinstance(billed, dict) and len(billed) == 1:
+        return next(iter(billed))
+    return None
+
+
+def claude_axis_cost(parsed):
+    """What one axis spent, read from the result its own reviewer printed."""
+    counters = claude_usage(parsed.payload)
+    model = claude_resolved_model(parsed.payload)
+    return counters, model, None if counters else NO_USAGE_DETAIL
+
+
+def claude_failure_reason(parsed):
+    """Why this axis's report is not one, or `None` when it is."""
+    if parsed.is_error:
+        return f"the reviewer ended in error: {parsed.subtype or 'unknown'}"
+    if not parsed.result:
+        return "review completed without a final message"
+    if parsed.permission_denials:
+        return (
+            f"the reviewer was denied {len(parsed.permission_denials)} "
+            "permission(s), so its report covers less than it was asked to review"
+        )
+    return None
+
+
+def claude_axis_result(state, parsed):
+    """One axis's result, in the shape every Lane returns it."""
+    reason = claude_failure_reason(parsed)
+    result = {
+        "status": FAILED_STATUS if reason else "completed",
+        "finalMessage": parsed.result,
+        "reviewSessionId": state["reviewSessionId"],
+    }
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def headless_session_state(
+    session_id, owner, runtime_dir, pid, target, model, effort, axis
+):
+    """The record one headless axis leaves: the reviewer, and where it prints."""
+    now = time.time()
+    return {
+        "version": SESSION_STATE_VERSION,
+        "reviewSessionId": session_id,
+        "axis": axis,
+        "owner": owner.to_dict(),
+        "runtimeDir": str(runtime_dir),
+        "resultPath": str(pathlib.Path(runtime_dir) / CLAUDE_RESULT_FILENAME),
+        "pid": pid,
+        # The lineage this axis's next round resumes; it has none until the
+        # reviewer has printed the session it ran under.
+        "claudeSessionId": None,
+        "target": target,
+        "model": model,
+        "effort": effort,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def result_awaits(path):
+    """True when a reviewer that is no longer running left a result behind."""
+    try:
+        return pathlib.Path(path).stat().st_size > 0
+    except OSError:
+        return False
+
+
+async def wait_for_claude_exit(pid, timeout):
+    """Wait out a reviewer this caller never started, which is polling or nothing."""
+    deadline = time.monotonic() + timeout
+    while claude_process_alive(pid):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"the reviewer was still running after {timeout}s"
+            )
+        await asyncio.sleep(CLAUDE_EXIT_POLL_SECONDS)
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeLaunch:
+    """One axis's reviewer, started, recorded, and not yet waited on."""
+
+    args: argparse.Namespace
+    brief: AxisBrief
+    command: list
+    runtime_dir: pathlib.Path
+    process: object
+    state: dict
+
+
+@dataclasses.dataclass(frozen=True)
+class ClaudeRun:
+    """One axis this Lane drove, whether or not it reached a report."""
+
+    state: dict
+    parsed: ClaudeResult | None = None
+    reason: str = ""
+
+
+class ClaudeLane(Lane):
+    """Delivery to the claude reviewer: one headless process per axis.
+
+    There is no pane and no thread on this side of the seam: `claude -p` prints
+    one JSON object and exits, so what this Lane owns is a process, the file that
+    object lands in, and the record naming both. A review here needs no tmux,
+    which is this Lane's dependency rather than a difference in the review
+    (ADR-0003).
+    """
+
+    name = REVIEWER_CLAUDE
+    NO_COST = (None, None, NO_RESULT_DETAIL)
+    #: What a record must carry for a recovering caller to reach its reviewer.
+    RECOVERABLE_FIELDS = ("pid", "resultPath")
+    NO_LIVE_SESSION = (
+        "No live review session for this worktree. "
+        "Nothing to recover; start a review instead."
+    )
+
+    def open(self, brief):
+        """Start one axis's reviewer, recorded and ready to be waited on.
+
+        The record goes down here rather than where the waiting starts, because
+        the reviewer is already running by the time this returns: a driver killed
+        in between would otherwise leave a live reviewer that `--recover-session`
+        can no longer find.
         """
-        hook_axis_end(
-            self.args,
-            axis,
-            result["status"],
-            result["reviewSessionId"],
-            run.thread_id,
+        axis_args = axis_arguments(self.args, brief.axis)
+        launch = self.launch(
+            axis_args, brief, axis_args.model, axis_args.effort, None
+        )
+        state = headless_session_state(
+            str(uuid.uuid4()),
+            self.owner,
+            launch.runtime_dir,
+            launch.process.pid,
+            self.args.base,
+            axis_args.model,
+            axis_args.effort,
+            brief.axis,
+        )
+        state["preparation"] = preparation_report(self.args)
+        self.store.write(state["reviewSessionId"], state)
+        return dataclasses.replace(launch, state=state)
+
+    def launch(self, axis_args, brief, model, effort, resume_id):
+        """Put one brief to a reviewer of this axis's own, new lineage or resumed."""
+        command = build_claude_command(
+            resolve_claude_binary(self.args.claude_binary),
+            brief.text,
+            model,
+            effort,
+            resume_id,
+        )
+        runtime_dir = make_runtime(brief.text)
+        try:
+            process = open_child_process(axis_args, command, runtime_dir)
+        except Exception:
+            shutil.rmtree(runtime_dir, ignore_errors=True)
+            raise
+        return ClaudeLaunch(
+            axis_args, brief, command, runtime_dir, process, None
         )
 
-    def recovered_preparation(self, runs):
-        """What a recovered review was prepared from, read back off its own records."""
-        return next(
-            (
-                run.state.get("preparation")
-                for run in runs
-                if run.state is not None
-            ),
-            None,
+    def discard(self, launch):
+        """Tear down an axis that started but will never be waited on.
+
+        Its record goes with it: a review that never began is not one a later
+        caller should find a handle to.
+        """
+        launch.process.kill()
+        if launch.state is not None:
+            self.store.remove(launch.state["reviewSessionId"])
+        shutil.rmtree(launch.runtime_dir, ignore_errors=True)
+
+    async def deliver(self, launch):
+        """Drive one started axis to a result of its own."""
+        return await self.drive(launch, launch.state)
+
+    async def drive(self, launch, state):
+        """Wait this axis's reviewer out and read what it printed.
+
+        Nothing here throws the reviewer's output away: what it printed stays on
+        disk, under a record that still names it, until the result reaches the
+        caller. A driver that dies with the report already read has therefore
+        thrown nothing away either — the report is still there to be recovered.
+        """
+        try:
+            await launch.process.wait(self.args.timeout)
+            parsed = read_claude_result(
+                launch.runtime_dir / CLAUDE_RESULT_FILENAME
+            )
+        except TimeoutError:
+            # Nothing else will wait on this reviewer, so it is stopped rather
+            # than left running at the caller's expense.
+            launch.process.kill()
+            return ClaudeRun(
+                state,
+                reason=(
+                    f"the reviewer did not finish within {self.args.timeout}s"
+                ),
+            )
+        except Exception as error:
+            return ClaudeRun(state, reason=str(error) or type(error).__name__)
+        return ClaudeRun(state, parsed=parsed)
+
+    async def resume(self, brief):
+        """Put one more turn to the lineage a resume handle names."""
+        state = self.args.resume_state
+        if state is None:
+            state = self.store.read(self.args.resume_session)
+        validate_resume_axis(self.args, state)
+        validate_session_owner(state, self.owner)
+        apply_session_model_choice(self.args, state)
+        launch = self.launch(
+            axis_arguments(self.args, state["axis"]),
+            brief,
+            state["model"],
+            state["effort"],
+            state.get("claudeSessionId"),
         )
+        state["runtimeDir"] = str(launch.runtime_dir)
+        state["resultPath"] = str(
+            launch.runtime_dir / CLAUDE_RESULT_FILENAME
+        )
+        state["pid"] = launch.process.pid
+        state["updatedAt"] = time.time()
+        # On disk before the turn is awaited, for the same reason a first review
+        # writes its record early: a driver killed mid-review must leave a
+        # reviewer the recovery path can still find.
+        self.store.write(state["reviewSessionId"], state)
+        return await self.drive(dataclasses.replace(launch, state=state), state)
+
+    def recoverable(self):
+        """Every record of this owner's that still names a reviewer to wait on.
+
+        A reviewer outlives its driver, so what survives that death is the
+        record, the process, and the file the result lands in. A record whose
+        runtime directory is gone was settled and is nobody's to recover; one
+        whose reviewer has exited without printing anything is nothing to wait
+        on either.
+        """
+        return [
+            state
+            for state in self.store.find_by_owner(
+                self.owner, required=self.RECOVERABLE_FIELDS
+            )
+            if pathlib.Path(state["runtimeDir"]).is_dir()
+            and (
+                claude_process_alive(state["pid"])
+                or result_awaits(state["resultPath"])
+            )
+        ]
+
+    async def recover(self):
+        """Re-attach to every axis this owner already has running.
+
+        The caller reaching here has lost the handle its driver was going to
+        print. This starts no reviewer: it finds the owner's live ones and waits
+        on the results already on their way. With none it raises
+        `NoLiveSessionError` rather than falling back to a first review.
+        """
+        states = self.recoverable()
+        if not states:
+            raise NoLiveSessionError(self.NO_LIVE_SESSION)
+        runs = await asyncio.gather(*(self.rejoin(state) for state in states))
+        return {run.state["axis"]: run for run in runs}
+
+    async def rejoin(self, state):
+        """Wait out one reviewer this call adopted, and read what it printed."""
+        try:
+            await wait_for_claude_exit(state["pid"], self.args.timeout)
+            parsed = read_claude_result(state["resultPath"])
+        except TimeoutError as error:
+            # This call adopted the reviewer and is now giving up on it, and
+            # nobody else is coming: settling this axis is what makes its record
+            # unrecoverable, so the reviewer must not outlive it.
+            terminate_claude(state["pid"])
+            return ClaudeRun(state, reason=str(error))
+        except Exception as error:
+            return ClaudeRun(state, reason=str(error) or type(error).__name__)
+        return ClaudeRun(state, parsed=parsed)
+
+    def settle(self, run):
+        """Close one axis out: its record written, its files gone, its result returned.
+
+        The files go last and only here, once this axis's result is the caller's:
+        a record left naming a runtime directory that is no longer there is
+        exactly how a settled review says it is nobody's to recover.
+        """
+        state = run.state
+        if run.parsed is None:
+            self.let_go_of_runtime(state)
+            return {
+                "status": FAILED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": state["reviewSessionId"],
+                "reason": run.reason,
+            }
+        state["claudeSessionId"] = run.parsed.session_id
+        state["updatedAt"] = time.time()
+        if not self.args.recover_session:
+            state["target"] = self.args.base
+            state["preparation"] = preparation_report(self.args)
+        self.store.write(state["reviewSessionId"], state)
+        result = claude_axis_result(state, run.parsed)
+        self.let_go_of_runtime(state)
+        return result
+
+    def let_go_of_runtime(self, state):
+        """Drop what this axis's reviewer left on disk, now nothing needs it."""
+        shutil.rmtree(state["runtimeDir"], ignore_errors=True)
+
+    def axis_cost(self, run):
+        """What an axis spent, read from the result its own reviewer printed."""
+        if run.parsed is None:
+            return self.NO_COST
+        return claude_axis_cost(run.parsed)
 
 
 # Every reviewing vendor there is a Lane for, keyed by the name `--reviewer`
 # takes. The keys are the argument's accepted values, so a Lane cannot be
 # reachable by a name the command line rejects, or rejected by one it accepts.
-LANES = {CodexLane.name: CodexLane}
+LANES = {CodexLane.name: CodexLane, ClaudeLane.name: ClaudeLane}
 
 
-def resolve_lane(args, owner, store):
-    """The Lane this call named, before any of it opens."""
+def resolve_lane(args, store):
+    """The Lane this call named, under the owner identity it runs as.
+
+    Both are resolved before any of the Lane opens, so a reviewer there is no
+    Lane for, and a Lane whose dependencies this caller has not got, are each
+    refused by name rather than part way through a review.
+    """
     lane = LANES.get(args.reviewer)
     if lane is None:
         known = ", ".join(sorted(LANES))
@@ -2134,7 +2744,7 @@ def resolve_lane(args, owner, store):
             f"Unknown reviewer for --reviewer: {args.reviewer!r}; "
             f"known reviewers: {known}"
         )
-    return lane(args, owner, store)
+    return lane(args, lane_owner(args, lane), store)
 
 
 async def deliver_briefs(args, lane, briefs):
@@ -2151,7 +2761,7 @@ async def deliver_briefs(args, lane, briefs):
     except Exception:
         for brief, launch in zip(briefs, launches, strict=False):
             lane.discard(launch)
-            end_launched_axis(args, brief.axis)
+            lane.end_launched_axis(brief.axis)
         raise
     runs = await asyncio.gather(*(lane.deliver(launch) for launch in launches))
     return {brief.axis: run for brief, run in zip(briefs, runs, strict=True)}
@@ -2170,15 +2780,14 @@ async def run_bridge(args):
     # Preparation has succeeded and no Lane has opened yet, which is what this
     # point promises: a review that failed before here never started.
     hook_review_start(args, review_start_model(args, args.resume_state))
-    owner = resolve_owner(args)
     store = SessionStore()
-    lane = resolve_lane(args, owner, store)
+    lane = resolve_lane(args, store)
     # The lock stays process-scoped: it serialises concurrent calls from one
     # pane, and a driver that dies releases it. Duplicate prevention across a
     # driver's death is the recovery path's job, not a longer-lived lock's — a
     # lock that outlived its holder would also have to be reaped, and would
     # block the very recovery call that clears the duplicate.
-    with owner_lock(store, owner):
+    with owner_lock(store, lane.owner):
         if args.recover_session:
             runs = await lane.recover()
         elif args.resume_session:
@@ -2220,7 +2829,7 @@ async def run_bridge(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Launch or resume an interactive Codex TUI review."
+        description="Launch or resume a code review on the Lane --reviewer names."
     )
     parser.add_argument(
         "--reviewer",
@@ -2246,29 +2855,37 @@ def build_parser():
     parser.add_argument("--sandbox", default="danger-full-access")
     parser.add_argument("--approval", default="never")
     parser.add_argument(
-        "--model", help="Codex model for this review lineage (default: Codex config)"
+        "--model",
+        help="model for this review lineage (default: the reviewer's own config)",
     )
     parser.add_argument(
         "--effort",
-        help="Reasoning effort for this review lineage (default: Codex config)",
+        help="reasoning effort for this review lineage (default: the reviewer's "
+             "own config)",
     )
     parser.add_argument(
         "--standards-model",
-        help="Codex model for the standards axis (default: --model)",
+        help="model for the standards axis (default: --model)",
     )
     parser.add_argument(
         "--standards-effort",
-        help="Reasoning effort for the standards axis (default: --effort)",
+        help="reasoning effort for the standards axis (default: --effort)",
     )
     parser.add_argument(
         "--spec-model",
-        help="Codex model for the spec axis (default: --model)",
+        help="model for the spec axis (default: --model)",
     )
     parser.add_argument(
         "--spec-effort",
-        help="Reasoning effort for the spec axis (default: --effort)",
+        help="reasoning effort for the spec axis (default: --effort)",
     )
     parser.add_argument("--network", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--account",
+        help="profile directory the reviewer is launched under, on a Lane whose "
+             "reviewer has one; without it the reviewer inherits the caller's "
+             "own login",
+    )
     parser.add_argument("--resume-session")
     parser.add_argument(
         "--recover-session",
@@ -2287,6 +2904,7 @@ def build_parser():
                  f"nothing runs)",
         )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
+    parser.add_argument("--claude-binary", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
     return parser

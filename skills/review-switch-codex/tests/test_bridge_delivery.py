@@ -228,6 +228,7 @@ class RecordingLane:
     """
 
     instances = []
+    NEEDS_TMUX = True
 
     def __init__(self, args, owner, store):
         self.args = args

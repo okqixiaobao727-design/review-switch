@@ -78,6 +78,8 @@ def base_args(**overrides):
         "spec_effort": None,
         "probe": False,
         "browser_probe": False,
+        "account": None,
+        "claude_binary": None,
         "resume_state": None,
         "status": "failed",
     }
@@ -326,6 +328,158 @@ class FakeCodexSession:
         self.mcp_errors[axis] = reason
 
 
+class FakeClaudeProcess:
+    """One stubbed headless Claude process, in the shape the Lane drives it.
+
+    A headless reviewer's whole life is visible from outside: it is launched, it
+    is alive or it is not, and when it exits its one JSON object is on disk. That
+    is all this stands in for.
+    """
+
+    def __init__(self, session, axis, pid, runtime_dir, command):
+        self.session = session
+        self.axis = axis
+        self.pid = pid
+        self.runtime_dir = pathlib.Path(runtime_dir)
+        self.command = command
+        self.completed = False
+
+    @property
+    def prompt(self):
+        """The prompt this process was launched with, which is its last argument."""
+        return self.command[-1]
+
+    @property
+    def result_path(self):
+        return self.runtime_dir / "result.json"
+
+    def exit_with_result(self):
+        """Write what this process prints on its way out, and stop being alive."""
+        if self.completed:
+            return
+        printed = self.session.printed_by(self.axis)
+        if printed is None:
+            return
+        self.result_path.write_text(printed, encoding="utf-8")
+        self.completed = True
+        self.session.alive.discard(self.pid)
+
+    async def wait(self, _timeout):
+        error = self.session.axis_errors.get(self.axis)
+        if error is not None:
+            if isinstance(error, BaseException):
+                raise error
+            raise RuntimeError(error)
+        self.exit_with_result()
+        if not self.completed:
+            raise TimeoutError(f"the {self.axis} reviewer was still running")
+
+    def kill(self):
+        self.session.terminate(self.pid)
+
+
+class FakeClaudeSession:
+    """Every stubbed headless reviewer launched by one Bridge call."""
+
+    def __init__(self):
+        self.launched = []
+        self.alive = set()
+        self.killed = []
+        self.default_outcome = None
+        self.axis_outcomes = {}
+        self.axis_errors = {}
+        self.axis_payloads = {}
+        self.raw_output = {}
+        self.launch_errors = {}
+        self.usage = {}
+        self.model_usage = {}
+
+    @property
+    def commands(self):
+        return [process.command for process in self.launched]
+
+    @property
+    def prompts(self):
+        return [process.prompt for process in self.launched]
+
+    def launch(self, args, command, runtime_dir):
+        error = self.launch_errors.pop(args.axis, None)
+        if error is not None:
+            raise RuntimeError(error)
+        pid = 4000 + len(self.launched)
+        process = FakeClaudeProcess(self, args.axis, pid, runtime_dir, command)
+        self.launched.append(process)
+        self.alive.add(pid)
+        return process
+
+    def printed_by(self, axis):
+        """The stdout this axis's reviewer leaves behind, or `None` while it runs on."""
+        if axis in self.raw_output:
+            return self.raw_output[axis]
+        payload = self.payload_for(axis)
+        return None if payload is None else json.dumps(payload)
+
+    def payload_for(self, axis):
+        """The JSON object this axis's reviewer prints, or `None` while it runs on."""
+        if axis in self.axis_payloads:
+            return self.axis_payloads[axis]
+        message = self.axis_outcomes.get(axis, self.default_outcome)
+        if message is None:
+            return None
+        payload = {
+            "session_id": f"claude-{axis}",
+            "result": message,
+            "is_error": False,
+            "subtype": "success",
+            "permission_denials": [],
+        }
+        if axis in self.usage:
+            payload["usage"] = self.usage[axis]
+        if axis in self.model_usage:
+            payload["modelUsage"] = {self.model_usage[axis]: {"inputTokens": 1}}
+        return payload
+
+    def finish(self, message, axis=None):
+        """Give a reviewer its report; one already launched exits on it."""
+        if axis is None:
+            self.default_outcome = message
+        else:
+            self.axis_outcomes[axis] = message
+        self.settle_launched()
+
+    def answer_with(self, payload, axis=None):
+        """Give a reviewer a whole JSON object of its own to print."""
+        for target in (axis,) if axis else ("standards", "spec"):
+            self.axis_payloads[target] = payload
+        self.settle_launched()
+
+    def settle_launched(self):
+        """Let every reviewer already launched exit on the outcome it now has."""
+        for process in self.launched:
+            process.exit_with_result()
+
+    def terminate(self, pid):
+        """Stop a reviewer, whether its driver holds it or only its number."""
+        self.killed.append(pid)
+        self.alive.discard(pid)
+
+    def garble(self, axis, printed="not a JSON object at all"):
+        """Have a reviewer print something that is not the one JSON object."""
+        self.raw_output[axis] = printed
+        self.settle_launched()
+
+    def bill(self, usage, model=None, axis="standards"):
+        self.usage[axis] = usage
+        if model is not None:
+            self.model_usage[axis] = model
+
+    def error(self, axis, reason):
+        self.axis_errors[axis] = reason
+
+    def fail_launch(self, axis, reason):
+        self.launch_errors[axis] = reason
+
+
 class DriverKilled(BaseException):
     """The process vanished, so in-process exception cleanup cannot run."""
 
@@ -351,11 +505,15 @@ class FakePaneTestCase(unittest.TestCase):
         self.fixed_point = initialize_review_repo(self.worktree)
         self.state_dir = self.root / "state"
         self.codex = FakeCodexSession()
+        self.claude = FakeClaudeSession()
 
         self.environment = {
             "TMUX": self.TMUX,
             "TMUX_PANE": self.ORIGIN_PANE,
             "CODE_REVIEW_TUI_STATE_DIR": str(self.state_dir),
+            # A stub Lane launches no real reviewer, but the binary is resolved
+            # before one is launched, so it has to name a file that exists.
+            "CODE_REVIEW_CLAUDE_BINARY": sys.executable,
         }
         self.worktree_root = str(self.worktree)
         self.enter(mock.patch.dict(os.environ, self.environment, clear=False))
@@ -380,10 +538,36 @@ class FakePaneTestCase(unittest.TestCase):
         self.enter(mock.patch.object(
             self.bridge, "connect_existing_session", self.connect_existing
         ))
+        self.claude_launch = self.enter(mock.patch.object(
+            self.bridge, "launch_claude", self.claude.launch
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "claude_process_alive",
+            side_effect=lambda pid: pid in self.claude.alive,
+        ))
+        self.enter(mock.patch.object(
+            self.bridge, "terminate_claude", side_effect=self.claude.terminate
+        ))
 
     def enter(self, patcher):
+        """Start a patcher for the length of this test, and hand it back.
+
+        Handed back because a test that drives a real reviewer process has to
+        stop the stub that stands in for one; stopping is therefore tolerant of
+        having already happened.
+        """
         patcher.start()
-        self.addCleanup(patcher.stop)
+        self.addCleanup(self.stop_patcher, patcher)
+        return patcher
+
+    @staticmethod
+    def stop_patcher(patcher):
+        with contextlib.suppress(RuntimeError):
+            patcher.stop()
+
+    def use_real_claude_process(self):
+        """Let this test launch a reviewer process for real, stub and all."""
+        self.stop_patcher(self.claude_launch)
 
     async def connect(self, socket_path, *_args, **_kwargs):
         return self.codex.client(socket_path)
@@ -551,3 +735,14 @@ ROUND_TWO_COUNTERS = {
     "input": 40000, "output": 15000, "cache_read": 310000, "cache_creation": 0,
 }
 RESOLVED_MODEL = "gpt-5.6-sol"
+
+
+# One round's counters as a headless Claude result reports them. Claude counts its
+# cached tokens beside the input count rather than inside it, so the four arrive
+# already disjoint and map straight onto the counters an `axis-end` is handed.
+CLAUDE_ROUND_ONE_USAGE = {
+    "input_tokens": ROUND_ONE_COUNTERS["input"],
+    "output_tokens": ROUND_ONE_COUNTERS["output"],
+    "cache_read_input_tokens": ROUND_ONE_COUNTERS["cache_read"],
+    "cache_creation_input_tokens": ROUND_ONE_COUNTERS["cache_creation"],
+}
