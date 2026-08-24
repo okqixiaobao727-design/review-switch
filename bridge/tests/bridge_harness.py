@@ -64,6 +64,7 @@ def base_args(**overrides):
         "cwd": "/workspace/ticket-50",
         "timeout": 1,
         "startup_timeout": 1,
+        "parent_pid": os.getpid(),
         "sandbox": "danger-full-access",
         "approval": "never",
         "network": False,
@@ -81,6 +82,7 @@ def base_args(**overrides):
         "account": None,
         "claude_binary": None,
         "resume_state": None,
+        "resume_thread_id": None,
         "status": "failed",
     }
     values.update(overrides)
@@ -161,8 +163,8 @@ class FakeClient:
 
     async def request(self, method, params):
         self.requests.append((method, params))
-        if method == "turn/start":
-            return {"turn": {"id": "turn-followup"}}
+        if method == "thread/queue/add":
+            return {"queuedSubmission": {"id": "queued-followup"}}
         raise AssertionError(f"unexpected request: {method}")
 
 
@@ -172,21 +174,25 @@ MARKER_PATTERN = re.compile(r"\[claude-tui-review-bridge:[^\]]+\]")
 class FakeCodexAxis:
     """One fake pane/app-server pair in the multi-pane harness."""
 
-    def __init__(self, owner, axis, pane_id, socket_path):
+    def __init__(
+        self, owner, axis, pane_id, socket_path, model=None, effort=None,
+        resume_thread_id=None,
+    ):
         self.owner = owner
         self.axis = axis
         self.pane_id = pane_id
         self.socket_path = str(socket_path)
         self.thread_id = f"thread-{axis}-{pane_id.lstrip('%')}"
         self.turn_id = f"turn-{axis}-{pane_id.lstrip('%')}"
+        self.model = model
+        self.effort = effort
+        self.resume_thread_id = resume_thread_id
         self.marker = None
+        self.tui_attached = False
+        self.queued = []
+        # Kept so this harness can exercise the pre-#26 notification gate when
+        # the regression test is run against the fixed point.
         self.mcp_startup = {}
-
-    async def pump(self, _seconds):
-        error = self.owner.mcp_errors.get(self.axis)
-        if error is not None:
-            raise RuntimeError(error)
-        self.mcp_startup["graph"] = "ready"
 
     def turn(self):
         status, final_message = self.owner.outcome_for(self.axis)
@@ -211,9 +217,43 @@ class FakeCodexAxis:
             ],
         }
 
+    def record_turn(self, params):
+        self.owner.started_turns.append(params)
+        self.marker = MARKER_PATTERN.search(
+            params["input"][0]["text"]
+        ).group(0)
+
+    def attach_tui(self, thread_id=None):
+        """Attach the visible control client while this thread is still idle.
+
+        Codex 0.149.1 interrupts an already-active turn when the TUI resumes that
+        thread. Modelling that control effect keeps the delivery fake honest.
+        """
+        if self.tui_attached:
+            return
+        if thread_id is not None:
+            self.thread_id = thread_id
+            self.owner.resumed_threads.append(thread_id)
+        self.tui_attached = True
+        self.owner.tui_attachments.append((self.axis, self.thread_id))
+        self.owner.control_events.append((self.axis, "tui-attached"))
+        if self.marker is not None:
+            self.owner.axis_errors[self.axis] = "Cannot write to closing transport"
+        self.owner.record_mcp_startup(self)
+
     async def request(self, method, params):
+        if method == "thread/loaded/list":
+            self.attach_tui(self.resume_thread_id)
+            return {"data": [self.thread_id]}
         if method == "mcpServerStatus/list":
             return {"data": [{"name": "graph"}]}
+        if method == "config/read":
+            error = self.owner.mcp_errors.get(self.axis)
+            if error is not None:
+                raise RuntimeError(error)
+            return {
+                "config": {"mcp_servers": {"graph": {"enabled": True}}}
+            }
         if method == "thread/start":
             error = self.owner.thread_start_errors.get(self.axis)
             if error is not None:
@@ -221,6 +261,7 @@ class FakeCodexAxis:
             return {"thread": {"id": self.thread_id}}
         if method == "thread/resume":
             self.owner.resumed_threads.append(params["threadId"])
+            self.thread_id = params["threadId"]
             return {}
         if method == "thread/read":
             error = self.owner.axis_errors.get(self.axis)
@@ -228,27 +269,60 @@ class FakeCodexAxis:
                 if isinstance(error, BaseException):
                     raise error
                 raise RuntimeError(error)
-            return {"thread": {"id": self.thread_id, "turns": [self.turn()]}}
+            turns = [self.turn()] if self.marker is not None else []
+            return {
+                "thread": {
+                    "id": self.thread_id,
+                    "status": {"type": "idle"},
+                    "turns": turns,
+                }
+            }
+        if method == "thread/queue/list":
+            return {"data": list(self.queued), "nextCursor": None}
+        if method == "thread/queue/add":
+            submission = {
+                "id": f"queued-{self.axis}-{len(self.owner.started_turns) + 1}",
+                "clientUserMessageId": params["clientUserMessageId"],
+                "input": params["input"],
+            }
+            self.queued.append(submission)
+            self.owner.control_events.append((self.axis, "brief-queued"))
+            effective = dict(params)
+            if self.model:
+                effective["model"] = self.model
+            if self.effort:
+                effective["effort"] = self.effort
+            self.record_turn(effective)
+            self.queued.remove(submission)
+            if self.owner.queue_add_exit_after_accept is not None:
+                raise self.owner.queue_add_exit_after_accept
+            return {"queuedSubmission": submission}
         if method == "turn/start":
-            self.owner.started_turns.append(params)
-            self.marker = MARKER_PATTERN.search(
-                params["input"][0]["text"]
-            ).group(0)
+            self.record_turn(params)
             return {"turn": {"id": self.turn_id}}
         raise AssertionError(f"unexpected request: {method}")
 
+    async def pump(self, _seconds):
+        """Settle the fixed point's notification gate without clock sleeps."""
+        self.mcp_startup["graph"] = "ready"
+
     async def __aexit__(self, *_ignored):
+        self.owner.closed_clients.append((self.axis, self.pane_id))
         return None
 
 
 class FakeCodexSession:
     """All fake panes and app-servers launched by one Bridge call."""
 
-    def __init__(self):
+    def __init__(self, bridge):
+        self.bridge = bridge
         self.panes = []
         self.launched_panes = []
         self.launches = []
         self.started_turns = []
+        self.tui_attachments = []
+        self.control_events = []
+        self.closed_clients = []
         self.resumed_threads = []
         self.sessions = {}
         self.default_outcome = ("in_progress", "")
@@ -256,7 +330,26 @@ class FakeCodexSession:
         self.axis_errors = {}
         self.thread_start_errors = {}
         self.mcp_errors = {}
+        self.queue_add_exit_after_accept = None
         self.concurrent_turn_count = 0
+
+    def record_mcp_startup(self, session):
+        if hasattr(self.bridge, "record_mcp_startup_notification"):
+            self.bridge.record_mcp_startup_notification(
+                pathlib.Path(session.socket_path).parent
+                / self.bridge.MCP_STARTUP_LOG_FILENAME,
+                {
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {
+                        "threadId": session.thread_id,
+                        "name": "graph",
+                        "status": "ready",
+                    },
+                },
+            )
+        else:
+            session.mcp_startup["graph"] = "ready"
+        self.control_events.append((session.axis, "mcp-ready"))
 
     @property
     def first_session(self):
@@ -293,7 +386,15 @@ class FakeCodexSession:
         socket_path.touch()
         pane_id = f"%{90 + len(self.launched_panes)}"
         axis = args.axis
-        session = FakeCodexAxis(self, axis, pane_id, socket_path)
+        session = FakeCodexAxis(
+            self,
+            axis,
+            pane_id,
+            socket_path,
+            getattr(args, "model", None),
+            getattr(args, "effort", None),
+            getattr(args, "resume_thread_id", None),
+        )
         self.sessions[str(socket_path)] = session
         self.panes.append(pane_id)
         self.launched_panes.append(pane_id)
@@ -326,6 +427,11 @@ class FakeCodexSession:
 
     def fail_mcp_startup(self, axis, reason):
         self.mcp_errors[axis] = reason
+
+    def hand_off_thread(self, runtime_dir, thread_id):
+        """Model the old pane consuming its handoff and resuming an active turn."""
+        socket_path = str(pathlib.Path(runtime_dir) / "app-server.sock")
+        self.sessions[socket_path].attach_tui(thread_id)
 
 
 class FakeClaudeProcess:
@@ -510,7 +616,7 @@ class FakePaneTestCase(unittest.TestCase):
         self.worktree.mkdir()
         self.fixed_point = initialize_review_repo(self.worktree)
         self.state_dir = self.root / "state"
-        self.codex = FakeCodexSession()
+        self.codex = FakeCodexSession(self.bridge)
         self.claude = FakeClaudeSession()
 
         self.environment = {
@@ -543,6 +649,12 @@ class FakePaneTestCase(unittest.TestCase):
         ))
         self.enter(mock.patch.object(
             self.bridge, "connect_existing_session", self.connect_existing
+        ))
+        self.enter(mock.patch.object(
+            self.bridge,
+            "hand_off_thread",
+            side_effect=self.codex.hand_off_thread,
+            create=True,
         ))
         self.claude_launch = self.enter(mock.patch.object(
             self.bridge, "launch_claude", self.claude.launch

@@ -83,22 +83,29 @@ class DeliveryContractTests(unittest.TestCase):
                 pathlib.Path("/tmp/runtime"),
             )
 
-    def test_followup_starts_a_turn_on_the_saved_thread(self):
+    def test_axis_brief_is_added_to_the_saved_threads_durable_queue(self):
         client = FakeClient()
-        state = {"threadId": "thread-ticket-50"}
 
         result = asyncio.run(
-            self.bridge.start_followup_turn(client, state, "review again")
+            self.bridge.queue_review(
+                client,
+                "thread-ticket-50",
+                "review again",
+                "[claude-tui-review-bridge:brief-1]",
+            )
         )
 
-        self.assertEqual(result["turn"]["id"], "turn-followup")
+        self.assertEqual(result["queuedSubmission"]["id"], "queued-followup")
         self.assertEqual(
             client.requests,
             [
                 (
-                    "turn/start",
+                    "thread/queue/add",
                     {
                         "threadId": "thread-ticket-50",
+                        "clientUserMessageId": (
+                            "[claude-tui-review-bridge:brief-1]"
+                        ),
                         "input": [
                             {
                                 "type": "text",
@@ -119,20 +126,77 @@ class DeliveryContractTests(unittest.TestCase):
         )
         self.assertEqual(command[-2:], ["resume", "thread-ticket-50"])
 
-    def test_no_prompt_ever_reaches_the_tui_command_line(self):
-        """A positional prompt is submitted at TUI startup, racing MCP (#14).
+    def test_a_fresh_tui_starts_without_an_axis_brief_or_resume_target(self):
+        """The TUI must own an idle thread before the Bridge delivers the Brief.
 
-        The turn goes over the app-server once the readiness gate opens, so the
-        launch command must carry nothing but the thread to attach to.
+        A positional prompt would start a turn too early, while a resume target
+        would require the not-yet-created thread that the TUI itself must own.
         """
         command = self.bridge.build_tui_command(
             base_args(),
             pathlib.Path("/tmp/app-server.sock"),
-            "thread-ticket-50",
+            None,
         )
-        for argument in command:
-            self.assertNotIn("Review HEAD", argument)
-            self.assertNotIn("Rounds contract", argument)
+        self.assertNotIn("resume", command)
+        self.assertNotIn("Review HEAD", command)
+
+    def test_pane_starts_the_observing_proxy_before_the_tui(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_dir = pathlib.Path(temp_dir)
+            args = base_args(
+                runtime_dir=temp_dir,
+                cwd=temp_dir,
+                startup_timeout=1,
+                network=False,
+                sandbox="danger-full-access",
+                approval="never",
+            )
+            processes = [mock.Mock(name="app-server"), mock.Mock(name="proxy")]
+            waits = []
+
+            def ready(path, _timeout):
+                waits.append(pathlib.Path(path).name)
+                return True
+
+            with mock.patch.object(
+                self.bridge.subprocess, "Popen", side_effect=processes
+            ) as popen, mock.patch.object(
+                self.bridge.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0),
+            ) as run, mock.patch.object(
+                self.bridge, "wait_for_path", side_effect=ready
+            ), mock.patch.object(
+                self.bridge, "terminate_process"
+            ), mock.patch.object(
+                self.bridge.signal, "signal"
+            ), mock.patch.object(
+                self.bridge.shutil, "rmtree"
+            ) as rmtree:
+                code = self.bridge.run_pane(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(waits, ["app-server.sock", "tui-proxy.sock"])
+        self.assertIn("_tui_proxy", popen.call_args_list[1].args[0])
+        tui_command = run.call_args.args[0]
+        self.assertIn(f"unix://{runtime_dir / 'tui-proxy.sock'}", tui_command)
+        rmtree.assert_not_called()
+
+    def test_pane_runtime_waits_for_a_live_parent_to_collect_it(self):
+        with mock.patch.object(
+            self.bridge, "process_exists", return_value=True
+        ), mock.patch.object(self.bridge.shutil, "rmtree") as rmtree:
+            self.bridge.cleanup_orphaned_runtime(1234, "/tmp/runtime")
+
+        rmtree.assert_not_called()
+
+    def test_pane_runtime_self_reaps_after_its_parent_is_gone(self):
+        with mock.patch.object(
+            self.bridge, "process_exists", return_value=False
+        ), mock.patch.object(self.bridge.shutil, "rmtree") as rmtree:
+            self.bridge.cleanup_orphaned_runtime(1234, "/tmp/runtime")
+
+        rmtree.assert_called_once_with("/tmp/runtime", ignore_errors=True)
 
     def test_session_store_is_overridable_and_private(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -322,6 +386,30 @@ class DeliverySeamTests(FakePaneTestCase):
 
 class ReviewDeliveryTests(FakePaneTestCase):
     """A whole review driven through stubbed panes, and what it reports back."""
+
+    def test_tui_attachment_does_not_interrupt_the_axis_brief_turn(self):
+        self.codex.finish("visible review completed")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        self.assertEqual(code, 0, output)
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"],
+            "visible review completed",
+        )
+        self.assertEqual(
+            self.codex.tui_attachments,
+            [("standards", self.codex.thread_id)],
+        )
+        self.assertEqual(
+            self.codex.control_events,
+            [
+                ("standards", "tui-attached"),
+                ("standards", "mcp-ready"),
+                ("standards", "brief-queued"),
+            ],
+        )
+        self.assertEqual(len(self.codex.started_turns), 1)
 
     def test_a_standards_run_reports_what_was_prepared(self):
         fixed_point = self.fixed_point
@@ -621,6 +709,65 @@ class PerAxisModelAndEffortTests(FakePaneTestCase):
         )
         self.assertEqual(standards_path.read_bytes(), standards_record)
 
+    def test_a_followup_readiness_failure_closes_its_client_and_pane(self):
+        self.codex.finish("round one", axis="spec")
+        first_code, first_output = self.run_bridge(self.args(axis="spec"))
+        self.assertEqual(first_code, 0)
+        session_id = first_output["axes"]["spec"]["reviewSessionId"]
+        closed_before = len(self.codex.closed_clients)
+        self.codex.fail_mcp_startup("spec", "MCP inventory unavailable")
+
+        code, output = self.run_bridge(
+            self.args(axis="spec", resume_session=session_id)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "MCP inventory unavailable", output["axes"]["spec"]["reason"]
+        )
+        self.assertEqual(len(self.codex.closed_clients), closed_before + 1)
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_followup_connection_failure_keeps_the_original_reason(self):
+        self.codex.finish("round one", axis="spec")
+        first_code, first_output = self.run_bridge(self.args(axis="spec"))
+        self.assertEqual(first_code, 0)
+        session_id = first_output["axes"]["spec"]["reviewSessionId"]
+
+        async def fail_connection(*_args, **_kwargs):
+            raise RuntimeError("app-server connection failed")
+
+        with mock.patch.object(
+            self.bridge, "connect_when_ready", side_effect=fail_connection
+        ):
+            code, output = self.run_bridge(
+                self.args(axis="spec", resume_session=session_id)
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "app-server connection failed", output["axes"]["spec"]["reason"]
+        )
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_timed_out_followup_settles_and_cleans_its_fresh_pane(self):
+        self.codex.finish("round one", axis="spec")
+        first_code, first_output = self.run_bridge(self.args(axis="spec"))
+        self.assertEqual(first_code, 0)
+        session_id = first_output["axes"]["spec"]["reviewSessionId"]
+        self.codex.error("spec", "Timed out waiting for the spec review turn")
+
+        code, output = self.run_bridge(
+            self.args(axis="spec", resume_session=session_id)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            output["axes"]["spec"]["reason"],
+            "Timed out waiting for the spec review turn",
+        )
+        self.assertEqual(self.codex.panes, [])
+
     def test_followup_can_replace_its_axis_model_and_effort(self):
         self.codex.finish("round one clear", axis="spec")
         first_code, first_output = self.run_bridge(
@@ -650,6 +797,13 @@ class PerAxisModelAndEffortTests(FakePaneTestCase):
         self.assertEqual(state["axis"], "spec")
         self.assertEqual(state["model"], "spec-model-two")
         self.assertEqual(state["effort"], "high")
+        self.assertEqual(
+            (
+                self.codex.started_turns[-1].get("model"),
+                self.codex.started_turns[-1].get("effort"),
+            ),
+            ("spec-model-two", "high"),
+        )
 
 
 if __name__ == "__main__":

@@ -153,6 +153,66 @@ class RecoveryTests(FakePaneTestCase):
         self.assertEqual(state["marker"], self.codex.marker)
         self.assertEqual(state["owner"]["origin_pane"], self.ORIGIN_PANE)
 
+    def test_recovery_delivers_a_recorded_but_not_yet_queued_brief_once(self):
+        killed_driver = self.enter(mock.patch.object(
+            self.bridge,
+            "queue_review",
+            side_effect=DriverKilled,
+        ))
+
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args())
+        self.stop_patcher(killed_driver)
+
+        recorded = self.stored_session()
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(len(self.codex.tui_attachments), 1)
+        self.assertEqual(self.codex.started_turns, [])
+        self.codex.finish("the original handoff completed")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["axes"]["standards"]["reviewSessionId"],
+            recorded["reviewSessionId"],
+        )
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"],
+            "the original handoff completed",
+        )
+        self.assertEqual(self.codex.launched_panes, ["%90"])
+        self.assertEqual(len(self.codex.tui_attachments), 1)
+        self.assertEqual(len(self.codex.started_turns), 1)
+
+    def test_recovery_does_not_duplicate_a_queue_add_that_lost_its_response(self):
+        self.codex.queue_add_exit_after_accept = DriverKilled()
+
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args())
+
+        recorded = self.stored_session()
+        self.assertEqual(len(self.codex.started_turns), 1)
+        self.codex.queue_add_exit_after_accept = None
+        self.codex.finish("the accepted queued brief completed")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["axes"]["standards"]["reviewSessionId"],
+            recorded["reviewSessionId"],
+        )
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"],
+            "the accepted queued brief completed",
+        )
+        self.assertEqual(
+            len(self.codex.started_turns),
+            1,
+            "recovery queued the already accepted Brief a second time",
+        )
+
     def test_recovery_returns_the_same_session_without_a_second_pane(self):
         killed = self.kill_the_driver()
         self.codex.finish("two spec findings, one standards finding")

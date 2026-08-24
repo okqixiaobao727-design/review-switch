@@ -76,7 +76,9 @@ Both Lanes need Python 3.11+ with `aiohttp` (`pip install aiohttp`) installed fo
 that runs `review-bridge`, and `git`.
 
 - **codex Lane** — the `codex` CLI, and `tmux`: each axis is an interactive TUI lineage in a pane
-  of its own, torn down when its turn ends and left resumable.
+  of its own. The TUI creates or resumes an idle thread; the Bridge observes that thread's MCP
+  startup on the same TUI connection, records recovery state, and queues the Axis Brief only after
+  startup settles. The pane is torn down when the turn ends and the lineage is left resumable.
 - **claude Lane** — the `claude` CLI. Each axis is a headless process, and no tmux is involved.
 
 `code-review-graph` is optional on either Lane: when its CLI and an existing graph are available,

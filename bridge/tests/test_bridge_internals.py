@@ -25,59 +25,84 @@ from bridge_harness import (
 
 
 class GateClient:
-    """An app-server whose MCP servers announce themselves over successive pumps.
+    """A TUI-owned thread and its startup notifications/queue RPCs."""
 
-    `script` is one dict of name -> status per pump, merged in order, so a test
-    can spell out the startup sequence the gate has to sit through.
-    """
-
-    def __init__(self, script, inventory=("alpha", "beta")):
+    def __init__(
+        self,
+        inventory=("alpha", "beta"),
+        loaded=("thread-tui",),
+        disabled=(),
+        failed=(),
+        status_inventory=None,
+    ):
         self.inventory = list(inventory)
-        self.script = [dict(step) for step in script]
-        self.mcp_startup = {}
+        self.status_inventory = list(
+            inventory if status_inventory is None else status_inventory
+        )
+        self.loaded = list(loaded)
+        self.disabled = set(disabled)
+        self.failed = set(failed)
         self.requests = []
-        self.thread_start_params = None
-        self.startup_when_turn_started = None
+        self.brief_queued = False
+        self.startup_by_thread = {
+            thread_id: {
+                name: {
+                    "threadId": thread_id,
+                    "name": name,
+                    "status": "failed" if name in self.failed else "ready",
+                }
+                for name in self.status_inventory
+                if name not in self.disabled
+            }
+            for thread_id in self.loaded
+        }
+
+    def write_startup_log(self, path):
+        lines = [
+            json.dumps(status)
+            for statuses in self.startup_by_thread.values()
+            for status in statuses.values()
+        ]
+        pathlib.Path(path).write_text(
+            "".join(f"{line}\n" for line in lines), encoding="utf-8"
+        )
 
     async def request(self, method, params):
-        self.requests.append(method)
-        if method == "mcpServerStatus/list":
-            return {"data": [{"name": name} for name in self.inventory]}
-        if method == "thread/start":
-            self.thread_start_params = dict(params)
-            return {"thread": {"id": "thread-new"}}
-        if method == "thread/resume":
-            return {}
-        if method == "turn/start":
-            # The whole point of the gate: what MCP looked like at this moment.
-            self.startup_when_turn_started = dict(self.mcp_startup)
-            return {"turn": {"id": "turn-1"}}
+        self.requests.append((method, dict(params)))
+        if method == "thread/loaded/list":
+            return {"data": list(self.loaded), "nextCursor": None}
+        if method == "config/read":
+            return {
+                "config": {
+                    "mcp_servers": {
+                        name: {"enabled": name not in self.disabled}
+                        for name in self.inventory
+                    }
+                }
+            }
+        if method == "thread/queue/add":
+            self.brief_queued = True
+            return {"queuedSubmission": {"id": "queued-1"}}
         raise AssertionError(f"unexpected request: {method}")
-
-    async def pump(self, _seconds):
-        if self.script:
-            self.mcp_startup.update(self.script.pop(0))
 
     async def __aexit__(self, *_ignored):
         return None
 
 
 class FakeStore:
-    def __init__(self):
+    def __init__(self, client):
+        self.client = client
         self.written = {}
-        # Whether the pane had already been handed its thread when the record
-        # was written — the ordering a killed driver depends on.
-        self.handoff_done_at_first_write = None
+        self.brief_queued_at_first_write = None
 
     def write(self, session_id, state):
-        handoff = pathlib.Path(state["runtimeDir"]) / "thread-id"
-        if self.handoff_done_at_first_write is None:
-            self.handoff_done_at_first_write = handoff.exists()
+        if self.brief_queued_at_first_write is None:
+            self.brief_queued_at_first_write = self.client.brief_queued
         self.written[session_id] = state
 
 
-class McpReadinessGateTests(unittest.TestCase):
-    """The first turn must not go in while a server is still coming up (#14)."""
+class CodexDeliveryStartupTests(unittest.TestCase):
+    """A TUI owns the thread before the Bridge checks MCP and queues the Brief."""
 
     def setUp(self):
         self.bridge = load_bridge()
@@ -94,6 +119,9 @@ class McpReadinessGateTests(unittest.TestCase):
 
         def fake_launch_pane(args, runtime_dir):
             self.runtime_dirs.append(pathlib.Path(runtime_dir))
+            client.write_startup_log(
+                pathlib.Path(runtime_dir) / self.bridge.MCP_STARTUP_LOG_FILENAME
+            )
             return "%9"
 
         async def fake_connect(*_args, **_kwargs):
@@ -104,7 +132,7 @@ class McpReadinessGateTests(unittest.TestCase):
 
         args = base_args(cwd=os.getcwd(), tmux_target="%1",
                          startup_timeout=startup_timeout)
-        self.store = FakeStore()
+        self.store = FakeStore(client)
         with mock.patch.multiple(
             self.bridge,
             launch_pane=fake_launch_pane,
@@ -117,144 +145,401 @@ class McpReadinessGateTests(unittest.TestCase):
             brief = self.bridge.axis_brief(args, args.axis)
             return asyncio.run(lane.deliver(lane.open(brief)))
 
-    def test_the_turn_waits_until_every_announced_server_has_settled(self):
-        client = GateClient([
-            {"alpha": "starting", "beta": "starting"},
-            {"alpha": "ready"},
-            {"beta": "ready"},
-        ])
+    def test_the_tui_thread_and_its_mcp_notifications_precede_the_axis_brief(self):
+        client = GateClient()
 
         self.deliver_one_axis(client)
 
         self.assertEqual(
-            client.startup_when_turn_started,
-            {"alpha": "ready", "beta": "ready"},
-            "the first turn was submitted while a server was still starting",
+            [method for method, _params in client.requests],
+            [
+                "thread/loaded/list",
+                "config/read",
+                "thread/queue/add",
+            ],
+        )
+        self.assertNotIn(
+            "mcpServerStatus/list",
+            [method for method, _params in client.requests],
         )
 
-    def test_the_thread_is_handed_over_only_after_the_turn_has_started(self):
-        """`resume` refuses a thread with no rollout, so this order matters."""
-        client = GateClient([{"alpha": "ready"}])
+    def test_the_bridge_neither_starts_nor_resumes_the_tui_owned_thread(self):
+        client = GateClient()
 
         self.deliver_one_axis(client)
 
-        handoff = self.runtime_dirs[0] / self.bridge.THREAD_HANDOFF_FILENAME
-        self.assertEqual(handoff.read_text(encoding="utf-8"), "thread-new")
-        self.assertIn("thread/start", client.requests)
-        self.assertIn("turn/start", client.requests)
+        methods = [method for method, _params in client.requests]
+        self.assertNotIn("thread/start", methods)
+        self.assertNotIn("thread/resume", methods)
+        self.assertNotIn("turn/start", methods)
 
-    def test_the_review_thread_carries_unattended_session_policy(self):
-        client = GateClient([{"alpha": "ready"}])
-
-        self.deliver_one_axis(client)
-
-        self.assertEqual(client.thread_start_params["approvalPolicy"], "never")
-        self.assertEqual(client.thread_start_params["sandbox"], "danger-full-access")
-
-    def test_the_record_is_on_disk_before_the_pane_is_handed_the_thread(self):
-        """Otherwise a driver killed in between orphans a live, running review.
-
-        The pane attaches as soon as it sees the thread id, so a record written
-        after that leaves a window where a review is running that
-        `--recover-session` cannot find.
-        """
-        client = GateClient([{"alpha": "ready"}])
+    def test_the_record_is_on_disk_before_the_axis_brief_is_queued(self):
+        client = GateClient()
 
         self.deliver_one_axis(client)
 
         self.assertFalse(
-            self.store.handoff_done_at_first_write,
-            "the pane was handed its thread before the record was written",
+            self.store.brief_queued_at_first_write,
+            "the Brief was queued before recovery could discover its record",
         )
 
-    def test_a_late_announcement_is_still_waited_for(self):
-        """One server was measured announcing 169 ms after another went ready.
-
-        `ghost` is configured but never announces, so the gate cannot simply
-        wait for the whole inventory — and it must still not open in the window
-        where alpha is ready and beta has not spoken yet.
-        """
-        client = GateClient(
-            [
-                {"alpha": "starting"},
-                {"alpha": "ready"},
-                {"beta": "starting"},
-                {"beta": "ready"},
-            ],
-            inventory=("alpha", "beta", "ghost"),
-        )
-
-        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 10))
-
-        self.assertEqual(settled, {"alpha": "ready", "beta": "ready"})
-
-    def test_an_inventory_call_that_hangs_does_not_hang_the_gate(self):
-        """Nothing under `request` times out, so this RPC needs its own bound.
-
-        Without one a stuck app-server holds the gate open past every budget the
-        caller set, and only the pane's reaper eventually notices.
-        """
-
-        class HangingInventory:
-            mcp_startup = {}
-
-            async def request(self, method, _params):
-                assert method == "mcpServerStatus/list"
-                await asyncio.sleep(3600)
-
-            async def pump(self, _seconds):
-                raise AssertionError("the gate should never reach its poll loop")
+    def test_missing_startup_notifications_do_not_hang_the_gate(self):
+        client = GateClient(status_inventory=())
 
         started = time.monotonic()
-        with self.assertRaisesRegex(RuntimeError, "which MCP servers are configured"):
-            asyncio.run(
-                self.bridge.wait_for_mcp_startup(HangingInventory(), None, 0.3)
-            )
+        with self.assertRaisesRegex(RuntimeError, "MCP startup"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+                client.write_startup_log(startup_log)
+                asyncio.run(
+                    self.bridge.wait_for_mcp_startup(
+                        client,
+                        "thread-tui",
+                        os.getcwd(),
+                        None,
+                        0.3,
+                        startup_log,
+                    )
+                )
 
         self.assertLess(time.monotonic() - started, 30)
 
-    def test_a_server_that_never_settles_is_named_in_the_failure(self):
-        client = GateClient([{"alpha": "starting", "beta": "ready"}])
-
-        with self.assertRaisesRegex(RuntimeError, "still starting: alpha"):
-            asyncio.run(
-                self.bridge.wait_for_mcp_startup(client, None, 0.2)
-            )
-
-        self.assertIsNone(
-            client.startup_when_turn_started,
-            "a turn was submitted even though the gate never opened",
-        )
-
-    def test_a_gate_that_times_out_tears_the_pane_down(self):
-        client = GateClient([{"alpha": "starting"}])
+    def test_an_unsettled_server_tears_the_pane_down_without_queueing(self):
+        client = GateClient(status_inventory=())
 
         failure = self.deliver_one_axis(client, startup_timeout=0.2)
 
         self.assertIsInstance(failure, self.bridge.AxisFailure)
-        self.assertIn("Timed out waiting for Codex MCP", failure.reason)
+        self.assertIn("MCP startup", failure.reason)
         self.assertEqual(self.cleaned, ["%9"])
-        self.assertIsNone(client.startup_when_turn_started)
+        self.assertFalse(client.brief_queued)
 
-    def test_silence_from_every_server_names_the_configured_ones(self):
-        client = GateClient([])
-
-        with self.assertRaisesRegex(RuntimeError, "none of alpha, beta announced"):
-            asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
-
-    def test_a_codex_without_mcp_servers_is_ready_at_once(self):
-        client = GateClient([], inventory=())
-
-        settled = asyncio.run(self.bridge.wait_for_mcp_startup(client, None, 0.2))
+    def test_a_codex_without_mcp_servers_is_affirmatively_ready(self):
+        client = GateClient(inventory=())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            client.write_startup_log(startup_log)
+            settled = asyncio.run(
+                self.bridge.wait_for_mcp_startup(
+                    client,
+                    "thread-tui",
+                    os.getcwd(),
+                    None,
+                    0.2,
+                    startup_log,
+                )
+            )
 
         self.assertEqual(settled, {})
 
-    def test_a_pane_that_dies_during_startup_is_reported(self):
-        client = GateClient([{"alpha": "starting"}])
+    def test_a_terminally_unavailable_optional_server_is_settled(self):
+        client = GateClient(failed=("beta",))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            client.write_startup_log(startup_log)
+            settled = asyncio.run(
+                self.bridge.wait_for_mcp_startup(
+                    client,
+                    "thread-tui",
+                    os.getcwd(),
+                    None,
+                    0.2,
+                    startup_log,
+                )
+            )
 
-        with mock.patch.object(self.bridge, "pane_exists", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "pane exited before its MCP"):
-                asyncio.run(self.bridge.wait_for_mcp_startup(client, "%9", 5))
+        self.assertEqual(settled["beta"]["status"], "failed")
+
+    def test_an_enabled_server_missing_from_status_keeps_the_gate_closed(self):
+        client = GateClient(status_inventory=("alpha",))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            client.write_startup_log(startup_log)
+            with self.assertRaisesRegex(RuntimeError, "unsettled: beta"):
+                asyncio.run(
+                    self.bridge.wait_for_mcp_startup(
+                        client,
+                        "thread-tui",
+                        os.getcwd(),
+                        None,
+                        0.2,
+                        startup_log,
+                    )
+                )
+
+    def test_a_disabled_server_does_not_block_readiness(self):
+        client = GateClient(disabled=("beta",), status_inventory=("alpha",))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            client.write_startup_log(startup_log)
+            settled = asyncio.run(
+                self.bridge.wait_for_mcp_startup(
+                    client,
+                    "thread-tui",
+                    os.getcwd(),
+                    None,
+                    0.2,
+                    startup_log,
+                )
+            )
+
+        self.assertEqual(set(settled), {"alpha"})
+
+    def test_a_pane_that_dies_before_status_returns_is_reported(self):
+        client = GateClient()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            client.write_startup_log(startup_log)
+            with mock.patch.object(self.bridge, "pane_exists", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "pane exited before MCP"):
+                    asyncio.run(
+                        self.bridge.wait_for_mcp_startup(
+                            client,
+                            "thread-tui",
+                            os.getcwd(),
+                            "%9",
+                            5,
+                            startup_log,
+                        )
+                    )
+
+    def test_proxy_log_records_only_thread_scoped_startup_updates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "mcp-startup.jsonl"
+            self.bridge.record_mcp_startup_notification(
+                startup_log,
+                {
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {
+                        "threadId": "thread-tui",
+                        "name": "alpha",
+                        "status": "starting",
+                    },
+                },
+            )
+            self.bridge.record_mcp_startup_notification(
+                startup_log,
+                {
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {
+                        "threadId": "thread-tui",
+                        "name": "alpha",
+                        "status": "ready",
+                    },
+                },
+            )
+            self.bridge.record_mcp_startup_notification(
+                startup_log,
+                {
+                    "method": "mcpServer/startupStatus/updated",
+                    "params": {
+                        "threadId": None,
+                        "name": "global",
+                        "status": "ready",
+                    },
+                },
+            )
+
+            statuses = self.bridge.read_mcp_startup_statuses(
+                startup_log, "thread-tui"
+            )
+
+        self.assertEqual(statuses["alpha"]["status"], "ready")
+        self.assertNotIn("global", statuses)
+
+    def test_tui_proxy_forwards_both_directions_and_records_server_updates(self):
+        class Source:
+            def __init__(self, messages):
+                self.messages = messages
+
+            async def __aiter__(self):
+                for message in self.messages:
+                    yield message
+
+        class Destination:
+            def __init__(self):
+                self.text = []
+
+            async def send_str(self, value):
+                self.text.append(value)
+
+        message_type = self.bridge.aiohttp.WSMsgType.TEXT
+        client_request = json.dumps({"id": 1, "method": "test", "params": {}})
+        server_update = json.dumps(
+            {
+                "method": "mcpServer/startupStatus/updated",
+                "params": {
+                    "threadId": "thread-tui",
+                    "name": "alpha",
+                    "status": "ready",
+                },
+            }
+        )
+        client_source = Source([type("Message", (), {"type": message_type, "data": client_request})()])
+        server_source = Source([type("Message", (), {"type": message_type, "data": server_update})()])
+        upstream = Destination()
+        downstream = Destination()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            startup_log = pathlib.Path(temp_dir) / "startup.jsonl"
+            asyncio.run(self.bridge.forward_websocket(client_source, upstream))
+            asyncio.run(
+                self.bridge.forward_websocket(
+                    server_source, downstream, startup_log
+                )
+            )
+            statuses = self.bridge.read_mcp_startup_statuses(
+                startup_log, "thread-tui"
+            )
+
+        self.assertEqual(upstream.text, [client_request])
+        self.assertEqual(downstream.text, [server_update])
+        self.assertEqual(statuses["alpha"]["status"], "ready")
+
+    def test_tui_proxy_accepts_the_codex_rpc_upgrade_path(self):
+        app = self.bridge.build_tui_proxy_app(object())
+        paths = {route.resource.canonical for route in app.router.routes()}
+
+        self.assertEqual(paths, {"/rpc"})
+
+    def test_a_fresh_app_server_rejects_more_than_one_tui_thread(self):
+        client = GateClient(loaded=("thread-a", "thread-b"))
+
+        with self.assertRaisesRegex(RuntimeError, "more than one thread"):
+            asyncio.run(
+                self.bridge.wait_for_tui_thread(client, None, None, 0.2)
+            )
+
+
+class RecoveryDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.marker = "[claude-tui-review-bridge:recovery]"
+        self.state = {
+            "threadId": "thread-tui",
+            "marker": self.marker,
+        }
+
+    def run_delivery(self, client):
+        with mock.patch.object(self.bridge, "pane_exists", return_value=True):
+            return asyncio.run(
+                self.bridge.ensure_review_delivery(
+                    client,
+                    self.state,
+                    "Review the recorded scope",
+                    "%9",
+                    1,
+                )
+            )
+
+    def test_a_matching_durable_queue_entry_is_not_added_again(self):
+        marker = self.marker
+
+        class QueuedClient:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, method, params):
+                self.requests.append((method, params))
+                if method == "thread/queue/list":
+                    return {
+                        "data": [{"clientUserMessageId": marker}],
+                        "nextCursor": None,
+                    }
+                raise AssertionError(f"unexpected request: {method}")
+
+        client = QueuedClient()
+
+        self.assertEqual(self.run_delivery(client), "queued")
+        self.assertEqual(
+            [method for method, _params in client.requests],
+            ["thread/queue/list"],
+        )
+
+    def test_a_matching_entry_on_a_later_queue_page_is_not_added_again(self):
+        marker = self.marker
+
+        class PaginatedClient:
+            def __init__(self):
+                self.requests = []
+
+            async def request(self, method, params):
+                self.requests.append((method, params))
+                if method != "thread/queue/list":
+                    raise AssertionError(f"unexpected request: {method}")
+                if params.get("cursor") is None:
+                    return {
+                        "data": [{"clientUserMessageId": "another-review"}],
+                        "nextCursor": "page-two",
+                    }
+                return {
+                    "data": [{"clientUserMessageId": marker}],
+                    "nextCursor": None,
+                }
+
+        client = PaginatedClient()
+
+        self.assertEqual(self.run_delivery(client), "queued")
+        self.assertEqual(
+            client.requests,
+            [
+                (
+                    "thread/queue/list",
+                    {"threadId": "thread-tui"},
+                ),
+                (
+                    "thread/queue/list",
+                    {"threadId": "thread-tui", "cursor": "page-two"},
+                ),
+            ],
+        )
+
+    def test_an_active_turn_without_its_user_item_is_waited_for(self):
+        marker = self.marker
+
+        class MaterializingClient:
+            def __init__(self):
+                self.read_count = 0
+                self.requests = []
+
+            async def request(self, method, params):
+                self.requests.append((method, params))
+                if method == "thread/queue/list":
+                    return {"data": [], "nextCursor": None}
+                if method == "thread/read":
+                    self.read_count += 1
+                    items = []
+                    if self.read_count > 1:
+                        items = [
+                            {
+                                "type": "userMessage",
+                                "clientId": marker,
+                                "content": [],
+                            }
+                        ]
+                    return {
+                        "thread": {
+                            "status": {"type": "active"},
+                            "turns": [
+                                {
+                                    "id": "turn-1",
+                                    "status": "inProgress",
+                                    "items": items,
+                                }
+                            ],
+                        }
+                    }
+                raise AssertionError(f"unexpected request: {method}")
+
+        client = MaterializingClient()
+
+        self.assertEqual(self.run_delivery(client), "started")
+        self.assertNotIn(
+            "thread/queue/add",
+            [method for method, _params in client.requests],
+        )
 
 
 class WaitForReviewTests(unittest.TestCase):
