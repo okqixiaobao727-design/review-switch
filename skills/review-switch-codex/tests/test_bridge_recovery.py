@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Recovering the review a killed driver left running."""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+from bridge_harness import DriverKilled, FakePaneTestCase, load_bridge
+
+
+class RecoveryRecordTests(unittest.TestCase):
+    """Which records on disk a recovery is willing to reach for."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+
+    def test_recovery_skips_records_from_state_version_one(self):
+        owner = self.bridge.InvocationOwner(
+            tmux_server="/tmp/tmux-501/default,1",
+            origin_pane="%1",
+            worktree_root="/workspace/ticket-50",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.bridge.SessionStore(temp_dir)
+            store.write(
+                "session-ticket-50",
+                {
+                    "version": 1,
+                    "reviewSessionId": "session-ticket-50",
+                    "owner": owner.to_dict(),
+                    "threadId": "thread-ticket-50",
+                    "marker": "[claude-tui-review-bridge:old]",
+                },
+            )
+
+            self.assertEqual(self.bridge.SESSION_STATE_VERSION, 2)
+            self.assertEqual(store.find_by_owner(owner), [])
+
+
+class RecoveryTests(FakePaneTestCase):
+    """A driver killed mid-review is recovered, not restarted.
+
+    The whole path runs through `run_bridge` against a stubbed pane: the first
+    call is killed the way the harness kills it — the record is written, the
+    pane lives on, nothing is printed — and the second call has only its own
+    owner identity to work from.
+    """
+
+    def kill_the_two_axis_driver(self):
+        """Kill a `both` call after both axis records and panes are live."""
+        self.codex.error("spec", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args(axis="both"))
+        del self.codex.axis_errors["spec"]
+        states = self.stored_sessions(expected_count=2)
+        return {state["axis"]: state for state in states}
+
+    def test_a_killed_driver_leaves_a_recoverable_record_and_a_live_pane(self):
+        state = self.kill_the_driver()
+
+        self.assertEqual(self.codex.panes, ["%90"])
+        self.assertEqual(state["threadId"], self.codex.thread_id)
+        self.assertEqual(state["marker"], self.codex.marker)
+        self.assertEqual(state["owner"]["origin_pane"], self.ORIGIN_PANE)
+
+    def test_recovery_returns_the_same_session_without_a_second_pane(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("two spec findings, one standards finding")
+        # The first review's own turn; recovery must not add to it.
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(
+            self.args(recover_session=True)
+        )
+
+        self.assertEqual(code, 0)
+        result = output["axes"]["standards"]
+        self.assertEqual(result["reviewSessionId"], killed["reviewSessionId"])
+        self.assertEqual(
+            result["finalMessage"], "two spec findings, one standards finding"
+        )
+        self.assertEqual(self.codex.panes, [])
+        self.assertEqual(
+            len(self.codex.started_turns),
+            turns_before,
+            "recovery started a second turn instead of waiting on the first",
+        )
+        self.assertEqual(
+            self.stored_session()["target"], killed["target"]
+        )
+
+    def test_recovery_returns_every_live_axis_with_its_original_handle(self):
+        killed = self.kill_the_two_axis_driver()
+        self.codex.finish("standards recovered", axis="standards")
+        self.codex.finish("spec recovered", axis="spec")
+        panes_before = list(self.codex.launched_panes)
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(set(output["axes"]), {"standards", "spec"})
+        for axis in ("standards", "spec"):
+            result = output["axes"][axis]
+            self.assertTrue(result["recovered"])
+            self.assertEqual(
+                result["reviewSessionId"], killed[axis]["reviewSessionId"]
+            )
+            self.assertEqual(result["finalMessage"], f"{axis} recovered")
+        self.assertEqual(self.codex.launched_panes, panes_before)
+        self.assertEqual(len(self.codex.started_turns), turns_before)
+        self.assertEqual(self.codex.panes, [])
+
+    def test_recovery_tolerates_a_record_with_no_preparation_report(self):
+        state = self.kill_the_driver()
+        del state["preparation"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        self.codex.finish("legacy review findings")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(output["preparation"])
+
+    def test_recovery_keeps_the_lineage_resumable_for_round_two(self):
+        killed = self.kill_the_driver()
+        self.codex.finish("round one findings")
+        self.run_bridge(self.args(recover_session=True))
+        turns_before = len(self.codex.started_turns)
+
+        code, output = self.run_bridge(
+            self.args(resume_session=killed["reviewSessionId"])
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(
+            len(self.codex.started_turns) - turns_before,
+            1,
+            "round two should start exactly one follow-up turn",
+        )
+        self.assertEqual(self.codex.panes, [])
+
+    def test_two_recovered_axes_each_remain_resumable_for_round_two(self):
+        killed = self.kill_the_two_axis_driver()
+        self.codex.finish("round one standards", axis="standards")
+        self.codex.finish("round one spec", axis="spec")
+        self.run_bridge(self.args(recover_session=True))
+        turns_before = len(self.codex.started_turns)
+
+        for axis in ("standards", "spec"):
+            self.codex.finish(f"round two {axis}", axis=axis)
+            code, output = self.run_bridge(
+                self.args(
+                    axis=axis,
+                    resume_session=killed[axis]["reviewSessionId"],
+                )
+            )
+
+            self.assertEqual(code, 0)
+            result = output["axes"][axis]
+            self.assertEqual(
+                result["reviewSessionId"], killed[axis]["reviewSessionId"]
+            )
+            self.assertEqual(result["finalMessage"], f"round two {axis}")
+
+        self.assertEqual(len(self.codex.started_turns) - turns_before, 2)
+        self.assertEqual(self.codex.panes, [])
+
+    def test_another_origin_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        os.environ["TMUX_PANE"] = "%777"
+
+        with self.assertRaisesRegex(
+            self.bridge.NoLiveSessionError, "No live review session"
+        ):
+            self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(self.codex.panes, ["%90"])
+
+    def test_another_worktree_recovers_nothing(self):
+        self.kill_the_driver()
+        self.worktree_root = str(self.root / "another-worktree")
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(recover_session=True))
+
+    def test_a_dead_pane_recovers_nothing(self):
+        self.kill_the_driver()
+        self.codex.panes.clear()
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(recover_session=True))
+
+    def test_a_record_from_before_recovery_names_no_turn_to_wait_on(self):
+        state = self.kill_the_driver()
+        del state["marker"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+        with self.assertRaises(self.bridge.NoLiveSessionError):
+            self.run_bridge(self.args(recover_session=True))
+
+    def test_nothing_to_recover_exits_distinguishably_from_a_failed_review(self):
+        with mock.patch.object(sys, "argv", [
+            "tui_review_bridge.py", "--recover-session", "--cwd", str(self.worktree),
+        ]):
+            code = self.bridge.main()
+
+        self.assertEqual(code, self.bridge.NO_LIVE_SESSION_EXIT)
+        self.assertNotEqual(self.bridge.NO_LIVE_SESSION_EXIT, 1)
+        self.assertEqual(self.codex.panes, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
