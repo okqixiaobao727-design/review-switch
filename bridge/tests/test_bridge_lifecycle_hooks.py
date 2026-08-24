@@ -97,7 +97,7 @@ class HookRecordingTestCase(FakePaneTestCase):
 
     def main(self, *arguments):
         argv = [
-            "tui_review_bridge.py",
+            "review_bridge.py",
             "--reviewer", self.REVIEWER,
             "--cwd", str(self.worktree),
             *arguments,

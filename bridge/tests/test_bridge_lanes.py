@@ -571,7 +571,7 @@ class ClaudeRecoveryTests(FakePaneTestCase):
 
     def test_nothing_to_recover_exits_distinguishably_from_a_failed_review(self):
         with mock.patch.object(sys, "argv", [
-            "tui_review_bridge.py", "--reviewer", "claude",
+            "review_bridge.py", "--reviewer", "claude",
             "--recover-session", "--cwd", str(self.worktree),
         ]):
             code = self.bridge.main()

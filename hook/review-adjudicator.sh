@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Adjudicate every review-skill invocation: who owns this session's review, and which lane runs it.
+# Adjudicate every review-skill invocation: who owns this session's review, and whether the
+# invoked skill is the one that may run it.
 #
 # PreToolUse hook, matcher Skill, installed once — globally, in ~/.claude/settings.json. The
-# governed targets are the plugin reviewer (mattpocock-skills:code-review) and the review-switch
-# family; every other skill passes untouched.
+# governed targets are the plugin reviewer (mattpocock-skills:code-review) and the Dispatcher
+# (review-switch); every other skill passes untouched. The Bridge is a command rather than a
+# skill, so this hook never fires on it — prompt text is what points a caller at it.
 #
 # Two session states, decided by REVIEW_COORDINATOR:
 #   - Non-empty: a coordinator (orchestrate or any third party) has declared this workspace's
@@ -14,28 +16,25 @@
 #   - Empty or absent: a manual session. Absence means manual by design, so version skew or a
 #     forgotten declaration degrades to the conservative behaviour.
 #
-# In a manual session the configured reviewer decides the lane: the exact value "codex" in
-# ~/.claude/code-reviewer selects the Codex lane, any other value or a missing file the Claude
-# lane. CODE_REVIEWER_FILE overrides the path; it is a test seam.
-#
-# A bare plugin-reviewer call is what upstream skill text plants ("use /code-review"), so it is
-# denied and pointed at /review-switch. The cc lane's sanctioned forward carries via=review-switch
-# in its args, and its codex-lane fallback after a bridge hard error carries via=codex-fallback.
-# The sentinels are readable here, so a determined model could forge them; the deny reasons
-# deliberately do not mention them.
+# In a manual session the Dispatcher runs and the plugin reviewer does not. The plugin reviewer
+# is the in-session protocol this project deleted: it reviews inside the caller's own session,
+# which is the one place a review may not run, so it is denied whatever it is invoked with and
+# pointed at the Dispatcher. Nothing in the args opens it — the sentinels that once did retired
+# with the forward they permitted, and this hook reads no configuration at all: which Lane a
+# review runs on is the Dispatcher's to resolve, from a file only it reads.
 #
 # Tests: bash tests/test-review-adjudicator.sh (black box: stdin JSON + env in, decision out).
 
 set -uo pipefail
 
 PLUGIN_REVIEWER="mattpocock-skills:code-review"
+DISPATCHER="review-switch"
 
 input=$(cat)
 skill=$(jq -r '.tool_input.skill // ""' <<<"$input")
-args=$(jq -r '.tool_input.args // ""' <<<"$input")
 
 case "$skill" in
-  "$PLUGIN_REVIEWER"|review-switch|review-switch-cc|review-switch-codex) ;;
+  "$PLUGIN_REVIEWER"|"$DISPATCHER") ;;
   *) exit 0 ;;
 esac
 
@@ -55,49 +54,9 @@ if [ -n "$coordinator" ]; then
   deny "Review in this workspace is owned by $coordinator. Follow the review instructions already given to this session — they name the exact command to run, and it is this work's only review."
 fi
 
-reviewer_file="${CODE_REVIEWER_FILE:-$HOME/.claude/code-reviewer}"
-if [ "$(cat "$reviewer_file" 2>/dev/null)" = "codex" ]; then
-  configured=codex
-  lane_skill=/review-switch-codex
-else
-  configured=cc
-  lane_skill=/review-switch-cc
+if [ "$skill" = "$PLUGIN_REVIEWER" ]; then
+  deny "That reviewer runs inside this session, and a review does not run here. Invoke \`/review-switch\` with the same target: it resolves the reviewer this machine is configured for and runs the review outside this session."
 fi
-
-# A sentinel is a whole argument, so match it against the args split on whitespace: a string that
-# merely contains one — via=review-switch-elsewhere, notvia=codex-fallback — is not the token.
-args_tokens=" $(tr -s '[:space:]' ' ' <<<"$args") "
-has_token() {
-  [[ "$args_tokens" == *" $1 "* ]]
-}
-
-sanctioned_forward=false
-if has_token "via=review-switch"; then
-  sanctioned_forward=true
-fi
-
-case "$skill" in
-  "$PLUGIN_REVIEWER")
-    if [ "$sanctioned_forward" = false ]; then
-      deny "The reviewer configured for this machine is $configured. Invoke \`/review-switch\` with the same target; it reads that configuration and dispatches to the matching lane."
-    fi
-    # A forward is a Claude-lane review. Under the Codex lane it is a misroute, sanctioned only as
-    # the fallback after a bridge hard error.
-    if [ "$configured" = codex ] && ! has_token "via=codex-fallback"; then
-      deny "The reviewer configured for this machine is codex. Invoke \`$lane_skill\` with the same target. The Claude reviewer runs here only as the fallback that lane prescribes after a bridge hard error."
-    fi
-    ;;
-  review-switch-cc)
-    if [ "$configured" = codex ]; then
-      deny "The reviewer configured for this machine is codex. Invoke \`$lane_skill\` with the same target, or \`/review-switch\` to let the dispatcher pick."
-    fi
-    ;;
-  review-switch-codex)
-    if [ "$configured" != codex ]; then
-      deny "The reviewer configured for this machine is $configured. Invoke \`$lane_skill\` with the same target, or \`/review-switch\` to let the dispatcher pick."
-    fi
-    ;;
-esac
 
 # No objection. Silence is not approval — the normal permission flow still runs.
 exit 0

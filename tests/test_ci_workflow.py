@@ -25,6 +25,10 @@ class CiWorkflowTests(unittest.TestCase):
     def test_ci_runs_the_test_suite_and_residue_lint(self):
         self.assertIn("python -m pytest", self.workflow)
         self.assertIn("bash hook/tests/test-review-adjudicator.sh", self.workflow)
+        self.assertIn(
+            "bash skills/review-switch/tests/test-resolve-machine-config.sh",
+            self.workflow,
+        )
         self.assertIn("python scripts/validate_plugin_tree.py --root .", self.workflow)
 
     def test_ci_installs_the_bridge_runtime_dependency(self):

@@ -19,12 +19,12 @@ from unittest import mock
 
 
 BRIDGE_PATH = (
-    pathlib.Path(__file__).parents[1] / "scripts" / "tui_review_bridge.py"
+    pathlib.Path(__file__).parents[1] / "review_bridge.py"
 )
 
 
 def load_bridge():
-    spec = importlib.util.spec_from_file_location("tui_review_bridge", BRIDGE_PATH)
+    spec = importlib.util.spec_from_file_location("review_bridge", BRIDGE_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
