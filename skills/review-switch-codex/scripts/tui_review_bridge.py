@@ -397,6 +397,10 @@ class InvocationOwner:
         return dataclasses.asdict(self)
 
 
+def printable_git_command(arguments):
+    return " ".join(("git", *arguments))
+
+
 def run_git(cwd, *arguments):
     return subprocess.run(
         ["git", "-C", cwd, *arguments],
@@ -413,27 +417,79 @@ def canonical_worktree_root(cwd):
     return str(pathlib.Path(cwd).resolve())
 
 
-def resolve_fixed_point(cwd, fixed_point):
-    result = run_git(
-        cwd, "rev-parse", "--verify", f"{fixed_point}^{{commit}}"
-    )
-    if result.returncode != 0 or not result.stdout.strip():
+@dataclasses.dataclass(frozen=True)
+class ReviewScope:
+    """The fixed point to the working tree as it stands, committed or not.
+
+    The tree is read live rather than snapshotted, so a Scope holds only as
+    long as the tree does; the Axis Brief asks for it to be left alone
+    (ADR-0004).
+    """
+
+    fixed_point: str
+    resolved_fixed_point: str
+    fork_point: str
+
+    UNTRACKED_ARGUMENTS = ("ls-files", "--others", "--exclude-standard")
+
+    @property
+    def diff_arguments(self):
+        """A diff of the tree against the fork point: committed, staged, and unstaged."""
+        return ("diff", self.fork_point)
+
+    @property
+    def emptiness_arguments(self):
+        """The same diff, asked only whether it is empty; --quiet must precede the rev."""
+        return ("diff", "--quiet", self.fork_point, "--")
+
+    @property
+    def diff_command(self):
+        return printable_git_command(self.diff_arguments)
+
+    @property
+    def untracked_command(self):
+        """The new files no diff can show, which is why the brief prints two lines."""
+        return printable_git_command(self.UNTRACKED_ARGUMENTS)
+
+
+def resolve_review_scope(cwd, fixed_point):
+    """The Scope a review runs over, or the failure that the fixed point is not one."""
+    resolved = run_git(cwd, "rev-parse", "--verify", f"{fixed_point}^{{commit}}")
+    fork = run_git(cwd, "merge-base", fixed_point, "HEAD")
+    if (
+        resolved.returncode != 0
+        or not resolved.stdout.strip()
+        or fork.returncode != 0
+        or not fork.stdout.strip()
+    ):
         raise RuntimeError(f"fixed point did not resolve: {fixed_point}")
-    return result.stdout.strip()
-
-
-def ensure_nonempty_diff(cwd, fixed_point):
-    result = run_git(
-        cwd, "diff", "--quiet", f"{fixed_point}...HEAD", "--"
+    return ReviewScope(
+        fixed_point=fixed_point,
+        resolved_fixed_point=resolved.stdout.strip(),
+        fork_point=fork.stdout.strip(),
     )
-    if result.returncode == 0:
+
+
+def ensure_scope_holds_work(cwd, scope):
+    """Raises when the tree matches the fixed point, which is nothing to review."""
+    diff = run_git(cwd, *scope.emptiness_arguments)
+    if diff.returncode == 1:
+        return
+    if diff.returncode != 0:
+        detail = diff.stderr.strip() or "git diff failed"
         raise RuntimeError(
-            f"three-dot diff is empty: git diff {fixed_point}...HEAD"
+            f"review scope could not be read for {scope.fixed_point}: {detail}"
         )
-    if result.returncode != 1:
-        detail = result.stderr.strip() or "git diff failed"
+    untracked = run_git(cwd, *scope.UNTRACKED_ARGUMENTS)
+    if untracked.returncode != 0:
+        detail = untracked.stderr.strip() or "git ls-files failed"
         raise RuntimeError(
-            f"three-dot diff could not be read for {fixed_point}: {detail}"
+            f"review scope could not be read for {scope.fixed_point}: {detail}"
+        )
+    if not untracked.stdout.strip():
+        raise RuntimeError(
+            "nothing to review: the working tree matches the fixed point "
+            f"{scope.fixed_point}"
         )
 
 
@@ -726,7 +782,8 @@ class AppServerClient:
 
 STANDARDS_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff {fixed_point}...HEAD
+Diff: {diff_command}
+New files not in that diff: {untracked_command}
 Commits:
 {commit_list}
 Standards sources: {standards_files}
@@ -856,9 +913,10 @@ def read_code_graph_navigation(cwd, fixed_point):
         return None
 
 
-def build_standards_brief(fixed_point, commit_list, standards_files):
+def build_standards_brief(scope, commit_list, standards_files):
     return STANDARDS_BRIEF_TEMPLATE.format(
-        fixed_point=fixed_point,
+        diff_command=scope.diff_command,
+        untracked_command=scope.untracked_command,
         commit_list=with_trailing_newline(commit_list),
         standards_files=(
             ", ".join(standards_files)
@@ -870,7 +928,8 @@ def build_standards_brief(fixed_point, commit_list, standards_files):
 
 SPEC_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff {fixed_point}...HEAD
+Diff: {diff_command}
+New files not in that diff: {untracked_command}
 Commits:
 {commit_list}
 Spec:
@@ -878,9 +937,10 @@ Spec:
 Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."""
 
 
-def build_spec_brief(fixed_point, commit_list, spec_contents):
+def build_spec_brief(scope, commit_list, spec_contents):
     return SPEC_BRIEF_TEMPLATE.format(
-        fixed_point=fixed_point,
+        diff_command=scope.diff_command,
+        untracked_command=scope.untracked_command,
         commit_list=with_trailing_newline(commit_list),
         spec_contents=with_trailing_newline(spec_contents),
     )
@@ -888,8 +948,7 @@ def build_spec_brief(fixed_point, commit_list, spec_contents):
 
 @dataclasses.dataclass(frozen=True)
 class ReviewPreparation:
-    fixed_point: str
-    resolved_fixed_point: str
+    scope: ReviewScope
     commit_list: str
     spec_source: str
     spec_contents: str | None
@@ -910,7 +969,7 @@ class ReviewPreparation:
         if axis == "standards":
             return append_navigation_block(
                 build_standards_brief(
-                    self.fixed_point, self.commit_list, self.standards_files
+                    self.scope, self.commit_list, self.standards_files
                 ),
                 self.navigation_block,
             )
@@ -922,7 +981,7 @@ class ReviewPreparation:
                 )
             return append_navigation_block(
                 build_spec_brief(
-                    self.fixed_point, self.commit_list, self.spec_contents
+                    self.scope, self.commit_list, self.spec_contents
                 ),
                 self.navigation_block,
             )
@@ -930,7 +989,7 @@ class ReviewPreparation:
 
     def report(self):
         return {
-            "fixedPoint": self.resolved_fixed_point,
+            "fixedPoint": self.scope.resolved_fixed_point,
             "specSource": self.spec_source,
             "standardsFiles": list(self.standards_files),
             "codeGraphUsed": self.code_graph_used,
@@ -1017,8 +1076,7 @@ def prepare_review(args):
     source, contents = read_spec(repo_root, args.spec)
     navigation_block = read_code_graph_navigation(repo_root, args.base)
     preparation = ReviewPreparation(
-        fixed_point=args.base,
-        resolved_fixed_point=args.resolved_base,
+        scope=args.scope,
         commit_list=read_commit_list(args.cwd, args.base),
         spec_source=source,
         spec_contents=contents,
@@ -2104,8 +2162,8 @@ async def run_bridge(args):
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
     probe = args.probe or args.browser_probe
     if not args.recover_session and not probe:
-        args.resolved_base = resolve_fixed_point(args.cwd, args.base)
-        ensure_nonempty_diff(args.cwd, args.base)
+        args.scope = resolve_review_scope(args.cwd, args.base)
+        ensure_scope_holds_work(args.cwd, args.scope)
         args.preparation = prepare_review(args)
     elif probe:
         args.preparation = None
@@ -2170,7 +2228,9 @@ def build_parser():
         choices=tuple(LANES),
         help="reviewing vendor this review is delivered to",
     )
-    parser.add_argument("--base", help="fixed point for the three-dot diff")
+    parser.add_argument(
+        "--base", help="fixed point the Review Scope runs from"
+    )
     parser.add_argument("--spec", help="issue reference or file path for the spec")
     parser.add_argument(
         "--axis",

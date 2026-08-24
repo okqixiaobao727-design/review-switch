@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preparing a review: the fixed point, the spec, the graph, and the Axis Brief."""
+"""Preparing a review: the Review Scope, the spec, the graph, and the Axis Brief."""
 
 import argparse
 import json
@@ -17,6 +17,13 @@ class AxisBriefTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+
+    def scope_at(self, fork_point):
+        return self.bridge.ReviewScope(
+            fixed_point="base-ref",
+            resolved_fixed_point="abc123",
+            fork_point=fork_point,
+        )
 
     def test_code_graph_result_is_trimmed_to_the_navigation_contract(self):
         graph_result = {
@@ -89,7 +96,7 @@ class AxisBriefTests(unittest.TestCase):
 
     def test_standards_axis_brief_matches_the_fixed_text(self):
         brief = self.bridge.build_standards_brief(
-            "base-ref",
+            self.scope_at("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736"),
             "abc1234 feature one\ndef5678 feature two",
             ["AGENTS.md", "docs/agents/domain.md"],
         )
@@ -98,7 +105,8 @@ class AxisBriefTests(unittest.TestCase):
             brief,
             """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff base-ref...HEAD
+Diff: git diff 0f1e2d3c4b5a69788796a5b4c3d2e1f009182736
+New files not in that diff: git ls-files --others --exclude-standard
 Commits:
 abc1234 feature one
 def5678 feature two
@@ -124,7 +132,7 @@ Report, per file/hunk where relevant, (a) every place the diff violates a docume
 
     def test_spec_axis_brief_matches_the_fixed_text(self):
         brief = self.bridge.build_spec_brief(
-            "base-ref",
+            self.scope_at("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736"),
             "abc1234 feature one\ndef5678 feature two",
             "Feature title\n\nThe feature must keep the contract.",
         )
@@ -133,7 +141,8 @@ Report, per file/hunk where relevant, (a) every place the diff violates a docume
             brief,
             """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
-Diff: git diff base-ref...HEAD
+Diff: git diff 0f1e2d3c4b5a69788796a5b4c3d2e1f009182736
+New files not in that diff: git ls-files --others --exclude-standard
 Commits:
 abc1234 feature one
 def5678 feature two
@@ -148,8 +157,11 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
 
     def test_both_axis_briefs_receive_the_identical_navigation_block(self):
         preparation = self.bridge.ReviewPreparation(
-            fixed_point="base-ref",
-            resolved_fixed_point="abc123",
+            scope=self.bridge.ReviewScope(
+                fixed_point="base-ref",
+                resolved_fixed_point="abc123",
+                fork_point="fed321",
+            ),
             commit_list="def456 feature change",
             spec_source="spec.md",
             spec_contents="Feature spec.",
@@ -190,7 +202,7 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
 
     def test_standards_brief_names_the_documented_fallback(self):
         brief = self.bridge.build_standards_brief(
-            "main", "abc123 feature change", []
+            self.scope_at("abc123"), "abc123 feature change", []
         )
 
         self.assertIn(
@@ -471,24 +483,6 @@ class PreparationTests(FakePaneTestCase):
 
         self.assertEqual(self.codex.panes, [])
 
-    def test_an_empty_three_dot_diff_fails_before_a_pane_opens(self):
-        fixed_point = subprocess.run(
-            ["git", "-C", str(self.worktree), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-
-        with mock.patch.object(
-            self.bridge,
-            "launch_pane",
-            side_effect=AssertionError("a pane opened"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "three-dot diff is empty"):
-                self.run_bridge(self.args(base=fixed_point))
-
-        self.assertEqual(self.codex.panes, [])
-
     def test_a_symbolic_fixed_point_is_resolved_only_for_the_report(self):
         self.codex.finish("no findings")
 
@@ -499,7 +493,7 @@ class PreparationTests(FakePaneTestCase):
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["fixedPoint"], self.fixed_point)
-        self.assertIn("Diff: git diff HEAD~1...HEAD", prompt)
+        self.assertIn(f"Diff: git diff {self.fixed_point}", prompt)
 
     def test_the_spec_axis_without_a_spec_fails_before_a_pane_opens(self):
         with mock.patch.object(
@@ -595,6 +589,166 @@ class PreparationTests(FakePaneTestCase):
             "Spec:\nIssue title\n\nIssue body\n\nFirst comment\n\nReport:",
             prompt,
         )
+
+
+class ReviewScopeTests(FakePaneTestCase):
+    """The fixed point to the working tree as it stands, committed or not."""
+
+    def git(self, *arguments):
+        return subprocess.run(
+            ["git", "-C", str(self.worktree), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    def head(self):
+        return self.git("rev-parse", "HEAD").strip()
+
+    def tree_and_index_state(self):
+        return (
+            self.git("status", "--porcelain"),
+            self.git("ls-files", "--stage"),
+            sorted(
+                (
+                    path.relative_to(self.worktree).as_posix(),
+                    path.read_bytes(),
+                )
+                for path in self.worktree.rglob("*")
+                if path.is_file() and ".git/" not in path.as_posix()
+            ),
+        )
+
+    def scope_commands(self, prompt):
+        """The two lines the brief prints, as the reviewer would run them."""
+        diff_line = next(
+            line for line in prompt.splitlines() if line.startswith("Diff: ")
+        )
+        untracked_line = next(
+            line
+            for line in prompt.splitlines()
+            if line.startswith("New files not in that diff: ")
+        )
+        return (
+            diff_line.split(": ", 1)[1].split(),
+            untracked_line.split(": ", 1)[1].split(),
+        )
+
+    def write_work_of_every_kind(self):
+        """One committed, one staged, one unstaged, and one untracked change."""
+        (self.worktree / "staged.py").write_text(
+            "STAGED = True\n", encoding="utf-8"
+        )
+        self.git("add", "staged.py")
+        (self.worktree / "README.md").write_text(
+            "baseline\nunstaged\n", encoding="utf-8"
+        )
+        (self.worktree / "untracked.py").write_text(
+            "UNTRACKED = True\n", encoding="utf-8"
+        )
+
+    def test_the_scope_reaches_committed_staged_unstaged_and_untracked_work(self):
+        self.write_work_of_every_kind()
+        self.codex.finish("no findings")
+
+        code, _output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        diff_command, untracked_command = self.scope_commands(prompt)
+        before = self.tree_and_index_state()
+        diff = self.git(*diff_command[1:])
+        untracked = self.git(*untracked_command[1:])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(diff_command[0], "git")
+        self.assertEqual(untracked_command[0], "git")
+        for path in ("feature.py", "staged.py", "README.md"):
+            self.assertIn(f"b/{path}", diff)
+        self.assertNotIn("b/untracked.py", diff)
+        self.assertEqual(untracked.split(), ["untracked.py"])
+        self.assertEqual(self.tree_and_index_state(), before)
+
+    def test_the_diff_line_names_the_fork_point_as_a_resolved_sha(self):
+        fork_point = self.head()
+        self.git("checkout", "--quiet", "-b", "diverged", fork_point)
+        (self.worktree / "elsewhere.py").write_text(
+            "ELSEWHERE = True\n", encoding="utf-8"
+        )
+        self.git("add", "elsewhere.py")
+        self.git("commit", "--quiet", "-m", "diverged change")
+        diverged = self.head()
+        self.git("checkout", "--quiet", "-")
+        (self.worktree / "later.py").write_text("LATER = True\n", encoding="utf-8")
+        self.git("add", "later.py")
+        self.git("commit", "--quiet", "-m", "later change")
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(
+            self.args(base="diverged", axis="standards")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        diff_command, _untracked_command = self.scope_commands(prompt)
+        diff = self.git(*diff_command[1:])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(diff_command, ["git", "diff", fork_point])
+        self.assertEqual(output["preparation"]["fixedPoint"], diverged)
+        self.assertNotIn("b/elsewhere.py", diff)
+        self.assertIn("b/later.py", diff)
+
+    def test_a_tree_matching_the_fixed_point_fails_before_a_pane_opens(self):
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "nothing to review"):
+                self.run_bridge(self.args(base=self.head()))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_an_ignored_file_alone_leaves_nothing_to_review(self):
+        (self.worktree / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+        self.git("add", ".gitignore")
+        self.git("commit", "--quiet", "-m", "ignore rule")
+        (self.worktree / "ignored.py").write_text(
+            "IGNORED = True\n", encoding="utf-8"
+        )
+
+        with mock.patch.object(
+            self.bridge,
+            "launch_pane",
+            side_effect=AssertionError("a pane opened"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "nothing to review"):
+                self.run_bridge(self.args(base=self.head()))
+
+        self.assertEqual(self.codex.panes, [])
+
+    def test_work_never_committed_runs_end_to_end_and_returns_findings(self):
+        fixed_point = self.head()
+        (self.worktree / "README.md").write_text(
+            "baseline\nunstaged\n", encoding="utf-8"
+        )
+        (self.worktree / "brand-new.py").write_text(
+            "BRAND_NEW = True\n", encoding="utf-8"
+        )
+        self.codex.finish("one finding: BRAND_NEW is unused")
+
+        code, output = self.run_bridge(
+            self.args(base=fixed_point, spec="spec.md", axis="standards")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "completed")
+        self.assertEqual(
+            output["axes"]["standards"]["finalMessage"],
+            "one finding: BRAND_NEW is unused",
+        )
+        self.assertIn("Commits:\n\n", prompt)
+        self.assertNotIn("Start here (from the code graph", prompt)
 
 
 if __name__ == "__main__":
