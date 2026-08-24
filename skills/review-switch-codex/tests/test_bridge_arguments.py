@@ -233,5 +233,28 @@ class LifecycleHookParserTests(unittest.TestCase):
         self.assertIsNone(args.on_review_end)
 
 
+class LaneArgumentTests(unittest.TestCase):
+    """The command line the second Lane adds to."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+
+    def test_the_reviewer_argument_accepts_both_lanes(self):
+        for reviewer in ("codex", "claude"):
+            args = self.bridge.parse_args(
+                ["--reviewer", reviewer, "--base", "main"]
+            )
+            self.assertEqual(args.reviewer, reviewer)
+
+    def test_an_account_is_optional_and_defaults_to_none(self):
+        args = self.bridge.parse_args(["--reviewer", "claude", "--base", "main"])
+        self.assertIsNone(args.account)
+
+        args = self.bridge.parse_args(
+            ["--reviewer", "claude", "--base", "main", "--account", "/profiles/a"]
+        )
+        self.assertEqual(args.account, "/profiles/a")
+
+
 if __name__ == "__main__":
     unittest.main()
