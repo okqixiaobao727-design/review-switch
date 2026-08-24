@@ -185,13 +185,18 @@ class LifecycleHookTests(HookRecordingTestCase):
         )
 
     def test_a_resumed_review_fires_each_point_once(self):
-        """Round one closed its pane, so round two opens one of its own."""
-        self.codex.finish("round one findings")
-        self.main(*self.review_argv())
+        """Round one closed its pane, so round two opens one of its own.
+
+        On the spec axis, which is the axis a lineage has a second round on.
+        """
+        self.codex.finish("round one findings", axis="spec")
+        self.main(*self.review_argv(axis="spec"))
         session = self.stored_session()["reviewSessionId"]
         self.firings.unlink()
 
-        code = self.main(*self.review_argv("--resume-session", session))
+        code = self.main(
+            *self.review_argv("--resume-session", session, axis="spec")
+        )
 
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -201,11 +206,13 @@ class LifecycleHookTests(HookRecordingTestCase):
 
     def test_a_resume_onto_a_live_pane_launches_no_further_child(self):
         """Nothing was launched, so nothing is announced as launched."""
-        state = self.kill_the_driver()
-        self.codex.finish("round two clear")
+        state = self.kill_the_driver(axis="spec")
+        self.codex.finish("round two clear", axis="spec")
 
         code = self.main(
-            *self.review_argv("--resume-session", state["reviewSessionId"])
+            *self.review_argv(
+                "--resume-session", state["reviewSessionId"], axis="spec"
+            )
         )
 
         self.assertEqual(code, 0)

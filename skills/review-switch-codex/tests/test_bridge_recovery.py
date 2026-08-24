@@ -128,13 +128,14 @@ class RecoveryTests(FakePaneTestCase):
         self.assertIsNone(output["preparation"])
 
     def test_recovery_keeps_the_lineage_resumable_for_round_two(self):
-        killed = self.kill_the_driver()
-        self.codex.finish("round one findings")
-        self.run_bridge(self.args(recover_session=True))
+        """On the spec axis, which is the axis a lineage has a round two on."""
+        killed = self.kill_the_driver(axis="spec")
+        self.codex.finish("round one findings", axis="spec")
+        self.run_bridge(self.args(axis="spec", recover_session=True))
         turns_before = len(self.codex.started_turns)
 
         code, output = self.run_bridge(
-            self.args(resume_session=killed["reviewSessionId"])
+            self.args(axis="spec", resume_session=killed["reviewSessionId"])
         )
 
         self.assertEqual(code, 0)
@@ -146,30 +147,32 @@ class RecoveryTests(FakePaneTestCase):
         )
         self.assertEqual(self.codex.panes, [])
 
-    def test_two_recovered_axes_each_remain_resumable_for_round_two(self):
+    def test_a_recovered_axis_resumes_the_handle_it_was_recovered_under(self):
+        """Recovery of a `both` call leaves each axis's own handle usable.
+
+        Resumed on the spec axis, the axis a lineage has a round two on.
+        """
         killed = self.kill_the_two_axis_driver()
         self.codex.finish("round one standards", axis="standards")
         self.codex.finish("round one spec", axis="spec")
         self.run_bridge(self.args(recover_session=True))
         turns_before = len(self.codex.started_turns)
+        self.codex.finish("round two spec", axis="spec")
 
-        for axis in ("standards", "spec"):
-            self.codex.finish(f"round two {axis}", axis=axis)
-            code, output = self.run_bridge(
-                self.args(
-                    axis=axis,
-                    resume_session=killed[axis]["reviewSessionId"],
-                )
+        code, output = self.run_bridge(
+            self.args(
+                axis="spec",
+                resume_session=killed["spec"]["reviewSessionId"],
             )
+        )
 
-            self.assertEqual(code, 0)
-            result = output["axes"][axis]
-            self.assertEqual(
-                result["reviewSessionId"], killed[axis]["reviewSessionId"]
-            )
-            self.assertEqual(result["finalMessage"], f"round two {axis}")
-
-        self.assertEqual(len(self.codex.started_turns) - turns_before, 2)
+        self.assertEqual(code, 0)
+        result = output["axes"]["spec"]
+        self.assertEqual(
+            result["reviewSessionId"], killed["spec"]["reviewSessionId"]
+        )
+        self.assertEqual(result["finalMessage"], "round two spec")
+        self.assertEqual(len(self.codex.started_turns) - turns_before, 1)
         self.assertEqual(self.codex.panes, [])
 
     def test_another_origin_pane_recovers_nothing(self):

@@ -29,8 +29,8 @@ nothing beyond its plugin. Running the test suites additionally needs `pytest`.
 The Codex Lane is a thin coordinator around one Bridge call. The Bridge prepares the review once
 from the fixed point, spec reference, and requested axis. An `axis=both` review opens two Codex TUI
 panes concurrently — Standards and Spec — then closes each pane when its turn ends and returns the
-two reports separately. The Lane preserves that separation while applying its bounded Rounds
-contract.
+two reports separately. The Lane preserves that separation and follows the action each axis's
+result names, which is where the Bridge's bounded Rounds contract reaches it.
 
 ## Skills
 

@@ -215,6 +215,8 @@ class DeliveredAxis:
     """What a stub Lane hands back for one axis."""
 
     thread_id = None
+    #: This stub keeps no record, as an axis that failed before writing one has none.
+    state = None
 
     def __init__(self, axis):
         self.axis = axis

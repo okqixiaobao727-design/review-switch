@@ -357,6 +357,12 @@ class FakeClaudeProcess:
         """Write what this process prints on its way out, and stop being alive."""
         if self.completed:
             return
+        if not self.runtime_dir.is_dir():
+            # The runtime directory is gone, so this reviewer's axis has been
+            # settled and there is nothing left of it to print into.
+            self.completed = True
+            self.session.alive.discard(self.pid)
+            return
         printed = self.session.printed_by(self.axis)
         if printed is None:
             return
@@ -658,12 +664,12 @@ class FakePaneTestCase(unittest.TestCase):
         printed = stdout.getvalue().strip()
         return code, json.loads(printed) if printed else None
 
-    def kill_the_driver(self):
-        """The first review, killed the way the harness kills it."""
-        self.codex.error("standards", DriverKilled())
+    def kill_the_driver(self, axis="standards"):
+        """The first review of one axis, killed the way the harness kills it."""
+        self.codex.error(axis, DriverKilled())
         with self.assertRaises(DriverKilled):
-            self.run_bridge(self.args())
-        del self.codex.axis_errors["standards"]
+            self.run_bridge(self.args(axis=axis))
+        del self.codex.axis_errors[axis]
         return self.stored_session()
 
     def stored_session(self):

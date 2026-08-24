@@ -2,8 +2,11 @@
 
 """Code-review channel between a caller and the reviewing vendor it named.
 
-Round one starts a review lineage; round two resumes it, and `--recover-session`
-re-attaches to the review a killed driver left in flight.
+Round one starts a review lineage; a round the Rounds Contract still allows
+resumes it, and `--recover-session` re-attaches to the review a killed driver
+left in flight. That contract is held here rather than stated anywhere: every
+result names the one action its caller is permitted next, and a resume past the
+cap is refused. A fresh lineage is always available.
 
 Preparation and delivery are separate: preparation fills one Axis Brief per
 requested axis, and the Lane `--reviewer` names takes one brief and gives back
@@ -121,6 +124,9 @@ HOOK_VARS = frozenset({
 # What a review that never reached a result of its own is: the result contract's
 # spelling for a failure, which is what both status-carrying points use.
 FAILED_STATUS = "failed"
+# A resume this contract has no round left for. Held apart from a failure: no
+# Lane opened, so nothing was reviewed and nothing was billed.
+REFUSED_STATUS = "refused"
 NO_THREAD_DETAIL = "this axis started no thread to read a cost from"
 # Where Codex keeps the rollout of every thread it has run, one JSONL file per
 # thread under a dated tree, each filename ending in the thread's own id.
@@ -1181,6 +1187,127 @@ def resolve_axis_choice(args, axis, choice):
     return getattr(args, choice, None)
 
 
+# ---------------------------------------------------------------------------
+# The Rounds Contract.
+#
+# The cap on one review lineage, held here and enforced rather than stated, so
+# that it holds without depending on a reviewing model reading and obeying it.
+# Standards findings are fixed in one pass and earn no re-review; spec findings
+# that required fixes earn exactly one, scoped to those fixes. Every result
+# names the one action its caller is permitted next, which is the only channel
+# that reaches a child with no skill of ours to read.
+#
+# What escalation *is* stays the caller's: nothing here names the act, only the
+# moment.
+# ---------------------------------------------------------------------------
+#: The one axis whose findings earn a re-review.
+SPEC_AXIS = "spec"
+#: How many rounds the spec axis earns: the first, and the one re-review.
+SPEC_AXIS_ROUNDS = 2
+#: How many rounds every other axis earns, the standards axis above all.
+SINGLE_ROUND = 1
+NEXT_FIX_AND_STOP = "fix and stop"
+NEXT_FIX_THEN_ONE_RE_REVIEW = "fix then one re-review"
+NEXT_ESCALATE = "escalate"
+
+
+def rounds_per_lineage(axis):
+    """How many rounds one lineage of this axis earns."""
+    return SPEC_AXIS_ROUNDS if axis == SPEC_AXIS else SINGLE_ROUND
+
+
+def rounds_had(state):
+    """How many rounds this lineage has had.
+
+    A review that reached no record of its own had the round it was in, and a
+    record written before the count existed is a lineage that had exactly one.
+    """
+    return state.get("rounds", SINGLE_ROUND) if state else SINGLE_ROUND
+
+
+def next_action(axis, rounds):
+    """The one action a caller is permitted next on this lineage."""
+    if rounds < rounds_per_lineage(axis):
+        return NEXT_FIX_THEN_ONE_RE_REVIEW
+    if rounds > SINGLE_ROUND:
+        # The re-review this lineage earned has been had, and a finding that
+        # survived it has no further round to go to.
+        return NEXT_ESCALATE
+    return NEXT_FIX_AND_STOP
+
+
+def refusal_for(state):
+    """The refusal this lineage's next round gets, or `None` when it has one.
+
+    The lineage's own record decides the axis, which is what makes the cap per
+    lineage: a lineage that reached its cap exhausts itself and no other, and a
+    fresh review is always available.
+    """
+    axis = state["axis"]
+    rounds = rounds_had(state)
+    allowed = rounds_per_lineage(axis)
+    if rounds < allowed:
+        return None
+    return {
+        "status": REFUSED_STATUS,
+        "axes": {
+            axis: {
+                "status": REFUSED_STATUS,
+                "finalMessage": "",
+                "reviewSessionId": state["reviewSessionId"],
+                "reason": (
+                    f"a {axis} axis earns {allowed} round(s) per review "
+                    f"lineage, and this one has had {rounds}"
+                ),
+                "next": NEXT_ESCALATE,
+            }
+        },
+        "preparation": None,
+    }
+
+
+def refuse_resume_past_cap(args, owner, store):
+    """The refusal a resume gets before anything is prepared, or `None`.
+
+    Read before preparation and before any Lane opens, so a resume the contract
+    plainly has no round for costs its caller nothing. This is the early answer
+    and not the binding one: the copy read here may already have been overtaken
+    by a sibling call, so the round itself is granted under the lock instead.
+
+    Whose session it is is settled first. A handle belonging to another owner is
+    not this caller's to be told anything about, its rounds included.
+    """
+    if args.recover_session or not args.resume_session:
+        return None
+    state = args.resume_state or store.read(args.resume_session)
+    validate_session_owner(state, owner)
+    return refusal_for(state)
+
+
+def grant_round(args, owner, store):
+    """Take this resume's round, or the refusal that its lineage has none left.
+
+    Read from disk and written back here, under the owner's lock and before the
+    reviewer is launched. Both halves belong here. Reading: the copy a caller
+    arrived with predates any round a sibling call has since taken, and a cap
+    decided on that copy is a cap two calls can pass at once. Writing: a round
+    consumed but never recorded is one the contract cannot hold the next call
+    to, so the round is spent when it is granted rather than when it succeeds —
+    a resume that then fails has still had it, and a fresh lineage is the way
+    back.
+
+    Returns the record the Lane resumes, and the refusal that it may not.
+    """
+    state = store.read(args.resume_session)
+    validate_session_owner(state, owner)
+    refusal = refusal_for(state)
+    if refusal is not None:
+        return state, refusal
+    state["rounds"] = rounds_had(state) + 1
+    store.write(state["reviewSessionId"], state)
+    return state, None
+
+
 def validate_resume_axis(args, state):
     """Reject a caller axis that disagrees with the axis owned by the resume handle."""
     saved_axis = state["axis"]
@@ -1703,6 +1830,8 @@ def session_state(
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
         "axis": axis,
+        # Rounds this lineage has had, which the Rounds Contract caps.
+        "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
         "runtimeDir": str(runtime_dir),
         "socketPath": str(runtime_dir / "app-server.sock"),
@@ -2449,6 +2578,8 @@ def headless_session_state(
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
         "axis": axis,
+        # Rounds this lineage has had, which the Rounds Contract caps.
+        "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
         "runtimeDir": str(runtime_dir),
         "resultPath": str(pathlib.Path(runtime_dir) / CLAUDE_RESULT_FILENAME),
@@ -2767,9 +2898,23 @@ async def deliver_briefs(args, lane, briefs):
     return {brief.axis: run for brief, run in zip(briefs, runs, strict=True)}
 
 
+def report_refusal(args, refusal):
+    """Give the caller the refusal and nothing else; no Lane opened."""
+    print(json.dumps(refusal, ensure_ascii=False))
+    args.status = refusal["status"]
+    return 1
+
+
 async def run_bridge(args):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
+    store = SessionStore()
+    # Resolved before a resumed handle is looked at, because whose session it is
+    # decides whether this caller may be told anything about it at all.
+    lane = resolve_lane(args, store)
+    refusal = refuse_resume_past_cap(args, lane.owner, store)
+    if refusal is not None:
+        return report_refusal(args, refusal)
     probe = args.probe or args.browser_probe
     if not args.recover_session and not probe:
         args.scope = resolve_review_scope(args.cwd, args.base)
@@ -2780,8 +2925,6 @@ async def run_bridge(args):
     # Preparation has succeeded and no Lane has opened yet, which is what this
     # point promises: a review that failed before here never started.
     hook_review_start(args, review_start_model(args, args.resume_state))
-    store = SessionStore()
-    lane = resolve_lane(args, store)
     # The lock stays process-scoped: it serialises concurrent calls from one
     # pane, and a driver that dies releases it. Duplicate prevention across a
     # driver's death is the recovery path's job, not a longer-lived lock's — a
@@ -2791,6 +2934,12 @@ async def run_bridge(args):
         if args.recover_session:
             runs = await lane.recover()
         elif args.resume_session:
+            # The binding answer, and the only one that spends a round: the
+            # record is re-read and written back here, where the lock keeps two
+            # callers from taking the same round.
+            args.resume_state, refusal = grant_round(args, lane.owner, store)
+            if refusal is not None:
+                return report_refusal(args, refusal)
             runs = {args.axis: await lane.resume(axis_brief(args, args.axis))}
         else:
             runs = await deliver_briefs(args, lane, axis_briefs(args))
@@ -2798,6 +2947,9 @@ async def run_bridge(args):
         results = {}
         for axis, run in runs.items():
             result = lane.settle(run)
+            # Named here rather than in either Lane: what a caller may do next
+            # is the review's answer, and both Lanes give the same one.
+            result["next"] = next_action(axis, rounds_had(run.state))
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result

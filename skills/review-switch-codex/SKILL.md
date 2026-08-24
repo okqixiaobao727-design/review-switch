@@ -8,7 +8,7 @@ The Codex Lane is a thin coordinator. The Bridge owns review preparation: it pin
 Scope, reads the spec and standards, consults the optional code graph, and writes each Axis Brief.
 It then delivers each brief to the reviewing vendor `--reviewer` names, which on this lane is
 always `codex`. The Lane's only input work is the spec-reference discovery below. Hand the
-Bridge references, then apply the Rounds contract to its result.
+Bridge references, then follow the action its result names.
 
 ## First review
 
@@ -64,8 +64,8 @@ reranking it:
 <axes.spec.finalMessage or reason>
 ```
 
-After a `both` review, keep the Spec handle for the one automatic re-review the Rounds contract
-allows. Keep the Standards handle too, solely so a human can wake that session by hand.
+After a `both` review, keep the Spec handle for the re-review its result's `next` may name.
+Keep the Standards handle too, solely so a human can wake that session by hand.
 
 ## Recovery
 
@@ -77,14 +77,15 @@ same ordinary single-axis re-run rule.
 
 ## Rounds
 
-This section is the sole authority on round capping.
+The Bridge holds the round cap and enforces it; this section adds no rule of its own. Every axis
+result names the one action permitted next in its `next` field:
 
-Fix accepted Standards findings in one pass; Standards gets no automatic re-review. Spec
-findings that required fixes earn one re-review, using that axis's exact handle and scoped to
-exactly those fixes.
-
-If that re-review leaves a Spec finding open, or a finding is reopened after it was ruled on,
-end the review as a disagreement and escalate both positions to whoever requested the review.
+- `fix and stop` — fix the findings you accept and take this lineage no further.
+- `fix then one re-review` — fix the findings that required it, then resume that axis's exact
+  handle once, scoped to exactly those fixes.
+- `escalate` — this lineage has no round left. A resume past the cap is refused, with a `refused`
+  status and this same `next`. What escalation *is* is this lane's: end the review as a
+  disagreement and put both positions to whoever requested it. A fresh review is always available.
 
 **Completion criterion:** every returned axis is reported unchanged, every preparation gap is
-handled, and every automatic follow-up stays within the Rounds cap using its own axis handle.
+handled, and every follow-up is the one that axis's `next` named.

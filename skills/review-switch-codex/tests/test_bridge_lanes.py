@@ -404,7 +404,11 @@ class ClaudePerAxisChoiceTests(FakePaneTestCase):
         self.assertEqual((state["model"], state["effort"]), ("spec-model", "high"))
 
     def test_a_resume_carries_the_lineage_the_first_round_started(self):
-        """The gate that would have refused this resume is gone; the cap is #23's."""
+        """The lineage this Lane resumes is the one its first round started.
+
+        Whether a resume is allowed at all is the Rounds Contract's answer, and
+        `test_bridge_rounds.py` is where it is asserted.
+        """
         self.claude.finish("round one", axis="spec")
         _code, first = self.run_bridge(
             self.args(reviewer="claude", axis="spec")
