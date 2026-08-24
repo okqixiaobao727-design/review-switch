@@ -67,11 +67,12 @@ class FakeStore:
         self.written = {}
         # Whether the pane had already been handed its thread when the record
         # was written — the ordering a killed driver depends on.
-        self.handoff_done_at_write = None
+        self.handoff_done_at_first_write = None
 
     def write(self, session_id, state):
         handoff = pathlib.Path(state["runtimeDir"]) / "thread-id"
-        self.handoff_done_at_write = handoff.exists()
+        if self.handoff_done_at_first_write is None:
+            self.handoff_done_at_first_write = handoff.exists()
         self.written[session_id] = state
 
 
@@ -162,7 +163,7 @@ class McpReadinessGateTests(unittest.TestCase):
         self.deliver_one_axis(client)
 
         self.assertFalse(
-            self.store.handoff_done_at_write,
+            self.store.handoff_done_at_first_write,
             "the pane was handed its thread before the record was written",
         )
 

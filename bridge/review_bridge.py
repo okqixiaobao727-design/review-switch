@@ -3,10 +3,11 @@
 """Code-review channel between a caller and the reviewing vendor it named.
 
 Round one starts a review lineage; a round the Rounds Contract still allows
-resumes it, and `--recover-session` re-attaches to the review a killed driver
-left in flight. That contract is held here rather than stated anywhere: every
-result names the one action its caller is permitted next, and a resume past the
-cap is refused. A fresh lineage is always available.
+resumes it, and `--recover-session` waits on a live reviewer or hands back the
+undelivered report a killed driver left behind. That contract is held here
+rather than stated anywhere: every result names the one action its caller is
+permitted next, and a resume past the cap is refused. A fresh lineage is always
+available.
 
 Preparation and delivery are separate: preparation fills one Axis Brief per
 requested axis, and the Lane `--reviewer` names takes one brief and gives back
@@ -71,7 +72,7 @@ DEFAULT_TIMEOUT_SECONDS = 7200
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 60
 SESSION_STATE_VERSION = 2
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-# Recovery found nothing to re-attach to, which is a different answer from a
+# Recovery found no live reviewer or undelivered report, which is different from a
 # failed review: it is the one result that licenses starting a first review.
 NO_LIVE_SESSION_EXIT = 3
 # The reviewing vendor a caller names on `--reviewer`. The model is whatever the
@@ -151,7 +152,7 @@ class AppServerError(RuntimeError):
 
 
 class NoLiveSessionError(RuntimeError):
-    """No live review session belongs to the caller's owner identity."""
+    """No recoverable review session belongs to the caller's owner identity."""
 
 
 def hook_command(args, point):
@@ -647,10 +648,10 @@ class SessionStore:
         The record is written before the review is awaited, so a session whose
         driver died mid-review is already on disk under the same owner tuple the
         resume path validates. What makes a record reachable again is the Lane's
-        to say, and it says so as the fields it needs to find its reviewer with:
-        a record missing one of them names nothing to wait on. Anything
-        unreadable or written by another version is skipped rather than raised —
-        one damaged file must not hide a healthy session.
+        to say: either the fields needed to find its reviewer, or an undelivered
+        stored report. Anything unreadable or written by another version is
+        skipped rather than raised — one damaged file must not hide a healthy
+        session.
         """
         found = []
         for path in sorted(self.root.glob("*.json")):
@@ -1915,6 +1916,17 @@ class AxisFailure:
     reason: str
 
 
+@dataclasses.dataclass(frozen=True)
+class StoredAxisRun:
+    """One axis whose reviewer is gone but whose report is still undelivered."""
+
+    state: dict
+
+    @property
+    def thread_id(self):
+        return self.state.get("threadId")
+
+
 class AxisRunError(Exception):
     def __init__(self, state, thread_id, reason):
         super().__init__(reason)
@@ -2003,12 +2015,36 @@ async def drive_new_review(launch, owner, store):
 
 async def drive_terminal_axis(launch, owner, store):
     try:
-        result = await drive_new_review(launch, owner, store)
+        return await drive_new_review(launch, owner, store)
     except AxisRunError as error:
-        cleanup_pane(launch.pane_id, launch.runtime_dir)
         return AxisFailure(error.state, error.thread_id, error.reason)
-    cleanup_pane(launch.pane_id, launch.runtime_dir)
+
+
+def undelivered_report(state):
+    report = state.get("report")
+    if isinstance(report, dict) and report.get("delivered") is False:
+        return report
+    return None
+
+
+def result_from_report(report):
+    result = {
+        name: report[name]
+        for name in ("status", "finalMessage", "reviewSessionId")
+    }
+    if "reason" in report:
+        result["reason"] = report["reason"]
     return result
+
+
+def cost_from_report(report):
+    saved = report["costCounters"]
+    counters = (
+        dict(saved)
+        if all(saved.get(name) is not None for name in COUNTERS)
+        else None
+    )
+    return counters, report.get("resolvedModel"), report.get("costDetail")
 
 
 async def connect_existing_session(state):
@@ -2119,18 +2155,21 @@ async def run_existing_review(args, brief, owner, store):
 
 
 async def run_recovered_reviews(args, owner, store):
-    """Re-attach to every review axis this owner already has running.
+    """Recover every live reviewer or undelivered report this owner has.
 
     Returns each completed or failed axis for the sessions this owner already owns.
 
     The caller reaching here has lost the handle its driver was going to print —
-    the driver was killed, or its output never arrived. Everything needed to pick
-    the review back up survived that death: the record on disk, the pane, and the
-    thread. So this starts no pane and no thread; it finds the owner's live
-    sessions and waits on the turns already in flight. With no such session it
-    raises `NoLiveSessionError` rather than falling back to a first review.
+    the driver was killed, or its output never arrived. This starts no pane and
+    no thread: a live record is re-attached and awaited, while a stored report is
+    handed back without its reviewer. With neither it raises
+    `NoLiveSessionError` rather than falling back to a first review.
     """
     async def recover(state):
+        if undelivered_report(state) is not None:
+            return StoredAxisRun(state)
+        if any(not state.get(field) for field in CodexLane.RECOVERABLE_FIELDS):
+            return None
         client = await connect_existing_session(state)
         if client is None:
             return None
@@ -2156,14 +2195,12 @@ async def run_recovered_reviews(args, owner, store):
     recovered = await asyncio.gather(
         *(
             recover(state)
-            for state in store.find_by_owner(
-                owner, required=CodexLane.RECOVERABLE_FIELDS
-            )
+            for state in store.find_by_owner(owner)
         )
     )
-    live = [run for run in recovered if run is not None]
-    if live:
-        return {run.state["axis"]: run for run in live}
+    recoverable = [run for run in recovered if run is not None]
+    if recoverable:
+        return {run.state["axis"]: run for run in recoverable}
     raise NoLiveSessionError(
         "No live review session for this tmux pane and worktree. "
         "Nothing to recover; start a review instead."
@@ -2194,6 +2231,45 @@ class Lane:
     def axis_cost(self, run):
         """What one axis spent, read wherever this Lane's reviewer records it."""
         raise NotImplementedError
+
+    def store_report(self, run, result):
+        """Persist one report and its hook facts before recovery is dismantled."""
+        if run.state is None:
+            return
+        counters, model, detail = self.axis_cost(run)
+        report = dict(result)
+        report.update({
+            "resolvedModel": model,
+            "costCounters": {
+                name: counters.get(name) if counters is not None else None
+                for name in COUNTERS
+            },
+            "costDetail": detail,
+            "delivered": False,
+        })
+        run.state["report"] = report
+        run.state["updatedAt"] = time.time()
+        self.store.write(run.state["reviewSessionId"], run.state)
+
+    def settle_result(self, run):
+        """Return a stored report, or persist the result still held by its Lane."""
+        report = undelivered_report(run.state) if run.state else None
+        if report is not None:
+            return result_from_report(report)
+        result = self.result_for(run)
+        self.store_report(run, result)
+        return result
+
+    def mark_delivered(self, run):
+        """Mark a report only after its JSON has been printed to the caller."""
+        if run.state is None:
+            return
+        report = undelivered_report(run.state)
+        if report is None:
+            return
+        report["delivered"] = True
+        run.state["updatedAt"] = time.time()
+        self.store.write(run.state["reviewSessionId"], run.state)
 
     def end_axis(self, axis, result, run):
         """End an axis this Lane drove to a result of its own."""
@@ -2262,26 +2338,33 @@ class CodexLane(Lane):
 
     async def deliver(self, launch):
         """Drive one opened axis to a result of its own."""
-        return await drive_terminal_axis(launch, self.owner, self.store)
+        run = await drive_terminal_axis(launch, self.owner, self.store)
+        self.settle_result(run)
+        cleanup_pane(launch.pane_id, launch.runtime_dir)
+        return run
 
     async def resume(self, brief):
         """Put one more turn to the lineage a resume handle names."""
         return await run_existing_review(self.args, brief, self.owner, self.store)
 
     async def recover(self):
-        """Re-attach to every axis this owner already has running."""
+        """Recover every live reviewer or undelivered report this owner has."""
         return await run_recovered_reviews(self.args, self.owner, self.store)
 
     def settle(self, run):
         """Close one axis out: its record written, its pane down, its result returned."""
+        result = self.settle_result(run)
+        if self.args.recover_session or self.args.resume_session:
+            cleanup_pane(
+                run.state.get("paneId") if run.state else None,
+                run.state.get("runtimeDir") if run.state else None,
+            )
+        return result
+
+    def result_for(self, run):
+        """Build the shared axis result while its source is still available."""
         args = self.args
-        handed_back = args.recover_session or args.resume_session
         if isinstance(run, AxisFailure):
-            if handed_back:
-                cleanup_pane(
-                    run.state.get("paneId") if run.state else None,
-                    run.state.get("runtimeDir") if run.state else None,
-                )
             return {
                 "status": FAILED_STATUS,
                 "finalMessage": "",
@@ -2296,13 +2379,13 @@ class CodexLane(Lane):
         update_session_after_turn(state, turn, target)
         if not args.recover_session:
             state["preparation"] = preparation_report(args)
-        self.store.write(state["reviewSessionId"], state)
-        if handed_back:
-            cleanup_pane(state.get("paneId"), state.get("runtimeDir"))
         return axis_result(state, turn, final_message)
 
     def axis_cost(self, run):
         """What an axis spent, read from the Codex rollout its own thread wrote."""
+        report = undelivered_report(run.state) if run.state else None
+        if report is not None:
+            return cost_from_report(report)
         if run.thread_id is None:
             return self.NO_COST
         return harvest_rollout(codex_sessions_root(), run.thread_id)
@@ -2712,15 +2795,15 @@ class ClaudeLane(Lane):
 
     async def deliver(self, launch):
         """Drive one started axis to a result of its own."""
-        return await self.drive(launch, launch.state)
+        run = await self.drive(launch, launch.state)
+        self.settle_result(run)
+        return run
 
     async def drive(self, launch, state):
         """Wait this axis's reviewer out and read what it printed.
 
-        Nothing here throws the reviewer's output away: what it printed stays on
-        disk, under a record that still names it, until the result reaches the
-        caller. A driver that dies with the report already read has therefore
-        thrown nothing away either — the report is still there to be recovered.
+        Nothing here throws the reviewer's output away. The caller persists it
+        in the record as soon as this returns, before the runtime file is removed.
         """
         try:
             await launch.process.wait(self.args.timeout)
@@ -2769,33 +2852,34 @@ class ClaudeLane(Lane):
         return await self.drive(dataclasses.replace(launch, state=state), state)
 
     def recoverable(self):
-        """Every record of this owner's that still names a reviewer to wait on.
+        """Every live reviewer or undelivered report this owner can recover.
 
         A reviewer outlives its driver, so what survives that death is the
-        record, the process, and the file the result lands in. A record whose
-        runtime directory is gone was settled and is nobody's to recover; one
-        whose reviewer has exited without printing anything is nothing to wait
-        on either.
+        record, the process, and the file the result lands in. Once the report
+        is stored, those runtime dependencies may be gone; until then, a reviewer
+        that exited without printing anything leaves nothing to wait on.
         """
         return [
             state
-            for state in self.store.find_by_owner(
-                self.owner, required=self.RECOVERABLE_FIELDS
-            )
-            if pathlib.Path(state["runtimeDir"]).is_dir()
-            and (
-                claude_process_alive(state["pid"])
-                or result_awaits(state["resultPath"])
+            for state in self.store.find_by_owner(self.owner)
+            if undelivered_report(state) is not None
+            or (
+                all(state.get(field) for field in self.RECOVERABLE_FIELDS)
+                and pathlib.Path(state["runtimeDir"]).is_dir()
+                and (
+                    claude_process_alive(state["pid"])
+                    or result_awaits(state["resultPath"])
+                )
             )
         ]
 
     async def recover(self):
-        """Re-attach to every axis this owner already has running.
+        """Recover every live reviewer or undelivered report this owner has.
 
         The caller reaching here has lost the handle its driver was going to
-        print. This starts no reviewer: it finds the owner's live ones and waits
-        on the results already on their way. With none it raises
-        `NoLiveSessionError` rather than falling back to a first review.
+        print. This starts no reviewer: it waits on live reviewers and hands
+        stored reports back directly. With neither it raises `NoLiveSessionError`
+        rather than falling back to a first review.
         """
         states = self.recoverable()
         if not states:
@@ -2804,7 +2888,9 @@ class ClaudeLane(Lane):
         return {run.state["axis"]: run for run in runs}
 
     async def rejoin(self, state):
-        """Wait out one reviewer this call adopted, and read what it printed."""
+        """Return one stored report, or wait out the reviewer this call adopted."""
+        if undelivered_report(state) is not None:
+            return StoredAxisRun(state)
         try:
             await wait_for_claude_exit(state["pid"], self.args.timeout)
             parsed = read_claude_result(state["resultPath"])
@@ -2819,15 +2905,16 @@ class ClaudeLane(Lane):
         return ClaudeRun(state, parsed=parsed)
 
     def settle(self, run):
-        """Close one axis out: its record written, its files gone, its result returned.
+        """Persist one axis's report, then release its runtime files."""
+        state = run.state
+        result = self.settle_result(run)
+        self.let_go_of_runtime(state)
+        return result
 
-        The files go last and only here, once this axis's result is the caller's:
-        a record left naming a runtime directory that is no longer there is
-        exactly how a settled review says it is nobody's to recover.
-        """
+    def result_for(self, run):
+        """Build the shared axis result while its source is still available."""
         state = run.state
         if run.parsed is None:
-            self.let_go_of_runtime(state)
             return {
                 "status": FAILED_STATUS,
                 "finalMessage": "",
@@ -2839,10 +2926,7 @@ class ClaudeLane(Lane):
         if not self.args.recover_session:
             state["target"] = self.args.base
             state["preparation"] = preparation_report(self.args)
-        self.store.write(state["reviewSessionId"], state)
-        result = claude_axis_result(state, run.parsed)
-        self.let_go_of_runtime(state)
-        return result
+        return claude_axis_result(state, run.parsed)
 
     def let_go_of_runtime(self, state):
         """Drop what this axis's reviewer left on disk, now nothing needs it."""
@@ -2850,6 +2934,9 @@ class ClaudeLane(Lane):
 
     def axis_cost(self, run):
         """What an axis spent, read from the result its own reviewer printed."""
+        report = undelivered_report(run.state)
+        if report is not None:
+            return cost_from_report(report)
         if run.parsed is None:
             return self.NO_COST
         return claude_axis_cost(run.parsed)
@@ -2953,30 +3040,32 @@ async def run_bridge(args):
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result
-    # Once every turn has settled, so each rollout's last cumulative count is the
-    # whole of what its axis spent.
-    for axis, run in runs.items():
-        lane.end_axis(axis, results[axis], run)
-    if args.recover_session:
-        preparation = lane.recovered_preparation(runs.values())
-    else:
-        preparation = preparation_report(args)
-    output = {
-        "status": (
-            "completed"
-            if all(
-                result["status"] == "completed" and result["finalMessage"]
-                for result in results.values()
-            )
-            else "partially_completed"
-        ),
-        "axes": results,
-        "preparation": preparation,
-    }
-    print(json.dumps(output, ensure_ascii=False))
-    args.status = output["status"]
-    succeeded = output["status"] == "completed"
-    return 0 if succeeded else 1
+        # Every report and its cost facts are now durable, so the hook can use
+        # the same values whether this is the original or a recovered delivery.
+        for axis, run in runs.items():
+            lane.end_axis(axis, results[axis], run)
+        if args.recover_session:
+            preparation = lane.recovered_preparation(runs.values())
+        else:
+            preparation = preparation_report(args)
+        output = {
+            "status": (
+                "completed"
+                if all(
+                    result["status"] == "completed" and result["finalMessage"]
+                    for result in results.values()
+                )
+                else "partially_completed"
+            ),
+            "axes": results,
+            "preparation": preparation,
+        }
+        print(json.dumps(output, ensure_ascii=False), flush=True)
+        for run in runs.values():
+            lane.mark_delivered(run)
+        args.status = output["status"]
+        succeeded = output["status"] == "completed"
+        return 0 if succeeded else 1
 
 
 def build_parser():
@@ -3043,9 +3132,9 @@ def build_parser():
         "--recover-session",
         action="store_true",
         help=(
-            "re-attach to the live review this tmux pane and worktree already "
-            f"own, instead of starting one (exit {NO_LIVE_SESSION_EXIT} when "
-            "there is none)"
+            "recover a live reviewer or undelivered report this tmux pane and "
+            f"worktree already own, instead of starting one (exit "
+            f"{NO_LIVE_SESSION_EXIT} when there is none)"
         ),
     )
     for point, fires in HOOK_POINTS.items():

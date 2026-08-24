@@ -260,6 +260,9 @@ class RecordingLane:
     def end_axis(self, axis, result, run):
         self.ended.append((axis, result["status"]))
 
+    def mark_delivered(self, _run):
+        """This recordless Lane has no persisted report to acknowledge."""
+
 
 class DeliverySeamTests(FakePaneTestCase):
     """What the shared harness hands the Lane, and what it takes back."""
