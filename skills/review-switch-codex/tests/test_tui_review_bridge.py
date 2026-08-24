@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import importlib.util
 import io
@@ -9,6 +10,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,10 +18,6 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from hook_fixtures import marker_lines, write_hook_config  # noqa: E402
-
 
 BRIDGE_PATH = (
     pathlib.Path(__file__).parents[1] / "scripts" / "tui_review_bridge.py"
@@ -69,6 +67,8 @@ def base_args(**overrides):
         "spec_effort": None,
         "probe": False,
         "browser_probe": False,
+        "resume_state": None,
+        "status": "failed",
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -2168,282 +2168,6 @@ class RecoveryTests(FakePaneTestCase):
         self.assertEqual(self.codex.panes, [])
 
 
-STUB_WRITER = '''#!/usr/bin/env python3
-"""Stands in for the consumer's machine-log writer.
-
-`--machine-log` is a consumer-supplied seam: the consumer owns the writer and
-the line it writes, this lane owns the call. So this stub records the argv it
-was handed — the whole of what the lane is responsible for — and reports the one
-failure the lane must survive, a log path it cannot append to.
-"""
-
-import json
-import pathlib
-import sys
-
-arguments = sys.argv[1:]
-calls = pathlib.Path(sys.argv[0]).with_name("calls.jsonl")
-with calls.open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(arguments) + "\\n")
-
-log = pathlib.Path(arguments[arguments.index("--log") + 1])
-try:
-    log.parent.mkdir(parents=True, exist_ok=True)
-    log.open("a", encoding="utf-8").close()
-except OSError:
-    sys.exit(1)
-'''
-
-
-class MachineLogTests(FakePaneTestCase):
-    """The pair of `review` calls every review makes to the machine-log writer.
-
-    The bridge is the caller because it is the only party that deterministically
-    knows both that a review started and that it ended: the reviewed child may
-    skip a line it was asked for in prose, and a child whose session dies
-    mid-review can never report the end at all.
-
-    The writer itself belongs to whichever consumer configured `--machine-log`,
-    and is tested in that consumer's own suite; the lane's responsibility ends at
-    the argv it hands over, so that argv is what these tests pin.
-    """
-
-    TICKET = "26"
-    MODEL = "gpt-5.6-luna"
-
-    def setUp(self):
-        super().setUp()
-        self.machine_log = self.root / "run" / "log.jsonl"
-        writer = self.root / "machine_log.py"
-        writer.write_text(STUB_WRITER, encoding="utf-8")
-        self.calls_file = writer.with_name("calls.jsonl")
-        self.enter(mock.patch.object(self.bridge, "MACHINE_LOG", writer))
-
-    def main(self, *arguments):
-        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
-        stdout = io.StringIO()
-        with mock.patch.object(sys, "argv", argv):
-            with contextlib.redirect_stdout(stdout):
-                return self.bridge.main()
-
-    def review_argv(self, *arguments, timeout="5", axis="standards"):
-        return (
-            "--base", self.fixed_point,
-            "--spec", "spec.md",
-            "--axis", axis,
-            "--model", self.MODEL,
-            "--effort", "max",
-            "--timeout", timeout,
-            "--startup-timeout", "5",
-            "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET,
-            *arguments,
-        )
-
-    def resume_argv(self, session_id, *arguments, axis="spec"):
-        return (
-            "--base", self.fixed_point,
-            "--spec", "spec.md",
-            "--axis", axis,
-            "--resume-session", session_id,
-            "--timeout", "5",
-            "--startup-timeout", "5",
-            "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET,
-            *arguments,
-        )
-
-    def completed_spec_session(self):
-        self.codex.finish("round one findings", axis="spec")
-        code = self.main(*self.review_argv(axis="spec"))
-        self.assertEqual(code, 0)
-        session_id = self.stored_session()["reviewSessionId"]
-        self.calls_file.unlink(missing_ok=True)
-        return session_id
-
-    def reviews(self):
-        """Every `review` call the bridge made, read back as the flags it passed."""
-        if not self.calls_file.exists():
-            return []
-        records = []
-        for line in self.calls_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            arguments = json.loads(line)
-            if "review" not in arguments:
-                continue
-            records.append({
-                flag.lstrip("-"): value
-                for flag, value in zip(arguments, arguments[1:])
-                if flag.startswith("--")
-            })
-        return records
-
-    def assertPair(self, records):
-        """Exactly one `running` call and its `returned` pair, for this ticket, in that order."""
-        self.assertEqual([record["state"] for record in records], ["running", "returned"])
-        for record in records:
-            self.assertEqual(record["ticket"], self.TICKET)
-            # Vendor then model, the spelling the dashboard's annotation row prints verbatim.
-            self.assertEqual(record["lane"], f"codex {self.MODEL}")
-            # Absolute where the path entered, so no working directory can move
-            # what the consumer's writer is pointed at.
-            self.assertEqual(record["log"], os.path.abspath(str(self.machine_log)))
-
-    def test_a_review_leaves_its_running_line_and_its_returned_pair(self):
-        self.codex.finish("two spec findings, one standards finding")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 0)
-        self.assertPair(self.reviews())
-
-    def test_both_axes_still_leave_one_review_event_pair(self):
-        self.codex.finish("no findings")
-
-        code = self.main(*self.review_argv(axis="both"))
-
-        self.assertEqual(code, 0)
-        self.assertPair(self.reviews())
-
-    def test_both_axes_with_different_models_leave_a_vendor_only_lane(self):
-        self.codex.finish("no findings")
-
-        code = self.main(
-            *self.review_argv(
-                "--spec-model", "spec-model", axis="both"
-            )
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [record["lane"] for record in self.reviews()],
-            ["codex", "codex"],
-        )
-
-    def test_both_axes_with_the_same_axis_model_leave_that_model_in_the_lane(self):
-        self.codex.finish("no findings")
-
-        code = self.main(
-            *self.review_argv(
-                "--standards-model",
-                "shared-axis-model",
-                "--spec-model",
-                "shared-axis-model",
-                axis="both",
-            )
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [record["lane"] for record in self.reviews()],
-            ["codex shared-axis-model", "codex shared-axis-model"],
-        )
-
-    def test_single_axis_override_leaves_its_model_in_the_lane(self):
-        self.codex.finish("no findings")
-
-        code = self.main(
-            *self.review_argv(
-                "--spec-model", "spec-model", axis="spec"
-            )
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [record["lane"] for record in self.reviews()],
-            ["codex spec-model", "codex spec-model"],
-        )
-
-    def test_resumed_axis_override_leaves_its_model_in_the_lane(self):
-        session_id = self.completed_spec_session()
-        self.codex.finish("round two clear", axis="spec")
-
-        code = self.main(
-            *self.resume_argv(
-                session_id, "--spec-model", "resumed-spec-model"
-            )
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [record["lane"] for record in self.reviews()],
-            ["codex resumed-spec-model", "codex resumed-spec-model"],
-        )
-
-    def test_resume_without_model_flags_uses_the_model_saved_in_the_handle(self):
-        session_id = self.completed_spec_session()
-        self.codex.finish("round two clear", axis="spec")
-
-        code = self.main(*self.resume_argv(session_id))
-
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [record["lane"] for record in self.reviews()],
-            [f"codex {self.MODEL}", f"codex {self.MODEL}"],
-        )
-
-    def test_resume_rejects_a_different_axis_before_writing_running(self):
-        session_id = self.completed_spec_session()
-        panes_before = list(self.codex.launched_panes)
-        stderr = io.StringIO()
-
-        with contextlib.redirect_stderr(stderr):
-            code = self.main(
-                *self.resume_argv(session_id, axis="standards")
-            )
-
-        self.assertEqual(code, 1)
-        self.assertIn("axis 'spec'", stderr.getvalue())
-        self.assertEqual(self.reviews(), [])
-        self.assertEqual(self.codex.launched_panes, panes_before)
-
-    def test_a_review_with_no_log_configured_writes_nothing(self):
-        self.codex.finish("no findings")
-
-        code = self.main(
-            "--base", self.fixed_point, "--spec", "spec.md", "--axis", "standards",
-            "--model", self.MODEL, "--timeout", "5", "--startup-timeout", "5"
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(self.reviews(), [])
-        self.assertFalse(self.machine_log.exists())
-
-    def test_a_review_that_never_came_back_still_writes_its_returned_line(self):
-        """The turn never finishes, so the review fails — and the row must not stay standing."""
-        code = self.main(*self.review_argv(timeout="0.2"))
-
-        self.assertEqual(code, 1)
-        self.assertPair(self.reviews())
-
-    def test_a_log_that_cannot_be_written_leaves_the_exit_status_alone(self):
-        blocked = self.root / "not-a-directory"
-        blocked.write_text("this is a file, so nothing can be created beneath it\n")
-        self.machine_log = blocked / "log.jsonl"
-        self.codex.finish("no findings")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 0)
-
-    def test_round_two_writes_its_own_pair_for_the_same_ticket(self):
-        self.codex.finish("round one findings")
-        self.main(*self.review_argv())
-        session = self.stored_session()["reviewSessionId"]
-
-        code = self.main(*self.review_argv("--resume-session", session))
-
-        self.assertEqual(code, 0)
-        records = self.reviews()
-        self.assertEqual(
-            [record["state"] for record in records],
-            ["running", "returned", "running", "returned"],
-        )
-        self.assertEqual({record["ticket"] for record in records}, {self.TICKET})
-
-
-
 def token_count(usage):
     """One `token_count` event, in the shape a Codex rollout writes it."""
     return {
@@ -2507,7 +2231,7 @@ class RolloutHarvestTests(unittest.TestCase):
     """Reading what a Codex review spent out of the rollout its thread id names.
 
     A pure read of a file the lane already wrote: no model token is spent to obtain it, and every
-    way it can fail answers with the diagnosis that goes in the `session-cost` line instead.
+    way it can fail answers with the diagnosis the axis ends with instead.
     """
 
     def setUp(self):
@@ -2685,227 +2409,6 @@ class RolloutHarvestTests(unittest.TestCase):
 
 
 
-class SessionCostTests(FakePaneTestCase):
-    """The per-started-thread `session-cost` calls beside a `review` pair.
-
-    Same seam as the `review` pair, tested the same way: the writer belongs to
-    the consumer that configured `--machine-log`, so what this lane is
-    responsible for is the argv it hands over, and that argv is what these
-    tests pin.
-    """
-
-    TICKET = "26"
-    MODEL_ALIAS = "sol"
-
-    def setUp(self):
-        super().setUp()
-        self.machine_log = self.root / "run" / "log.jsonl"
-        writer = self.root / "machine_log.py"
-        writer.write_text(STUB_WRITER, encoding="utf-8")
-        self.calls_file = writer.with_name("calls.jsonl")
-        self.enter(mock.patch.object(self.bridge, "MACHINE_LOG", writer))
-        self.codex_home = self.root / "codex-home"
-        os.environ["CODEX_HOME"] = str(self.codex_home)
-        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
-
-    def write_rollout(self, records, thread_id=None):
-        return write_rollout(
-            self.codex_home / "sessions",
-            thread_id or self.codex.thread_id,
-            records,
-        )
-
-    def main(self, *arguments):
-        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
-        stdout = io.StringIO()
-        with mock.patch.object(sys, "argv", argv):
-            with contextlib.redirect_stdout(stdout):
-                return self.bridge.main()
-
-    def review_argv(self, *arguments, timeout="5", axis="standards"):
-        return (
-            "--base", self.fixed_point,
-            "--spec", "spec.md",
-            "--axis", axis,
-            "--model", self.MODEL_ALIAS,
-            "--timeout", timeout,
-            "--startup-timeout", "5",
-            "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET,
-            *arguments,
-        )
-
-    def costs(self):
-        """Every `session-cost` call the bridge made, read back as the flags it passed."""
-        if not self.calls_file.exists():
-            return []
-        records = []
-        for line in self.calls_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            arguments = json.loads(line)
-            if "session-cost" not in arguments:
-                continue
-            records.append({
-                flag.lstrip("-"): value
-                for flag, value in zip(arguments, arguments[1:])
-                if flag.startswith("--")
-            })
-        return records
-
-    def test_a_review_records_what_its_thread_spent(self):
-        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
-        self.codex.finish("one spec finding")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 0)
-        costs = self.costs()
-        self.assertEqual(len(costs), 1, costs)
-        entry = costs[0]
-        self.assertEqual(entry["ticket"], self.TICKET)
-        self.assertEqual(entry["executor"], "codex")
-        self.assertEqual(entry["lane"], f"codex {self.MODEL_ALIAS}")
-        self.assertEqual(entry["session"], self.codex.thread_id)
-        # The model the thread resolved to, not the alias the caller asked for.
-        self.assertEqual(entry["model"], RESOLVED_MODEL)
-        # Every counter reaches the writer as the string a command line carries.
-        self.assertEqual(entry["input-tokens"], str(ROUND_ONE_COUNTERS["input"]))
-        self.assertEqual(entry["output-tokens"], str(ROUND_ONE_COUNTERS["output"]))
-        self.assertEqual(entry["cache-read-tokens"], str(ROUND_ONE_COUNTERS["cache_read"]))
-        self.assertEqual(
-            entry["cache-creation-tokens"], str(ROUND_ONE_COUNTERS["cache_creation"])
-        )
-        self.assertEqual(entry["total-tokens"], str(ROUND_ONE_USAGE["total_tokens"]))
-        self.assertNotIn("detail", entry)
-
-    def test_both_axes_record_one_cost_for_each_started_thread(self):
-        standards_thread = "thread-standards-90"
-        spec_thread = "thread-spec-91"
-        for thread_id in (standards_thread, spec_thread):
-            self.write_rollout(
-                [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
-                thread_id=thread_id,
-            )
-        self.codex.finish("no findings")
-
-        code = self.main(*self.review_argv(axis="both"))
-
-        self.assertEqual(code, 0)
-        costs = self.costs()
-        self.assertEqual(len(costs), 2, costs)
-        self.assertEqual(
-            {entry["session"] for entry in costs},
-            {standards_thread, spec_thread},
-        )
-
-    def test_an_axis_that_never_started_a_thread_records_no_cost(self):
-        self.codex.fail_thread_start("standards", "thread could not start")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 1)
-        self.assertEqual(self.costs(), [])
-
-    def test_a_started_thread_records_cost_when_startup_later_fails(self):
-        thread_id = "thread-standards-90"
-        self.write_rollout(
-            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
-            thread_id=thread_id,
-        )
-        self.codex.fail_mcp_startup("standards", "MCP startup failed")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 1)
-        costs = self.costs()
-        self.assertEqual(len(costs), 1, costs)
-        self.assertEqual(costs[0]["session"], thread_id)
-
-    def test_a_review_whose_rollout_is_missing_records_the_diagnosis(self):
-        self.codex.finish("no findings")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 0)
-        entry = self.costs()[0]
-        self.assertIn(self.codex.thread_id, entry["detail"])
-        self.assertNotIn("total-tokens", entry)
-
-    def test_a_timed_out_review_records_its_known_thread_cost(self):
-        """A partial result still has a thread whose rollout can be measured."""
-        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
-
-        code = self.main(
-            *self.review_argv(timeout="0.2")
-        )
-
-        self.assertEqual(code, 1)
-        entry = self.costs()[0]
-        self.assertEqual(entry["lane"], f"codex {self.MODEL_ALIAS}")
-        self.assertEqual(entry["session"], self.codex.thread_id)
-        self.assertEqual(entry["total-tokens"], str(ROUND_ONE_USAGE["total_tokens"]))
-        self.assertNotIn("detail", entry)
-
-    def test_a_failed_second_round_still_names_the_thread_it_spent_in(self):
-        """Naming it is what keeps a same-vendor review out of the reviewed child's figures."""
-        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
-        self.codex.finish("round one findings")
-        self.main(*self.review_argv())
-        session = self.stored_session()["reviewSessionId"]
-        self.codex.status = "in_progress"
-
-        code = self.main(
-            *self.review_argv("--resume-session", session, timeout="0.2")
-        )
-
-        self.assertEqual(code, 1)
-        self.assertEqual(self.costs()[-1]["session"], self.codex.thread_id)
-
-    def test_a_failed_recovery_records_the_thread_it_recovered(self):
-        state = self.kill_the_driver()
-        self.write_rollout(
-            [turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)],
-            thread_id=state["threadId"],
-        )
-        self.codex.error("standards", "recovery timed out")
-
-        code = self.main(
-            "--recover-session",
-            "--timeout", "0.2",
-            "--machine-log", str(self.machine_log),
-            "--ticket", self.TICKET,
-            "--model", self.MODEL_ALIAS,
-        )
-
-        self.assertEqual(code, 1)
-        costs = self.costs()
-        self.assertEqual(len(costs), 1, costs)
-        self.assertEqual(costs[0]["session"], state["threadId"])
-
-    def test_a_rollout_that_names_no_model_records_no_model_rather_than_the_alias(self):
-        """The alias is already on the row, in the lane; the model field is a measurement."""
-        self.write_rollout([token_count(ROUND_ONE_USAGE)])
-        self.codex.finish("no findings")
-
-        code = self.main(*self.review_argv())
-
-        self.assertEqual(code, 0)
-        self.assertEqual(self.costs()[0]["model"], "")
-
-    def test_a_review_with_no_log_configured_records_no_cost(self):
-        self.write_rollout([turn_context(RESOLVED_MODEL), token_count(ROUND_ONE_USAGE)])
-        self.codex.finish("no findings")
-
-        code = self.main(
-            "--base", self.fixed_point, "--spec", "spec.md", "--axis", "standards",
-            "--model", self.MODEL_ALIAS, "--timeout", "5", "--startup-timeout", "5"
-        )
-
-        self.assertEqual(code, 0)
-        self.assertEqual(self.costs(), [])
-
-
 class RecoveryParserTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
@@ -2932,60 +2435,532 @@ class RecoveryParserTests(unittest.TestCase):
             self.bridge.parse_args(["--recover-session", "HEAD"])
 
 
-class LaunchHookTests(unittest.TestCase):
-    """The review pane is a child launch, so the project's hook covers it too.
+HOOK_RECORDER = '''#!/usr/bin/env python3
+"""Stands in for a caller's own hook command.
 
-    A project that configures no hook gets what it got before the hook existed:
-    the pane inherits the caller's environment and nothing is called.
+A Lifecycle Hook's whole contract is the command line the caller composed and
+the facts the bridge puts in its environment, so this records exactly that: every
+`REVIEW_` variable it was handed, plus the directory it was run in, one JSON line
+per firing.
+"""
+
+import json
+import os
+import pathlib
+import sys
+
+record = {
+    name: value for name, value in os.environ.items() if name.startswith("REVIEW_")
+}
+record["cwd"] = os.getcwd()
+with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record) + "\\n")
+'''
+
+HOOK_POINT_FLAGS = (
+    "--on-child-launch",
+    "--on-review-start",
+    "--on-axis-end",
+    "--on-review-end",
+)
+# The four token counters an `axis-end` carries when its cost could be read.
+COUNTER_VARS = {
+    "input": "REVIEW_INPUT_TOKENS",
+    "output": "REVIEW_OUTPUT_TOKENS",
+    "cache_read": "REVIEW_CACHE_READ_TOKENS",
+    "cache_creation": "REVIEW_CACHE_CREATION_TOKENS",
+}
+
+
+class LifecycleHookTests(FakePaneTestCase):
+    """The four points a caller can hand a command for, and what each is told.
+
+    The bridge learns no caller's vocabulary: a hook command is composed by the
+    caller and carries whatever correlation token that caller needs, and the only
+    thing the bridge adds is facts it owns. So these tests hand in a real command
+    at each point and pin the firings and the environment they arrive with.
     """
 
-    TAG = "CREW_LAUNCH_TAG"
+    MODEL = "gpt-5.6-luna"
+
+    def setUp(self):
+        super().setUp()
+        recorder = self.root / "record_hook.py"
+        recorder.write_text(HOOK_RECORDER, encoding="utf-8")
+        self.firings = self.root / "firings.jsonl"
+        self.recorder_command = shlex.join(
+            [sys.executable, str(recorder), str(self.firings)]
+        )
+        self.codex_home = self.root / "codex-home"
+        os.environ["CODEX_HOME"] = str(self.codex_home)
+        self.addCleanup(os.environ.pop, "CODEX_HOME", None)
+
+    def hooks(self, command=None):
+        """The same command handed to every point; REVIEW_EVENT tells them apart."""
+        command = self.recorder_command if command is None else command
+        return tuple(
+            argument for flag in HOOK_POINT_FLAGS for argument in (flag, command)
+        )
+
+    def main(self, *arguments):
+        argv = ["tui_review_bridge.py", "--cwd", str(self.worktree), *arguments]
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv):
+            with contextlib.redirect_stdout(stdout):
+                code = self.bridge.main()
+        printed = stdout.getvalue().strip()
+        self.output = json.loads(printed) if printed else None
+        return code
+
+    def review_argv(self, *arguments, timeout="5", axis="standards", hooks=None):
+        return (
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", axis,
+            "--model", self.MODEL,
+            "--timeout", timeout,
+            "--startup-timeout", "5",
+            *(self.hooks() if hooks is None else hooks),
+            *arguments,
+        )
+
+    def firing_records(self):
+        """Every hook firing, in the order the commands ran."""
+        if not self.firings.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.firings.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def events(self):
+        return [record["REVIEW_EVENT"] for record in self.firing_records()]
+
+    def firings_at(self, event):
+        return [
+            record for record in self.firing_records()
+            if record["REVIEW_EVENT"] == event
+        ]
+
+    def write_rollout(self, thread_id, usage):
+        return write_rollout(
+            self.codex_home / "sessions",
+            thread_id,
+            [turn_context(RESOLVED_MODEL), token_count(usage)],
+        )
+
+    def test_a_single_axis_review_fires_each_point_once(self):
+        self.codex.finish("one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        # review-start comes before any Lane opens, so before the child launches.
+        self.assertEqual(
+            self.events(),
+            ["review-start", "child-launch", "axis-end", "review-end"],
+        )
+
+    def test_a_two_axis_review_fires_once_per_axis_at_the_per_axis_points(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            collections.Counter(self.events()),
+            collections.Counter({
+                "review-start": 1,
+                "child-launch": 2,
+                "axis-end": 2,
+                "review-end": 1,
+            }),
+        )
+        self.assertEqual(
+            {record["REVIEW_AXIS"] for record in self.firings_at("axis-end")},
+            {"standards", "spec"},
+        )
+
+    def test_a_resumed_review_fires_each_point_once(self):
+        """Round one closed its pane, so round two opens one of its own."""
+        self.codex.finish("round one findings")
+        self.main(*self.review_argv())
+        session = self.stored_session()["reviewSessionId"]
+        self.firings.unlink()
+
+        code = self.main(*self.review_argv("--resume-session", session))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.events(),
+            ["review-start", "child-launch", "axis-end", "review-end"],
+        )
+
+    def test_a_resume_onto_a_live_pane_launches_no_further_child(self):
+        """Nothing was launched, so nothing is announced as launched."""
+        state = self.kill_the_driver()
+        self.codex.finish("round two clear")
+
+        code = self.main(
+            *self.review_argv("--resume-session", state["reviewSessionId"])
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.events(), ["review-start", "axis-end", "review-end"])
+
+    def test_a_review_that_fails_during_preparation_fires_only_the_review_end(self):
+        code = self.main(
+            "--base", "no-such-fixed-point",
+            "--spec", "spec.md",
+            "--timeout", "5",
+            "--startup-timeout", "5",
+            *self.hooks(),
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.events(), ["review-end"])
+        self.assertEqual(self.firings_at("review-end")[0]["REVIEW_STATUS"], "failed")
+
+    def test_an_axis_that_cannot_be_briefed_fails_before_the_review_starts(self):
+        """Preparation has not succeeded until every requested axis has a brief."""
+        code = self.main(
+            "--base", self.fixed_point,
+            "--axis", "spec",
+            "--timeout", "5",
+            "--startup-timeout", "5",
+            *self.hooks(),
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.events(), ["review-end"])
+        self.assertEqual(self.firings_at("review-end")[0]["REVIEW_STATUS"], "failed")
+
+    def test_an_axis_already_launched_ends_when_a_later_pane_fails(self):
+        launched = []
+
+        def launch(args, runtime_dir):
+            launched.append(args.axis)
+            if len(launched) == 2:
+                raise RuntimeError("tmux split-window failed")
+            return self.codex.launch_pane(args, runtime_dir)
+
+        self.enter(mock.patch.object(self.bridge, "launch_pane", launch))
+
+        code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.events(),
+            ["review-start", "child-launch", "axis-end", "review-end"],
+        )
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_AXIS"], "standards")
+        self.assertEqual(record["REVIEW_STATUS"], "failed")
+
+    def test_a_resume_rejected_before_any_axis_started_ends_no_axis(self):
+        self.codex.finish("round one findings")
+        self.main(*self.review_argv())
+        session = self.stored_session()["reviewSessionId"]
+        self.firings.unlink()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = self.main(
+                *self.review_argv("--resume-session", session, axis="spec")
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("axis 'standards'", stderr.getvalue())
+        self.assertEqual(self.events(), ["review-end"])
+
+    def test_a_caller_variable_of_its_own_reaches_the_hook_untouched(self):
+        self.enter(mock.patch.dict(os.environ, {"REVIEW_COORDINATOR": "caller-42"}))
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        for record in self.firing_records():
+            self.assertEqual(record["REVIEW_COORDINATOR"], "caller-42")
+
+    def test_a_costed_axis_carries_no_inherited_reason_beside_its_counters(self):
+        """The counters and the reason there are none are never both true."""
+        self.enter(mock.patch.dict(
+            os.environ, {"REVIEW_COST_DETAIL": "from an outer review"}
+        ))
+        self.write_rollout(self.codex.thread_id, ROUND_ONE_USAGE)
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("REVIEW_COST_DETAIL", self.firings_at("axis-end")[0])
+
+    def test_an_uncosted_axis_carries_no_inherited_counters_beside_its_reason(self):
+        self.enter(mock.patch.dict(
+            os.environ,
+            {variable: "999" for variable in COUNTER_VARS.values()},
+        ))
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        self.assertIn("REVIEW_COST_DETAIL", record)
+        for variable in COUNTER_VARS.values():
+            self.assertNotIn(variable, record)
+
+    def test_no_point_inherits_another_point_facts(self):
+        """A stale fact from an outer review is not this review's to pass on."""
+        self.enter(mock.patch.dict(
+            os.environ,
+            {
+                "REVIEW_EVENT": "review-end",
+                "REVIEW_AXIS": "spec",
+                "REVIEW_SESSION": "an-outer-session",
+            },
+        ))
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("review-end")[0]
+        self.assertNotIn("REVIEW_AXIS", record)
+        self.assertNotIn("REVIEW_SESSION", record)
+
+    def test_a_recovery_with_nothing_to_recover_still_ends_its_review(self):
+        code = self.main("--recover-session", "--timeout", "5", *self.hooks())
+
+        self.assertEqual(code, self.bridge.NO_LIVE_SESSION_EXIT)
+        self.assertEqual(self.events(), ["review-start", "review-end"])
+        self.assertEqual(self.firings_at("review-end")[0]["REVIEW_STATUS"], "failed")
+
+    def test_passing_no_hook_runs_nothing_extra(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(hooks=()))
+
+        self.assertEqual(code, 0)
+        self.assertFalse(self.firings.exists())
+
+    def test_a_hook_that_fails_leaves_the_result_and_the_exit_status_alone(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(hooks=self.hooks(f"{self.recorder_command}; exit 3"))
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.output["status"], "completed")
+        self.assertEqual(len(self.events()), 4)
+
+    def test_a_hook_that_is_not_installed_leaves_the_review_standing(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(
+                hooks=self.hooks("review-switch-hook-that-is-not-installed")
+            )
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.output["status"], "completed")
+
+    def test_a_hook_that_times_out_leaves_the_review_standing(self):
+        self.enter(mock.patch.object(self.bridge, "HOOK_TIMEOUT_SECONDS", 0.2))
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv(hooks=self.hooks(f"{self.recorder_command}; sleep 30"))
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.output["status"], "completed")
+
+    def test_every_hook_runs_in_the_reviewed_working_directory(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        for record in self.firing_records():
+            self.assertEqual(
+                pathlib.Path(record["cwd"]).resolve(), self.worktree.resolve()
+            )
+
+    def test_the_child_launch_hook_names_the_child_and_its_pane(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("child-launch")[0]
+        self.assertEqual(record["REVIEW_CHILD_CWD"], str(self.worktree))
+        self.assertEqual(
+            record["REVIEW_CHILD_TMUX_TARGET"], self.codex.launched_panes[0]
+        )
+
+    def test_the_review_start_hook_names_the_reviewer_the_model_and_the_axes(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("review-start")[0]
+        self.assertEqual(record["REVIEW_REVIEWER"], "codex")
+        self.assertEqual(record["REVIEW_MODEL"], self.MODEL)
+        self.assertEqual(record["REVIEW_AXES"], "standards,spec")
+
+    def test_a_single_axis_review_starts_naming_only_that_axis(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="spec"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.firings_at("review-start")[0]["REVIEW_AXES"], "spec")
+
+    def test_axes_pinned_to_different_models_start_with_no_single_model(self):
+        self.codex.finish("no findings")
+
+        code = self.main(
+            *self.review_argv("--spec-model", "another-model", axis="both")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.firings_at("review-start")[0]["REVIEW_MODEL"], "")
+
+    def test_the_axis_end_hook_carries_the_axis_its_result_and_its_cost(self):
+        self.write_rollout(self.codex.thread_id, ROUND_ONE_USAGE)
+        self.codex.finish("one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_AXIS"], "standards")
+        self.assertEqual(record["REVIEW_STATUS"], "completed")
+        self.assertEqual(
+            record["REVIEW_SESSION"], self.stored_session()["reviewSessionId"]
+        )
+        # The model the thread resolved to, not the alias the caller asked for.
+        self.assertEqual(record["REVIEW_MODEL"], RESOLVED_MODEL)
+        for counter, variable in COUNTER_VARS.items():
+            self.assertEqual(record[variable], str(ROUND_ONE_COUNTERS[counter]))
+        self.assertNotIn("REVIEW_COST_DETAIL", record)
+
+    def test_an_axis_whose_cost_cannot_be_read_says_why_instead(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        self.assertIn(self.codex.thread_id, record["REVIEW_COST_DETAIL"])
+        for variable in COUNTER_VARS.values():
+            self.assertNotIn(variable, record)
+
+    def test_a_two_axis_review_costs_each_axis_from_its_own_thread(self):
+        self.write_rollout("thread-standards-90", ROUND_ONE_USAGE)
+        self.write_rollout("thread-spec-91", ROUND_TWO_USAGE)
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 0)
+        costs = {
+            record["REVIEW_AXIS"]: record["REVIEW_INPUT_TOKENS"]
+            for record in self.firings_at("axis-end")
+        }
+        self.assertEqual(
+            costs,
+            {
+                "standards": str(ROUND_ONE_COUNTERS["input"]),
+                "spec": str(ROUND_TWO_COUNTERS["input"]),
+            },
+        )
+
+    def test_an_axis_that_never_came_back_ends_as_a_failure_with_its_cost(self):
+        self.write_rollout(self.codex.thread_id, ROUND_ONE_USAGE)
+
+        code = self.main(*self.review_argv(timeout="0.2"))
+
+        self.assertEqual(code, 1)
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_STATUS"], "failed")
+        self.assertEqual(
+            record["REVIEW_INPUT_TOKENS"], str(ROUND_ONE_COUNTERS["input"])
+        )
+
+    def test_an_axis_that_never_started_a_thread_still_ends_once(self):
+        self.codex.fail_thread_start("standards", "thread could not start")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            [record["REVIEW_STATUS"] for record in self.firings_at("axis-end")],
+            ["failed"],
+        )
+
+    def test_a_review_that_completed_ends_with_the_result_status(self):
+        self.codex.finish("no findings")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.firings_at("review-end")[0]["REVIEW_STATUS"], self.output["status"]
+        )
+        self.assertEqual(self.output["status"], "completed")
+
+    def test_a_review_that_never_came_back_ends_with_the_result_status(self):
+        code = self.main(*self.review_argv(timeout="0.2"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.firings_at("review-end")[0]["REVIEW_STATUS"], self.output["status"]
+        )
+        self.assertEqual(self.output["status"], "partially_completed")
+
+
+class LifecycleHookParserTests(unittest.TestCase):
+    """The arguments the protocol is handed in through, and the ones it retired."""
 
     def setUp(self):
         self.bridge = load_bridge()
-        self.work = tempfile.TemporaryDirectory()
-        self.root = pathlib.Path(self.work.name)
-        self.marker = self.root / "launched.log"
-        self.addCleanup(self.work.cleanup)
 
-    def marker_lines(self):
-        return marker_lines(self.marker)
+    def test_the_bridge_takes_no_argument_naming_a_caller_log_or_ticket(self):
+        for argument in ("--machine-log", "--ticket"):
+            with self.subTest(argument=argument):
+                with self.assertRaises(SystemExit):
+                    self.bridge.parse_args(
+                        ["--base", "main", argument, "anything"]
+                    )
 
-    def launch(self, pane_id):
-        fake = FakeSubprocess(stdout=f"{pane_id}\n")
-        with mock.patch.object(self.bridge, "subprocess", fake):
-            returned = self.bridge.launch_pane(
-                base_args(cwd=str(self.root), tmux_target="%1"),
-                self.root / "runtime",
-            )
-        self.assertEqual(returned, pane_id)
+    def test_each_lifecycle_point_takes_one_command(self):
+        args = self.bridge.parse_args([
+            "--base", "main",
+            "--on-child-launch", "notify launch",
+            "--on-review-start", "notify start",
+            "--on-axis-end", "notify axis",
+            "--on-review-end", "notify end",
+        ])
 
-    def test_an_unconfigured_hook_launches_the_pane_untouched(self):
-        self.launch("%42")
+        self.assertEqual(args.on_child_launch, "notify launch")
+        self.assertEqual(args.on_review_start, "notify start")
+        self.assertEqual(args.on_axis_end, "notify axis")
+        self.assertEqual(args.on_review_end, "notify end")
 
-        self.assertEqual(self.marker_lines(), [])
+    def test_a_point_left_out_carries_no_command(self):
+        args = self.bridge.parse_args(["--base", "main"])
 
-    def test_the_command_runs_once_for_the_pane_it_launched(self):
-        write_hook_config(
-            self.root,
-            command=f'printf "%s\\n" "$AGENTCREW_CHILD_TMUX_TARGET" >> {self.marker}',
-        )
-
-        self.launch("%42")
-
-        self.assertEqual(self.marker_lines(), ["%42"])
-
-    def test_a_child_of_an_unconfigured_hook_gets_no_extra_environment(self):
-        hook = self.bridge.launch_hook.load_hook(self.root)
-
-        self.assertEqual(self.bridge.child_session_env(hook), dict(os.environ))
-
-    def test_the_configured_variables_reach_the_codex_child(self):
-        write_hook_config(self.root, env={self.TAG: "ticket-133"})
-
-        hook = self.bridge.launch_hook.load_hook(self.root)
-
-        self.assertEqual(self.bridge.child_session_env(hook)[self.TAG], "ticket-133")
+        self.assertIsNone(args.on_child_launch)
+        self.assertIsNone(args.on_review_start)
+        self.assertIsNone(args.on_axis_end)
+        self.assertIsNone(args.on_review_end)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,11 @@ Round one starts a review lineage in its own tmux pane; round two resumes that
 thread, and `--recover-session` re-attaches to the turn a killed driver left in
 flight.
 
-Given `--machine-log` and `--ticket`, every call also leaves the run's machine
-log the pair of `review` lines the contract describes — `running` on entry and
-`returned` on exit — so the dashboard's review annotation appears and disappears
-with no operator action and no model token spent (ADR-0001).
+A caller that wants a review's start, each axis's cost, and its end observed
+hands in the commands to run at those points, and gets them run with this
+review's own facts in their environment. Pass none and nothing extra runs. The
+whole contact surface is this command, its result, and those hooks: nothing here
+reads a caller's configuration or names a caller's vocabulary (ADR-0002).
 """
 
 import argparse
@@ -39,10 +40,6 @@ except ImportError as error:
         "Install it for the Python interpreter used by Claude Code."
     ) from error
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import launch_hook  # noqa: E402  — a sibling asset, reached from this file's own directory
-
-
 TERMINAL_TURN_STATUSES = {"completed", "failed", "interrupted"}
 # A thread's MCP servers announce themselves on the connection that started the
 # thread; the first turn must wait until none of them is still coming up.
@@ -69,16 +66,56 @@ SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Recovery found nothing to re-attach to, which is a different answer from a
 # failed review: it is the one result that licenses starting a first review.
 NO_LIVE_SESSION_EXIT = 3
-# The log's own writer, so the `review` event's shape and its closed set of
-# states stay the log's alone: this bridge names the event, never spells it.
-MACHINE_LOG = pathlib.Path(__file__).resolve().parents[2] / "machine_log.py"
-# The vendor half of the lane this bridge reviews in. The model half is whatever
-# the lineage was pinned to, so the lane needs no argument of its own.
+# The reviewing vendor this bridge delivers to. The model is whatever the
+# lineage was pinned to, so the reviewer needs no argument of its own.
 REVIEW_VENDOR = "codex"
 CODE_GRAPH_CLI = "code-review-graph"
-# The four disjoint counters a `session-cost` line carries, in the machine log's
-# own spelling.
+# The four disjoint counters one axis's spend is reported as.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
+# The four points in a review's life a caller may hand one command for, each
+# mapped to when its command fires. The point's own name is both the option it
+# arrives on and the `REVIEW_EVENT` its command is handed, so a caller reading
+# either knows the other.
+CHILD_LAUNCH = "child-launch"
+REVIEW_START = "review-start"
+AXIS_END = "axis-end"
+REVIEW_END = "review-end"
+HOOK_POINTS = {
+    CHILD_LAUNCH: "once per launched reviewer process or pane",
+    REVIEW_START: (
+        "once per invocation, after preparation succeeds and before any Lane opens"
+    ),
+    AXIS_END: "once per started axis, on every exit path that axis can take",
+    REVIEW_END: "once per invocation, on every exit path",
+}
+HOOK_TIMEOUT_SECONDS = 30
+EVENT_VAR = "REVIEW_EVENT"
+COST_DETAIL_VAR = "REVIEW_COST_DETAIL"
+# One environment variable per counter, spelled from the counter itself so the
+# two cannot drift apart.
+COUNTER_VARS = {name: f"REVIEW_{name.upper()}_TOKENS" for name in COUNTERS}
+# Every variable some point sets. All of them leave the inherited environment
+# before this review's own facts go in, so a review run from inside another
+# review's hook cannot pass that review's facts off as this one's — the counters
+# and `REVIEW_COST_DETAIL` above all, which are answers to the same question and
+# never both true. A caller's own variables, this prefix included, are untouched.
+HOOK_VARS = frozenset({
+    EVENT_VAR,
+    COST_DETAIL_VAR,
+    "REVIEW_CHILD_CWD",
+    "REVIEW_CHILD_TMUX_TARGET",
+    "REVIEW_REVIEWER",
+    "REVIEW_MODEL",
+    "REVIEW_AXES",
+    "REVIEW_AXIS",
+    "REVIEW_STATUS",
+    "REVIEW_SESSION",
+    *COUNTER_VARS.values(),
+})
+# What a review that never reached a result of its own is: the result contract's
+# spelling for a failure, which is what both status-carrying points use.
+FAILED_STATUS = "failed"
+NO_THREAD_DETAIL = "this axis started no thread to read a cost from"
 # Where Codex keeps the rollout of every thread it has run, one JSONL file per
 # thread under a dated tree, each filename ending in the thread's own id.
 CODEX_HOME_ENV_VAR = "CODEX_HOME"
@@ -105,85 +142,132 @@ class NoLiveSessionError(RuntimeError):
     """No live review session belongs to the caller's owner identity."""
 
 
-class ReviewEvent:
-    """The pair of `review` lines one bridge call leaves in the run's machine log.
+def hook_command(args, point):
+    """The command this caller handed in for one point, or empty where it handed none."""
+    return getattr(args, hook_destination(point), None) or ""
 
-    Each axis thread that actually starts also leaves its own `session-cost`
-    line, so every line names one truthful session lineage and resolved model.
 
-    Both the log path and the ticket are optional everywhere they appear, and a
-    call given neither writes nothing: `--log` is optional on dispatch, and a run
-    without one still reviews normally.
+def hook_destination(point):
+    """The attribute one point's command arrives under, from the point's own name."""
+    return "on_" + point.replace("-", "_")
+
+
+def run_hook(args, point, **facts):
+    """Run the caller's command for one point of this review, if it handed one in.
+
+    The command is the caller's own, so it may carry whatever correlation token
+    that caller needs; all this adds is facts this review owns, in the
+    environment, plus the point's name in `REVIEW_EVENT`. It runs once, in the
+    reviewed working directory, with its output discarded and a bound on how long
+    it may take.
+
+    Observation must never change what a review returns, so a command that fails,
+    times out, or is not installed is swallowed here: the caller's exit status and
+    the JSON object it reads are the same either way.
     """
+    command = hook_command(args, point)
+    if not command:
+        return
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in HOOK_VARS
+    }
+    environment[EVENT_VAR] = point
+    environment.update(facts)
+    try:
+        subprocess.run(
+            command,
+            shell=True,
+            cwd=args.cwd,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HOOK_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
 
-    def __init__(self, log, ticket, model, vendor=REVIEW_VENDOR):
-        # Absolute where the path enters, before it is forwarded to the writer
-        # (ADR-0007), so what this bridge records cannot be moved by anyone's
-        # working directory. Symlinks are left alone: the operator's own name for
-        # the run directory is the one to log under.
-        self.log = os.path.abspath(log) if log else None
-        self.ticket = ticket
-        # Vendor then model, separated by a space: the annotation row prints the
-        # field verbatim after collapsing whitespace, so this is the spelling the
-        # dashboard shows.
-        self.lane = " ".join(part for part in (vendor, model) if part)
-        # A review leaves one cost line per started axis thread, whether it came
-        # back with figures or with the reason there are none.
-        self.costed = False
 
-    def write(self, state):
-        """Append one end of this review; returns nothing, and fails at nothing.
+def hook_child_launch(args, tmux_target=""):
+    """Name the reviewer child that just launched, and the window it runs in."""
+    run_hook(
+        args,
+        CHILD_LAUNCH,
+        REVIEW_CHILD_CWD=str(args.cwd),
+        REVIEW_CHILD_TMUX_TARGET=tmux_target,
+    )
 
-        A review that succeeded must not be reported as a failure because its
-        bookkeeping could not be written, so every way the append can go wrong is
-        swallowed here: the caller's exit status and the JSON object the reviewed
-        child reads are the same either way.
-        """
-        if not self.log or not self.ticket:
-            return
-        try:
-            subprocess.run(
-                [
-                    sys.executable, str(MACHINE_LOG), "--log", str(self.log),
-                    "review", "--ticket", str(self.ticket), "--lane", self.lane,
-                    "--state", state,
-                ],
-                capture_output=True, text=True, check=False,
-            )
-        except OSError:
-            pass
 
-    def cost(self, session, model, counters, detail):
-        """Append this review's one `session-cost` line; returns nothing, and fails at nothing.
+def hook_review_start(args, model):
+    """Name the review about to open: its reviewer, its model, and its axes."""
+    run_hook(
+        args,
+        REVIEW_START,
+        REVIEW_REVIEWER=REVIEW_VENDOR,
+        REVIEW_MODEL=model or "",
+        REVIEW_AXES=",".join(requested_axes(args)),
+    )
 
-        Lane-tagged, so a review's spend is told apart from the implementing
-        child's, and written through the log's own writer, which holds the
-        figures-or-diagnosis rule: `counters` are the four disjoint totals, or
-        `None` with `detail` saying why nobody could tell.
 
-        Accounting must never fail a review, so every way this can go wrong is
-        swallowed here, exactly as the `review` pair's write is.
-        """
-        if not self.log or not self.ticket:
-            return
-        self.costed = True
-        command = [
-            sys.executable, str(MACHINE_LOG), "--log", str(self.log),
-            "session-cost", "--ticket", str(self.ticket),
-            "--executor", REVIEW_VENDOR, "--model", model or "", "--lane", self.lane,
-        ]
-        if session:
-            command += ["--session", str(session)]
-        if counters is None:
-            command += ["--detail", detail]
-        else:
-            for name in COUNTERS:
-                command += [f"--{name.replace('_', '-')}-tokens", str(counters[name])]
-            command += ["--total-tokens", str(sum(counters.values()))]
-        try:
-            subprocess.run(command, capture_output=True, text=True, check=False)
-        except OSError:
-            pass
+def cost_facts(counters, detail):
+    """One axis's spend: the four disjoint counters, or why there are none.
+
+    A figure invented out of a contradiction is worse than the diagnosis that
+    says the rollout could not be read, so the two never arrive together.
+    """
+    if counters is None:
+        return {COST_DETAIL_VAR: detail or ""}
+    return {COUNTER_VARS[name]: str(counters[name]) for name in COUNTERS}
+
+
+def hook_axis_end(args, axis, status, session, thread_id):
+    """End one axis: how it finished, and what its own thread spent.
+
+    The model reported is the one the thread resolved to and nothing else: the
+    alias the caller asked for is already theirs to remember. An axis that never
+    started a thread has no rollout to read, and says so.
+    """
+    if thread_id is None:
+        counters, model, detail = None, None, NO_THREAD_DETAIL
+    else:
+        counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
+    run_hook(
+        args,
+        AXIS_END,
+        REVIEW_AXIS=axis,
+        REVIEW_STATUS=status,
+        REVIEW_SESSION=session or "",
+        REVIEW_MODEL=model or "",
+        **cost_facts(counters, detail),
+    )
+
+
+def end_axis_run(args, axis, result, run):
+    """End an axis this review drove to a result of its own."""
+    hook_axis_end(
+        args,
+        axis,
+        result["status"],
+        result["reviewSessionId"],
+        run.thread_id if isinstance(run, AxisFailure) else run.state["threadId"],
+    )
+
+
+def end_launched_axis(args, axis):
+    """End an axis that opened its pane and never got a result of its own.
+
+    A sibling axis failing to launch tears this one down before it could report
+    anything, and the point still owes the caller one end for the child it was
+    told about.
+    """
+    hook_axis_end(args, axis, FAILED_STATUS, None, None)
+
+
+def hook_review_end(args, status):
+    """Close this review out, whichever way it left."""
+    run_hook(args, REVIEW_END, REVIEW_STATUS=status)
 
 
 def codex_sessions_root(environment=None):
@@ -211,7 +295,7 @@ def find_rollout(root, thread_id):
 
 
 def rollout_counters(usage):
-    """Codex's cumulative counters as the machine log's four disjoint ones, or `None`.
+    """Codex's cumulative counters as the four disjoint ones an axis ends with, or `None`.
 
     Codex counts its cached tokens inside `input_tokens`, so they come back out
     here, and its reasoning tokens inside `output_tokens`, where they stay: the
@@ -249,7 +333,7 @@ def harvest_rollout(root, thread_id):
 
     A read of a file the lane already wrote, so it costs no model token and drives
     nothing. `counters` is `None` when the figures could not be read, and `detail`
-    then says why, which is the diagnosis the `session-cost` line carries instead.
+    then says why, which is the diagnosis the axis ends with instead.
 
     The **last** cumulative count is the answer: every turn appends one, and a
     resumed round two appends to the same file, so one read covers a whole review
@@ -301,32 +385,6 @@ def harvest_rollout(root, thread_id):
     if counters is None:
         return None, model, f"{path} reports a token count that does not hold together"
     return counters, model, None
-
-
-def resumed_thread_id(args):
-    """The thread a resumed call was about to review, or `None` when it names none.
-
-    A failed round still spent tokens in that thread, and the id is what keeps its rollout out of
-    a same-vendor child's figures, so the diagnosis row names it wherever the record survives.
-    """
-    if not getattr(args, "resume_session", None):
-        return None
-    try:
-        return SessionStore().read(args.resume_session).get("threadId")
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-
-def record_review_cost(review, thread_id):
-    """Leave this review's one `session-cost` line, harvested from its own rollout.
-
-    The model recorded is the one the thread resolved to and nothing else: the
-    caller's alias is already in the lane when every requested axis names the
-    same one. Mixed-model calls leave the lane vendor-only; each thread's model
-    field remains the per-axis truth either way.
-    """
-    counters, model, detail = harvest_rollout(codex_sessions_root(), thread_id)
-    review.cost(thread_id, model, counters, detail)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -933,10 +991,16 @@ def read_spec(repo_root, reference):
 
 
 def prepare_review(args):
+    """Everything every requested axis needs, or the failure that there is not.
+
+    Each requested axis's brief is built here rather than where its Lane opens,
+    so an axis that cannot be briefed fails preparation — before this review is
+    reported started, and before any pane exists to tear down.
+    """
     repo_root = canonical_worktree_root(args.cwd)
     source, contents = read_spec(repo_root, args.spec)
     navigation_block = read_code_graph_navigation(repo_root, args.base)
-    return ReviewPreparation(
+    preparation = ReviewPreparation(
         fixed_point=args.base,
         resolved_fixed_point=args.resolved_base,
         commit_list=read_commit_list(args.cwd, args.base),
@@ -946,6 +1010,9 @@ def prepare_review(args):
         navigation_block=navigation_block,
         code_graph_used=navigation_block is not None,
     )
+    for axis in requested_axes(args):
+        preparation.brief(axis)
+    return preparation
 
 
 def preparation_report(args):
@@ -1013,15 +1080,6 @@ def terminate_process(process):
         process.wait(timeout=3)
 
 
-def child_session_env(hook):
-    """Environment for the Codex processes this bridge spawns.
-
-    A review child is a child launch like any other, so it carries whatever the
-    project's on-child-launch hook adds — nothing, until a project configures it.
-    """
-    return hook.child_env()
-
-
 def model_config_overrides(args):
     """`-c` overrides pinning model/effort, or nothing when neither was chosen.
 
@@ -1060,7 +1118,7 @@ def validate_resume_axis(args, state):
 
 
 def resume_state_for_review(args):
-    """Read and validate a resumed handle before its machine-log `running` event."""
+    """Read and validate a resumed handle before this review is reported started."""
     if not args.resume_session:
         return None
     state = SessionStore().read(args.resume_session)
@@ -1068,13 +1126,21 @@ def resume_state_for_review(args):
     return state
 
 
-def review_event_model(args, resume_state=None):
-    """Return the model shared by requested axes, including a resumed axis's saved pin."""
+def requested_axes(args):
+    """The axes this call asked for, in the order a review runs them."""
+    return ("standards", "spec") if args.axis == "both" else (args.axis,)
+
+
+def review_start_model(args, resume_state=None):
+    """The model every requested axis shares, including a resumed axis's saved pin.
+
+    Axes pinned to different models share none, and a review that starts on more
+    than one model can name no single one truthfully.
+    """
     if resume_state is not None:
         selected = resolve_axis_choice(args, resume_state["axis"], "model")
         return selected if selected is not None else resume_state.get("model")
-    axes = ("standards", "spec") if args.axis == "both" else (args.axis,)
-    models = [resolve_axis_choice(args, axis, "model") for axis in axes]
+    models = [resolve_axis_choice(args, axis, "model") for axis in requested_axes(args)]
     return models[0] if all(model == models[0] for model in models[1:]) else None
 
 
@@ -1083,7 +1149,6 @@ def run_pane(args):
     socket_path = runtime_dir / "app-server.sock"
     log_path = runtime_dir / "app-server.log"
     log_file = log_path.open("a", encoding="utf-8")
-    child_env = child_session_env(launch_hook.load_hook(args.cwd))
     app_server_command = [
         "codex",
         "app-server",
@@ -1103,7 +1168,6 @@ def run_pane(args):
     app_server = subprocess.Popen(
         app_server_command,
         cwd=args.cwd,
-        env=child_env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -1264,8 +1328,13 @@ def launch_pane(args, runtime_dir):
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "tmux split-window failed")
-    pane_id = result.stdout.strip()
-    launch_hook.load_hook(args.cwd).run(args.cwd, tmux_target=pane_id)
+    return result.stdout.strip()
+
+
+def open_child_pane(args, runtime_dir):
+    """Open this axis's pane, and tell the caller's hook which child it got."""
+    pane_id = launch_pane(args, runtime_dir)
+    hook_child_launch(args, tmux_target=pane_id)
     return pane_id
 
 
@@ -1639,7 +1708,7 @@ def launch_axis(args, axis, tmux_target, split_direction):
     prompt = build_prompt(axis_args, bridge_id)
     runtime_dir = make_runtime(prompt)
     try:
-        pane_id = launch_pane(axis_args, runtime_dir)
+        pane_id = open_child_pane(axis_args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -1717,8 +1786,6 @@ async def run_new_review(args, owner, store):
 
 
 async def run_new_reviews(args, owner, store):
-    if args.preparation is not None:
-        args.preparation.brief("spec")
     launches = []
     try:
         standards = launch_axis(
@@ -1732,6 +1799,7 @@ async def run_new_reviews(args, owner, store):
     except Exception:
         for launch in launches:
             cleanup_pane(launch.pane_id, launch.runtime_dir)
+            end_launched_axis(args, launch.args.axis)
         raise
 
     completed = await asyncio.gather(
@@ -1762,7 +1830,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
     runtime_dir = make_runtime(prompt)
     args.tmux_target = owner.origin_pane
     try:
-        pane_id = launch_pane(args, runtime_dir)
+        pane_id = open_child_pane(args, runtime_dir)
     except Exception:
         shutil.rmtree(runtime_dir, ignore_errors=True)
         raise
@@ -1805,7 +1873,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
 
 
 async def run_existing_review(args, owner, store):
-    state = getattr(args, "_resume_state", None)
+    state = args.resume_state
     if state is None:
         state = store.read(args.resume_session)
     validate_resume_axis(args, state)
@@ -1894,7 +1962,7 @@ async def run_recovered_reviews(args, owner, store):
     )
 
 
-async def run_bridge(args, review=None):
+async def run_bridge(args):
     if not pathlib.Path(args.cwd).is_dir():
         raise RuntimeError(f"Working directory does not exist: {args.cwd}")
     probe = args.probe or args.browser_probe
@@ -1904,6 +1972,9 @@ async def run_bridge(args, review=None):
         args.preparation = prepare_review(args)
     elif probe:
         args.preparation = None
+    # Preparation has succeeded and no Lane has opened yet, which is what this
+    # point promises: a review that failed before here never started.
+    hook_review_start(args, review_start_model(args, args.resume_state))
     owner = resolve_owner(args)
     store = SessionStore()
     # The lock stays process-scoped: it serialises concurrent calls from one
@@ -1953,18 +2024,10 @@ async def run_bridge(args, review=None):
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result
-    if review is not None:
-        # Once the turn has settled, so the rollout's last cumulative count is
-        # the whole of what this review spent.
-        for run in runs.values():
-            state = run.state
-            thread_id = (
-                run.thread_id
-                if isinstance(run, AxisFailure)
-                else state["threadId"]
-            )
-            if thread_id is not None:
-                record_review_cost(review, thread_id)
+    # Once every turn has settled, so each rollout's last cumulative count is the
+    # whole of what its axis spent.
+    for axis, run in runs.items():
+        end_axis_run(args, axis, results[axis], run)
     if args.recover_session:
         states = [run.state for run in runs.values()]
         preparation = next(
@@ -1986,6 +2049,7 @@ async def run_bridge(args, review=None):
         "preparation": preparation,
     }
     print(json.dumps(output, ensure_ascii=False))
+    args.status = output["status"]
     succeeded = output["status"] == "completed"
     return 0 if succeeded else 1
 
@@ -2043,18 +2107,13 @@ def build_parser():
             "there is none)"
         ),
     )
-    parser.add_argument(
-        "--machine-log",
-        help="the run's machine log, where this review's `review` event pair is "
-             "appended; the pair is written only when this and --ticket are "
-             "both given",
-    )
-    parser.add_argument(
-        "--ticket",
-        help="the ticket this review is for, as the machine log spells it; the "
-             "review's event pair is written only when this and --machine-log "
-             "are both given",
-    )
+    for point, fires in HOOK_POINTS.items():
+        parser.add_argument(
+            f"--on-{point}",
+            help=f"command to run {fires}, in the reviewed working directory "
+                 f"with this review's facts in its environment (default: "
+                 f"nothing runs)",
+        )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
@@ -2091,40 +2150,29 @@ def main():
         args = build_pane_parser().parse_args(sys.argv[2:])
         return run_pane(args)
     args = parse_args()
+    # A review no result was ever reached for is a failed one, until the result
+    # itself says otherwise.
+    args.status = FAILED_STATUS
+    args.resume_state = None
+    # The end point straddles the whole call, so it fires on every exit path this
+    # bridge controls — a review that failed, timed out, or raised included,
+    # including one that failed before any Lane opened.
     try:
-        args._resume_state = resume_state_for_review(args)
-    except (OSError, RuntimeError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
-    # The pair straddles the whole call, so the `returned` line is written on
-    # every exit path this bridge controls — a review that failed, timed out, or
-    # raised included. A row claiming a review that is no longer running is worse
-    # than no row at all.
-    review = ReviewEvent(
-        args.machine_log,
-        args.ticket,
-        review_event_model(args, args._resume_state),
-    )
-    review.write("running")
-    try:
-        return asyncio.run(run_bridge(args, review))
-    except NoLiveSessionError as error:
-        print(str(error), file=sys.stderr)
-        return NO_LIVE_SESSION_EXIT
-    except (AppServerError, OSError, RuntimeError) as error:
-        print(str(error), file=sys.stderr)
-        return 1
+        try:
+            args.resume_state = resume_state_for_review(args)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        try:
+            return asyncio.run(run_bridge(args))
+        except NoLiveSessionError as error:
+            print(str(error), file=sys.stderr)
+            return NO_LIVE_SESSION_EXIT
+        except (AppServerError, OSError, RuntimeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
     finally:
-        # A resumed lineage may spend before the call returns enough state to
-        # harvest it. A first review that never started a thread has no session
-        # cost line: there is no lineage or spend to name truthfully.
-        resume_thread = resumed_thread_id(args)
-        if not review.costed and resume_thread:
-            review.cost(
-                resume_thread, None, None,
-                "this review returned no result to read a cost from",
-            )
-        review.write("returned")
+        hook_review_end(args, args.status)
 
 
 if __name__ == "__main__":
