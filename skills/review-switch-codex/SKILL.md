@@ -4,8 +4,8 @@ description: Run a code review on the Codex lane — an isolated interactive Cod
 allowed-tools: Read, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(python3 ~/.claude/skills/review-switch-codex/scripts/tui_review_bridge.py:*)
 ---
 
-The Codex Lane is a thin coordinator. The Bridge owns review preparation: it pins the three-dot
-diff, reads the spec and standards, consults the optional code graph, and writes each Axis Brief.
+The Codex Lane is a thin coordinator. The Bridge owns review preparation: it pins the Review
+Scope, reads the spec and standards, consults the optional code graph, and writes each Axis Brief.
 The Lane's only input work is the spec-reference discovery below. Hand the Bridge references,
 then apply the Rounds contract to its result.
 
