@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Preparing a review: the Review Scope, the spec, the graph, and the Axis Brief."""
 
-import argparse
 import json
 import os
 import pathlib
@@ -10,6 +9,21 @@ import unittest
 from unittest import mock
 
 from bridge_harness import FakePaneTestCase, base_args, load_bridge
+
+# Every `gh` double below is a response captured from real `gh` 2.88.1 on
+# 2026-08-26, so that no test here can pass against output `gh` never
+# produces (#30). The last is the same issue read the way the defect read
+# it: rc=0, the comment thread, and no body at all.
+#   gh issue view 23 --json number,title,body,comments
+#   gh issue view 3 --json number,title,body,comments
+#   gh issue view 14020 --repo cli/cli --json number,title,body,comments
+#   gh issue view 11230 --repo cli/cli --json number,title,body,comments
+#   gh issue view 23 --comments
+GH_ISSUE_WITH_A_COMMENT = '{"body":"## Parent\\n\\nSpec: #11\\n\\n## What to build\\n\\nA caller learns from every result what it is permitted to do next, and cannot exceed the cap even if it tries. This is the only channel that reaches a Codex child, which has no skill of ours to read.\\n\\n## Acceptance criteria\\n\\n- [ ] Every result names the next permitted action: fix and stop, fix then one re-review, or escalate.\\n- [ ] A standards axis is refused any resume. A spec axis is granted exactly one, and a second is refused. A refusal reports escalate.\\n- [ ] The cap is per lineage: starting a fresh review is always available and is unaffected by a lineage that reached its cap.\\n- [ ] The result states the permitted action only and never states what escalation is — that stays the caller\'s.\\n- [ ] The cap is asserted in exactly one test file.\\n\\n## Blocked by\\n\\n- #22\\n\\n## Routing\\n\\nWorkflow: tdd\\nExecutor: claude\\nModel: claude-opus-5\\nEffort: medium\\nReview: codex gpt-5.6-luna max\\nReasons: Enforcing the cap and reporting the next permitted action are new behaviour -> tdd; next is the contract callers code against -> core; it is a per-lineage per-axis round state machine -> complex; review overridden by the user at confirmation.\\n","comments":[{"id":"IC_kwDOT4SkBc8AAAABQTzpew","author":{"login":"okqixiaobao727-design"},"authorAssociation":"OWNER","body":"/crew crewtask/2","createdAt":"2026-08-24T00:49:01Z","includesCreatedEdit":false,"isMinimized":false,"minimizedReason":"","reactionGroups":[],"url":"https://github.com/okqixiaobao727-design/review-switch/issues/23#issuecomment-5389478267","viewerDidAuthor":true}],"number":23,"title":"The Rounds Contract is enforced by the Bridge and reported as the next permitted action"}'
+GH_ISSUE_WITHOUT_COMMENTS = '{"body":"## Summary\\n\\nState files written per review are only deleted when the turn **failed**; successful reviews leave their files behind forever. Measured 2026-08-18: `~/.claude/state/code-review-tui/` held **292 files (600 KB)** — now 294 — and `~/.claude/state/code-review-claude/` held **38 files (380 KB, largest 22 KB)**. Small in bytes, but the whole directory is globbed on every review launch, so the scan cost grows without bound.\\n\\nHand-off of the review-state part of agentcrew-dev-skills#83\'s residue inventory (item 6); the code paths are this repo\'s.\\n\\n## Evidence\\n\\n- `tui_review_bridge.py:984-986` — state file deleted **only when the turn failed**; the success path never unlinks.\\n- `tui_review_bridge.py:276` — the entire state directory is globbed on every review launch.\\n- `claude_review_bridge.py:237-249` — log opened with `open(\\"a\\")` per round, never rotated or deleted.\\n\\n## Possible directions\\n\\n1. Delete the state file on the success path too (mirror of the failure path).\\n2. Age-based sweep at launch: while globbing the directory anyway, unlink files older than a named retention window.\\n3. Rotate or cap the append-only claude-lane logs.","comments":[],"number":3,"title":"Review state files are never reaped on success: ~/.claude/state/code-review-tui holds 294 files and the whole dir is globbed on every launch"}'
+GH_ISSUE_WITH_ONLY_A_COMMENT = '{"body":"","comments":[{"id":"IC_kwDODKw3uc8AAAABMgBcTA","author":{"login":"github-actions"},"authorAssociation":"CONTRIBUTOR","body":"This issue may have been opened accidentally. I\'m going to close it now, but feel free to open a new issue with a more descriptive title.","createdAt":"2026-07-30T16:59:10Z","includesCreatedEdit":false,"isMinimized":false,"minimizedReason":"","reactionGroups":[],"url":"https://github.com/cli/cli/issues/14020#issuecomment-5133851724","viewerDidAuthor":false},{"id":"IC_kwDODKw3uc8AAAABMgBeew","author":{"login":"github-actions"},"authorAssociation":"CONTRIBUTOR","body":"Thank you for taking the time to create this issue.\\n\\nWe\'ve automatically reviewed this issue and suspect it as potentially inauthentic or spam-like content. As a result, we\'re closing this issue.\\n\\n**If this was closed by mistake**, please don\'t hesitate to reach out to us by commenting on this issue with additional context.\\n\\nWe appreciate your understanding and apologize if this action was taken in error. Our automated systems help us manage the large volume of issues we receive, but we know they\'re not perfect.\\n","createdAt":"2026-07-30T16:59:14Z","includesCreatedEdit":false,"isMinimized":false,"minimizedReason":"","reactionGroups":[],"url":"https://github.com/cli/cli/issues/14020#issuecomment-5133852283","viewerDidAuthor":false}],"number":14020,"title":"x"}'
+GH_ISSUE_WITHOUT_A_BODY_OR_COMMENT = '{"body":"","comments":[],"number":11230,"title":"Brew install"}'
+GH_ISSUE_THE_COMMENTS_FLAG_WAY = 'author:\tokqixiaobao727-design\nassociation:\towner\nedited:\tfalse\nstatus:\tnone\n--\n/crew crewtask/2\n--\n'
 
 
 class AxisBriefTests(unittest.TestCase):
@@ -516,29 +530,53 @@ class PreparationTests(FakePaneTestCase):
 
         self.assertEqual(self.codex.launched_panes, [])
 
-    def test_an_unreadable_spec_fails_before_a_pane_opens(self):
+    def test_an_unreadable_spec_degrades_instead_of_stopping_the_review(self):
         (self.worktree / "invalid-spec.md").write_bytes(b"\xff")
+        self.codex.finish("no findings")
 
-        with mock.patch.object(
-            self.bridge,
-            "launch_pane",
-            side_effect=AssertionError("a pane opened"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "spec file could not be read"):
-                self.run_bridge(self.args(spec="invalid-spec.md", axis="spec"))
+        code, output = self.run_bridge(
+            self.args(spec="invalid-spec.md", axis="spec")
+        )
 
-        self.assertEqual(self.codex.panes, [])
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: invalid-spec.md"
+        )
+        self.assertIn("Reference as given: invalid-spec.md", prompt)
+        self.assertIn("spec file could not be read", prompt)
 
-    def test_a_missing_spec_path_is_not_reported_as_an_issue(self):
-        with mock.patch.object(
-            self.bridge,
-            "launch_pane",
-            side_effect=AssertionError("a pane opened"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "spec file not found"):
-                self.run_bridge(self.args(spec="docs/missing.md", axis="spec"))
+    def test_a_missing_spec_path_degrades_and_is_never_sent_to_github(self):
+        calls = self.fake_gh(stdout=GH_ISSUE_WITHOUT_COMMENTS)
+        self.codex.finish("no findings")
 
-        self.assertEqual(self.codex.panes, [])
+        code, output = self.run_bridge(
+            self.args(spec="docs/missing.md", axis="spec")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: docs/missing.md"
+        )
+        self.assertIn("Reference as given: docs/missing.md", prompt)
+        self.assertIn("Failure: spec file not found", prompt)
+
+    def test_an_empty_spec_file_counts_as_not_fetched(self):
+        (self.worktree / "blank-spec.md").write_text("   \n\n", encoding="utf-8")
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(
+            self.args(spec="blank-spec.md", axis="spec")
+        )
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: blank-spec.md"
+        )
+        self.assertIn("spec file is empty", prompt)
 
     def test_a_spec_run_sends_only_the_spec_axis_brief_to_one_pane(self):
         fixed_point = self.fixed_point
@@ -563,32 +601,111 @@ class PreparationTests(FakePaneTestCase):
         ):
             self.assertNotIn(excluded, prompt)
 
-    def test_an_issue_spec_reaches_the_spec_axis_with_its_comments(self):
-        real_run = subprocess.run
-
-        def run(command, **kwargs):
-            if command[:3] == ["gh", "issue", "view"]:
-                self.assertEqual(command, ["gh", "issue", "view", "17", "--comments"])
-                return argparse.Namespace(
-                    returncode=0,
-                    stdout="Issue title\n\nIssue body\n\nFirst comment\n",
-                    stderr="",
-                )
-            return real_run(command, **kwargs)
-
+    def test_an_issue_spec_reaches_the_spec_axis_with_its_body_and_comments(self):
+        self.fake_gh(
+            stdout=GH_ISSUE_WITH_A_COMMENT,
+            plain_stdout=GH_ISSUE_THE_COMMENTS_FLAG_WAY,
+        )
         self.codex.finish("no findings")
-        with mock.patch.object(self.bridge.subprocess, "run", side_effect=run):
-            code, output = self.run_bridge(
-                self.args(spec="17", axis="spec")
-            )
 
-        prompt = self.codex.started_turns[0]["input"][0]["text"].split("\n", 1)[1]
+        code, output = self.run_bridge(self.args(spec="23", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
-        self.assertEqual(output["preparation"]["specSource"], "17")
+        self.assertEqual(output["preparation"]["specSource"], "23")
         self.assertIn(
-            "Spec:\nIssue title\n\nIssue body\n\nFirst comment\n\nReport:",
+            "#23 The Rounds Contract is enforced by the Bridge and reported as "
+            "the next permitted action",
             prompt,
         )
+        self.assertIn("A caller learns from every result", prompt)
+        self.assertIn(
+            "Comment from okqixiaobao727-design:\n/crew crewtask/2", prompt
+        )
+
+    def test_an_issue_without_comments_reaches_the_spec_axis_with_its_body(self):
+        self.fake_gh(stdout=GH_ISSUE_WITHOUT_COMMENTS)
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="#3", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["specSource"], "#3")
+        self.assertIn(
+            "#3 Review state files are never reaped on success", prompt
+        )
+        self.assertIn("State files written per review", prompt)
+        self.assertNotIn("Comment from", prompt)
+
+    def test_an_issue_whose_requirements_are_only_in_a_comment_reaches_the_brief(self):
+        self.fake_gh(stdout=GH_ISSUE_WITH_ONLY_A_COMMENT)
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="14020", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["specSource"], "14020")
+        self.assertIn(
+            "Comment from github-actions:\nThis issue may have been opened "
+            "accidentally.",
+            prompt,
+        )
+        self.assertNotIn("could not be fetched", prompt)
+
+    def test_an_issue_url_is_fetched_rather_than_read_as_a_file(self):
+        calls = self.fake_gh(stdout=GH_ISSUE_WITH_A_COMMENT)
+        reference = (
+            "https://github.com/okqixiaobao727-design/review-switch/issues/23"
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec=reference, axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(output["preparation"]["specSource"], reference)
+        self.assertIn("A caller learns from every result", prompt)
+
+    def test_a_gh_failure_degrades_the_spec_axis_instead_of_stopping_it(self):
+        self.fake_gh(
+            returncode=1,
+            stderr=(
+                "GraphQL: Could not resolve to an issue or pull request with "
+                "the number of 99999. (repository.issue)\n"
+            ),
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="99999", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: 99999"
+        )
+        self.assertIn("Reference as given: 99999", prompt)
+        self.assertIn(
+            "Could not resolve to an issue or pull request with the number of "
+            "99999",
+            prompt,
+        )
+        self.assertIn("Do not infer", prompt)
+
+    def test_an_issue_with_neither_body_nor_comment_counts_as_not_fetched(self):
+        self.fake_gh(stdout=GH_ISSUE_WITHOUT_A_BODY_OR_COMMENT)
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="11230", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: 11230"
+        )
+        self.assertIn("the issue has no body and no comments", prompt)
 
 
 class ReviewScopeTests(FakePaneTestCase):

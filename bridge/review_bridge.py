@@ -1043,32 +1043,112 @@ def find_standards_files(repo_root):
     return tuple(documented)
 
 
+UNFETCHED_SPEC_TEMPLATE = """The spec could not be fetched, so this review has no requirements to check against.
+Reference as given: {reference}
+Failure: {detail}
+Report exactly that: the spec was unreachable, naming the reference and the failure above. Do not infer from the diff, the commits, or the code what the spec asked for, and report no other spec finding."""
+
+
+def spec_not_fetched(reference, detail):
+    """Every way a spec goes missing, as the one thing that happens next.
+
+    A reference that cannot be fetched costs the caller a weaker review, never
+    the review: the Spec slot carries the reference and the failure, and the
+    source records that the spec was not fetched, so a spec-less review is told
+    apart from an ordinary one without re-deriving it (#30).
+    """
+    return (
+        f"not fetched: {reference}",
+        UNFETCHED_SPEC_TEMPLATE.format(reference=reference, detail=detail),
+    )
+
+
+#: What the Bridge asks `gh` for. Naming the fields is what makes "this issue
+#: states no requirements" distinguishable from "the requirements were never
+#: requested" — `--comments` replaces the body with the thread rather than
+#: adding to it, and its return code says nothing about either (#30).
+ISSUE_SPEC_FIELDS = "number,title,body,comments"
+
+
+def build_issue_spec(issue):
+    """An issue as the Spec slot reads it, or nothing when it states nothing.
+
+    The layout is the Bridge's, assembled from the fields it asked for, so what
+    a Lane reads is testable here rather than owned by `gh`.
+    """
+    body = (issue["body"] or "").strip()
+    comments = [
+        comment
+        for comment in issue["comments"]
+        if (comment["body"] or "").strip()
+    ]
+    if not body and not comments:
+        return None
+    sections = [f"#{issue['number']} {issue['title']}".strip()]
+    if body:
+        sections.append(body)
+    for comment in comments:
+        author = (comment.get("author") or {}).get("login") or "unknown"
+        sections.append(f"Comment from {author}:\n{comment['body'].strip()}")
+    return "\n\n".join(sections)
+
+
+def read_issue_spec(repo_root, reference):
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "view", reference, "--json", ISSUE_SPEC_FIELDS],
+            cwd=repo_root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        return spec_not_fetched(reference, f"gh could not be run: {error}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "gh issue view failed"
+        return spec_not_fetched(reference, f"gh issue view failed: {detail}")
+    try:
+        contents = build_issue_spec(json.loads(result.stdout))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return spec_not_fetched(
+            reference, "gh issue view returned output that could not be read"
+        )
+    if contents is None:
+        return spec_not_fetched(reference, "the issue has no body and no comments")
+    return reference, contents
+
+
+def read_spec_file(reference, candidate):
+    try:
+        contents = candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        return spec_not_fetched(
+            reference, f"spec file could not be read: {error}"
+        )
+    if not contents.strip():
+        return spec_not_fetched(reference, "spec file is empty")
+    return reference, contents
+
+
 def read_spec(repo_root, reference):
+    """The spec's text, or the failure a Lane is handed in its place.
+
+    Only a reference the caller never gave leaves the contents empty; every
+    other outcome is text. So `None` keeps exactly one meaning — the Spec axis
+    was asked for without a spec — and preparation still fails on that alone.
+    """
     if reference is None:
         return "not provided", None
+    if reference.startswith(("http://", "https://")):
+        return read_issue_spec(repo_root, reference)
     candidate = pathlib.Path(reference)
     if not candidate.is_absolute():
         candidate = pathlib.Path(repo_root) / candidate
     if candidate.is_file():
-        try:
-            return reference, candidate.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise RuntimeError(
-                f"spec file could not be read: {reference}: {error}"
-            ) from error
+        return read_spec_file(reference, candidate)
     if "/" in reference or candidate.suffix:
-        raise RuntimeError(f"spec file not found: {reference}")
-    result = subprocess.run(
-        ["gh", "issue", "view", reference, "--comments"],
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or "gh issue view failed"
-        raise RuntimeError(f"spec issue could not be read: {reference}: {detail}")
-    return reference, result.stdout
+        return spec_not_fetched(reference, "spec file not found")
+    return read_issue_spec(repo_root, reference)
 
 
 def prepare_review(args):

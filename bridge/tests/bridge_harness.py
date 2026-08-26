@@ -596,6 +596,25 @@ class DriverKilled(BaseException):
     """The process vanished, so in-process exception cleanup cannot run."""
 
 
+def gh_requested_fields(captured, command):
+    """A captured `gh --json` response, cut to the fields this command named.
+
+    `gh` returns exactly the fields asked for and no others, so a caller that
+    asks for the wrong ones must not be handed the right ones by the fake.
+    """
+    if not captured:
+        return captured
+    payload = json.loads(captured)
+    requested = command[command.index("--json") + 1].split(",")
+    missing = [field for field in requested if field not in payload]
+    if missing:
+        raise KeyError(
+            f"the captured `gh` response models no {', '.join(missing)}; "
+            "capture one that does rather than inventing the field here"
+        )
+    return json.dumps({field: payload[field] for field in requested})
+
+
 class FakePaneTestCase(unittest.TestCase):
     """One stubbed Codex pane, driven through the bridge's own entry points.
 
@@ -706,6 +725,43 @@ class FakePaneTestCase(unittest.TestCase):
         }
         values.update(overrides)
         return base_args(**values)
+
+    def fake_gh(self, returncode=0, stdout="", stderr="", plain_stdout=""):
+        """Stand `gh issue view` up at the process boundary, faithful to its flags.
+
+        `stdout` answers the `--json` form, cut down to the fields that form
+        asked for, and `plain_stdout` answers every other. Both halves of that
+        are the defect itself: `--comments` returns the thread without the body
+        at rc=0, and `--json` returns the named fields and no others. Asking
+        the wrong way therefore fails a test on the brief the Lane receives,
+        which is where it should fail — no test here asserts how the Bridge
+        fetched.
+
+        Faked here rather than on `PATH` because CI has no GitHub
+        authentication; every other command still runs for real. The log is
+        what lets a test assert a reference never reached GitHub at all.
+        """
+        real_run = subprocess.run
+        calls = []
+
+        def run(command, **kwargs):
+            if list(command[:3]) == ["gh", "issue", "view"]:
+                calls.append(list(command))
+                return argparse.Namespace(
+                    returncode=returncode,
+                    stdout=(
+                        gh_requested_fields(stdout, command)
+                        if "--json" in command
+                        else plain_stdout
+                    ),
+                    stderr=stderr,
+                )
+            return real_run(command, **kwargs)
+
+        self.enter(
+            mock.patch.object(self.bridge.subprocess, "run", side_effect=run)
+        )
+        return calls
 
     def install_graph_stub(self, graph_result, graph_status=None):
         graph_bin = self.root / "graph-bin"

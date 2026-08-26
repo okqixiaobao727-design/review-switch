@@ -85,8 +85,15 @@ reranking it:
 <axes.standards.finalMessage or reason>
 
 ## Spec
+Spec source: <preparation.specSource>
+
 <axes.spec.finalMessage or reason>
 ```
+
+State `preparation.specSource` verbatim on every Spec axis, not only when something went wrong.
+It names the spec this review was actually held to, and a value reading `not fetched: <reference>`
+means the Bridge could not obtain that spec and the Lane reviewed without it — say so to whoever
+asked for the review rather than passing the axis off as an ordinary one.
 
 After a `both` review, keep the Spec handle for the re-review its result's `next` may name.
 Keep the Standards handle too, solely so a human can wake that session by hand.
