@@ -265,7 +265,7 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             ),
         )
         expected_suffix = (
-            "\n\nStart here (from the code graph; the diff is the full scope):\n"
+            "\n\nStart here (from the code graph; the two commands above are the full scope):\n"
             "src/first.py:5–9  read_first\n"
             "src/later.py:30–35  late_change"
         )
@@ -390,7 +390,7 @@ class PreparationTests(FakePaneTestCase):
         self.assertNotIn("--brief", calls[2]["argv"])
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertIn(
-            "Start here (from the code graph; the diff is the full scope):\n"
+            "Start here (from the code graph; the two commands above are the full scope):\n"
             "feature.py:1–1  feature",
             prompt,
         )
@@ -602,7 +602,7 @@ class PreparationTests(FakePaneTestCase):
         )
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertIn(
-            "Start here (from the code graph; the diff is the full scope):\n"
+            "Start here (from the code graph; the two commands above are the full scope):\n"
             "feature.py:1–1  feature",
             prompt,
         )

@@ -888,7 +888,8 @@ def append_navigation_block(brief, navigation_block):
         return brief
     return (
         f"{brief}\n\n"
-        "Start here (from the code graph; the diff is the full scope):\n"
+        "Start here (from the code graph; the two commands above are the "
+        "full scope):\n"
         f"{navigation_block}"
     )
 

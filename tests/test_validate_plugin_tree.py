@@ -52,6 +52,26 @@ class TreeFixture:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
+    def commit_as_checkout(self):
+        """Make the copy a checkout, tracking everything written so far.
+
+        The copy arrives without a `.git`, so by default it is the exported
+        tree the lint falls back to walking. A test that needs the lint to
+        have a checkout to ask says so by calling this.
+        """
+        for arguments in (
+            ("init", "-q"),
+            ("config", "user.email", "lint@example.invalid"),
+            ("config", "user.name", "Residue Lint Fixture"),
+            ("add", "-A"),
+            ("commit", "-qm", "the tree as it ships"),
+        ):
+            subprocess.run(
+                ("git", "-C", str(self.root)) + arguments,
+                check=True,
+                capture_output=True,
+            )
+
 
 class ValidatePluginTreeTests(unittest.TestCase):
     def setUp(self):
@@ -154,6 +174,71 @@ class ValidatePluginTreeTests(unittest.TestCase):
             self.tree.write(f"{directory}/private.txt", f"{FIXTURE_IDENTIFIER}\n")
         result = run_validator(self.tree.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def write_private_residue(self, relative):
+        """Put a private identifier in one file, and arm the rule that catches it."""
+        self.tree.write(IDENTIFIERS_FILE, f"{FIXTURE_IDENTIFIER}\n")
+        self.tree.write(
+            relative,
+            f"gitdir: /Users/{FIXTURE_IDENTIFIER}/repo/.git/worktrees/other\n",
+        )
+
+    def test_a_worktree_another_session_left_does_not_fail_a_checkout(self):
+        """The shape that failed the lint on `main` whenever a worktree existed.
+
+        A linked worktree's `.git` is a file naming an absolute path, so it
+        carries the developer's user name. Nothing tracks it and no directory
+        name in `.gitignore` covers it, so only asking git keeps it out.
+        """
+        self.tree.commit_as_checkout()
+        self.write_private_residue(".claude/worktrees/another-session/.git")
+
+        result = run_validator(self.tree.root)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_one_file_passes_untracked_and_fails_once_tracked(self):
+        """Tracking is the whole difference: same path, same bytes, both ways."""
+        residue = "docs/agents/residue-fixture.md"
+        self.tree.commit_as_checkout()
+        self.write_private_residue(residue)
+
+        untracked = run_validator(self.tree.root)
+        self.tree.commit_as_checkout()
+        tracked = run_validator(self.tree.root)
+
+        self.assertEqual(untracked.returncode, 0, untracked.stderr)
+        self.assertEqual(tracked.returncode, 1, tracked.stdout + tracked.stderr)
+        self.assertIn(residue, tracked.stdout + tracked.stderr)
+
+    def test_a_tree_with_no_checkout_still_scans_what_lies_in_it(self):
+        """The export case: with no git to ask, the walk is all there is."""
+        self.write_private_residue(".claude/worktrees/another-session/.git")
+
+        result = run_validator(self.tree.root)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(FIXTURE_IDENTIFIER, result.stdout + result.stderr)
+
+    def test_an_export_inside_a_checkout_is_walked_not_answered_for(self):
+        """git searches upwards, so a tree with no checkout of its own has one.
+
+        An export unpacked anywhere inside a repository would otherwise be
+        answered for by its host, whose index says nothing about it — the lint
+        would scan nothing and pass. Only the tree that *is* the checkout may
+        answer with git.
+        """
+        self.tree.commit_as_checkout()
+        self.tree.write(f"export/{IDENTIFIERS_FILE}", f"{FIXTURE_IDENTIFIER}\n")
+        self.tree.write(
+            "export/notes.md",
+            f"gitdir: /Users/{FIXTURE_IDENTIFIER}/repo/.git\n",
+        )
+
+        result = run_validator(self.tree.path("export"))
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(FIXTURE_IDENTIFIER, result.stdout + result.stderr)
 
     def test_configured_identifier_matches_whole_tokens_only(self):
         self.tree.write(IDENTIFIERS_FILE, f"{FIXTURE_IDENTIFIER}\n")

@@ -147,6 +147,17 @@ class ClaudeDeliveryTests(FakePaneTestCase):
             1,
             "the Lane looked the change up again after preparation had",
         )
+        # Spelt out rather than taken from preparation, which every other
+        # assertion here compares against: a heading that named the wrong
+        # scope would reach both Lanes and satisfy both sides of that
+        # comparison (#34).
+        for prompt in self.claude.prompts:
+            self.assertIn(
+                "Start here (from the code graph; the two commands above "
+                "are the full scope):\n"
+                "feature.py:1–1  feature",
+                prompt,
+            )
 
     def test_an_erroring_reviewer_is_a_failed_axis(self):
         self.claude.answer_with(
