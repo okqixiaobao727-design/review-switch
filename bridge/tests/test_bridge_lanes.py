@@ -47,6 +47,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
             {
                 "fixedPoint": self.fixed_point,
                 "specSource": "spec.md",
+                "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
                 "codeGraphUsed": False,
             },

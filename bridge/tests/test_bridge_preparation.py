@@ -168,7 +168,8 @@ Report, per file/hunk where relevant, (a) every place the diff violates a docume
         brief = self.bridge.build_spec_brief(
             self.scope_at("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736"),
             "abc1234 feature one\ndef5678 feature two",
-            "Feature title\n\nThe feature must keep the contract.",
+            "Spec: /state/code-review-tui/2f0d-spec.md — #42 Feature title, "
+            "body and 2 comments. Read it before reviewing.",
         )
 
         self.assertEqual(
@@ -181,13 +182,46 @@ Commits:
 abc1234 feature one
 def5678 feature two
 
-Spec:
-Feature title
-
-The feature must keep the contract.
+Spec: /state/code-review-tui/2f0d-spec.md — #42 Feature title, body and 2 comments. Read it before reviewing.
 
 Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words.""",
         )
+
+    def test_a_spec_slot_names_the_file_and_what_the_file_holds(self):
+        self.assertEqual(
+            self.bridge.build_spec_slot(
+                "/state/code-review-tui/2f0d-spec.md",
+                "#42 Feature title, body and 2 comments",
+            ),
+            "Spec: /state/code-review-tui/2f0d-spec.md — #42 Feature title, "
+            "body and 2 comments. Read it before reviewing.",
+        )
+
+    def test_a_spec_slot_for_a_file_already_in_the_checkout_names_it_alone(self):
+        self.assertEqual(
+            self.bridge.build_spec_slot("docs/feature.md"),
+            "Spec: docs/feature.md. Read it before reviewing.",
+        )
+
+    def test_an_issue_spec_says_what_it_holds_beside_where_it_is(self):
+        for payload, summary in (
+            (
+                GH_ISSUE_WITH_A_COMMENT,
+                "#23 The Rounds Contract is enforced by the Bridge and "
+                "reported as the next permitted action, body and 1 comment",
+            ),
+            (
+                GH_ISSUE_WITHOUT_COMMENTS,
+                "#3 Review state files are never reaped on success: "
+                "~/.claude/state/code-review-tui holds 294 files and the "
+                "whole dir is globbed on every launch, body",
+            ),
+            (GH_ISSUE_WITH_ONLY_A_COMMENT, "#14020 x, 2 comments"),
+        ):
+            with self.subTest(summary=summary):
+                spec = self.bridge.build_issue_spec(json.loads(payload))
+
+                self.assertEqual(spec.summary, summary)
 
     def test_both_axis_briefs_receive_the_identical_navigation_block(self):
         preparation = self.bridge.ReviewPreparation(
@@ -197,8 +231,11 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
                 fork_point="fed321",
             ),
             commit_list="def456 feature change",
-            spec_source="spec.md",
-            spec_contents="Feature spec.",
+            spec=self.bridge.SpecSlot(
+                source="spec.md",
+                text="Spec: spec.md. Read it before reviewing.",
+                file="spec.md",
+            ),
             standards_files=("AGENTS.md",),
             navigation_block=(
                 "src/first.py:5–9  read_first\n"
@@ -745,6 +782,29 @@ class PreparationTests(FakePaneTestCase):
         )
         self.assertIn("spec file is empty", prompt)
 
+    def spec_lines(self, prompt):
+        """Every line of the brief that fills the Spec slot, however it was filled."""
+        return [line for line in prompt.splitlines() if line.startswith("Spec:")]
+
+    def untracked_files(self):
+        """The new files the Review Scope holds, read with the Scope's own command.
+
+        The Scope's command rather than a spelling of our own, because the
+        point of the assertion is that preparation never adds a file the review
+        would then review as work (#33).
+        """
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.worktree),
+                *self.bridge.ReviewScope.UNTRACKED_ARGUMENTS,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
     def test_a_spec_run_sends_only_the_spec_axis_brief_to_one_pane(self):
         fixed_point = self.fixed_point
         self.codex.finish("no findings")
@@ -756,7 +816,9 @@ class PreparationTests(FakePaneTestCase):
         prompt = self.codex.started_turns[0]["input"][0]["text"].split("\n", 1)[1]
         self.assertEqual(code, 0)
         self.assertEqual(self.codex.panes, [])
-        self.assertIn("Spec:\nFeature spec.\n\nReport:", prompt)
+        self.assertIn(
+            "Spec: spec.md. Read it before reviewing.\n\nReport:", prompt
+        )
         self.assertNotIn("Smell baseline", prompt)
         for excluded in (
             "Rounds contract",
@@ -768,7 +830,7 @@ class PreparationTests(FakePaneTestCase):
         ):
             self.assertNotIn(excluded, prompt)
 
-    def test_an_issue_spec_reaches_the_spec_axis_with_its_body_and_comments(self):
+    def test_an_issue_spec_reaches_the_spec_axis_as_the_one_file_it_names(self):
         self.fake_gh(
             stdout=GH_ISSUE_WITH_A_COMMENT,
             plain_stdout=GH_ISSUE_THE_COMMENTS_FLAG_WAY,
@@ -778,17 +840,28 @@ class PreparationTests(FakePaneTestCase):
         code, output = self.run_bridge(self.args(spec="23", axis="spec"))
 
         prompt = self.codex.started_turns[0]["input"][0]["text"]
+        spec_file = output["preparation"]["specFile"]
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["specSource"], "23")
-        self.assertIn(
-            "#23 The Rounds Contract is enforced by the Bridge and reported as "
-            "the next permitted action",
-            prompt,
+        self.assertEqual(pathlib.Path(spec_file).parent, self.state_dir)
+        self.assertTrue(pathlib.Path(spec_file).is_absolute())
+        self.assertEqual(
+            self.spec_lines(prompt),
+            [
+                f"Spec: {spec_file} — #23 The Rounds Contract is enforced by "
+                "the Bridge and reported as the next permitted action, body "
+                "and 1 comment. Read it before reviewing."
+            ],
         )
-        self.assertIn("A caller learns from every result", prompt)
+        # The whole thread is in the file the Lane is sent to, laid out as #30
+        # laid it out, and no line of it is in the brief.
+        contents = pathlib.Path(spec_file).read_text(encoding="utf-8")
+        self.assertIn("A caller learns from every result", contents)
         self.assertIn(
-            "Comment from okqixiaobao727-design:\n/crew crewtask/2", prompt
+            "Comment from okqixiaobao727-design:\n/crew crewtask/2", contents
         )
+        self.assertNotIn("A caller learns from every result", prompt)
+        self.assertNotIn("Comment from", prompt)
 
     def test_an_issue_without_comments_reaches_the_spec_axis_with_its_body(self):
         self.fake_gh(stdout=GH_ISSUE_WITHOUT_COMMENTS)
@@ -797,13 +870,17 @@ class PreparationTests(FakePaneTestCase):
         code, output = self.run_bridge(self.args(spec="#3", axis="spec"))
 
         prompt = self.codex.started_turns[0]["input"][0]["text"]
+        contents = pathlib.Path(
+            output["preparation"]["specFile"]
+        ).read_text(encoding="utf-8")
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["specSource"], "#3")
         self.assertIn(
-            "#3 Review state files are never reaped on success", prompt
+            "#3 Review state files are never reaped on success", contents
         )
-        self.assertIn("State files written per review", prompt)
-        self.assertNotIn("Comment from", prompt)
+        self.assertIn("State files written per review", contents)
+        self.assertNotIn("Comment from", contents)
+        self.assertIn(", body. Read it before reviewing.", prompt)
 
     def test_an_issue_whose_requirements_are_only_in_a_comment_reaches_the_brief(self):
         self.fake_gh(stdout=GH_ISSUE_WITH_ONLY_A_COMMENT)
@@ -812,13 +889,17 @@ class PreparationTests(FakePaneTestCase):
         code, output = self.run_bridge(self.args(spec="14020", axis="spec"))
 
         prompt = self.codex.started_turns[0]["input"][0]["text"]
+        contents = pathlib.Path(
+            output["preparation"]["specFile"]
+        ).read_text(encoding="utf-8")
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["specSource"], "14020")
         self.assertIn(
             "Comment from github-actions:\nThis issue may have been opened "
             "accidentally.",
-            prompt,
+            contents,
         )
+        self.assertIn("#14020 x, 2 comments. Read it before reviewing.", prompt)
         self.assertNotIn("could not be fetched", prompt)
 
     def test_an_issue_url_is_fetched_rather_than_read_as_a_file(self):
@@ -830,11 +911,112 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(spec=reference, axis="spec"))
 
-        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        contents = pathlib.Path(
+            output["preparation"]["specFile"]
+        ).read_text(encoding="utf-8")
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 1)
         self.assertEqual(output["preparation"]["specSource"], reference)
-        self.assertIn("A caller learns from every result", prompt)
+        self.assertIn("A caller learns from every result", contents)
+
+    def test_a_spec_file_in_the_checkout_is_named_where_it_lies_and_not_copied(self):
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="spec.md", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["specFile"], "spec.md")
+        self.assertEqual(
+            self.spec_lines(prompt),
+            ["Spec: spec.md. Read it before reviewing."],
+        )
+        self.assertEqual(list(self.state_dir.glob("*-spec.md")), [])
+
+    def test_an_unfetched_spec_names_no_file(self):
+        self.fake_gh(returncode=1, stderr="no such issue\n")
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="99999", axis="spec"))
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(output["preparation"]["specFile"])
+        self.assertEqual(list(self.state_dir.glob("*-spec.md")), [])
+
+    def test_a_spec_file_that_cannot_be_written_degrades_like_an_unfetched_one(self):
+        self.fake_gh(stdout=GH_ISSUE_WITH_A_COMMENT)
+        self.codex.finish("no findings")
+        with mock.patch.object(
+            self.bridge.SessionStore,
+            "write_spec",
+            side_effect=OSError("No space left on device"),
+        ):
+            code, output = self.run_bridge(self.args(spec="23", axis="spec"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specSource"], "not fetched: 23"
+        )
+        self.assertIsNone(output["preparation"]["specFile"])
+        self.assertIn("No space left on device", prompt)
+
+    def test_a_standards_only_review_still_names_the_spec_file(self):
+        self.codex.finish("no findings")
+
+        _code, output = self.run_bridge(
+            self.args(spec="spec.md", axis="standards")
+        )
+
+        self.assertEqual(output["preparation"]["specFile"], "spec.md")
+
+    def test_a_review_given_no_spec_at_all_names_no_spec_file(self):
+        self.codex.finish("no findings")
+
+        _code, output = self.run_bridge(
+            self.args(spec=None, axis="standards")
+        )
+
+        self.assertIn("specFile", output["preparation"])
+        self.assertIsNone(output["preparation"]["specFile"])
+
+    def test_a_state_directory_inside_the_checkout_fails_before_a_pane_opens(self):
+        """The Scope itself is wrong, so no review runs over it rather than a weak one.
+
+        A spec written there would be reviewed as work, and round two would
+        read round one's report the same way; that is not a spec being
+        unreachable, which is the only thing #30 lets a review continue past.
+        """
+        inside = self.worktree / "state-inside"
+        self.fake_gh(stdout=GH_ISSUE_WITH_A_COMMENT)
+        self.enter(mock.patch.dict(
+            os.environ, {"CODE_REVIEW_TUI_STATE_DIR": str(inside)}, clear=False
+        ))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "state directory is inside the reviewed checkout"
+        ):
+            self.run_bridge(self.args(spec="23", axis="spec"))
+
+        self.assertEqual(self.codex.launched_panes, [])
+        self.assertEqual(list(inside.glob("*-spec.md")), [])
+
+    def test_an_issue_spec_writes_nothing_into_the_reviewed_checkout(self):
+        self.fake_gh(stdout=GH_ISSUE_WITH_A_COMMENT)
+        before = self.untracked_files()
+        self.codex.finish("no findings")
+
+        self.run_bridge(self.args(spec="23", axis="spec"))
+
+        self.assertEqual(self.untracked_files(), before)
+
+    def test_a_file_spec_writes_nothing_into_the_reviewed_checkout(self):
+        before = self.untracked_files()
+        self.codex.finish("no findings")
+
+        self.run_bridge(self.args(spec="spec.md", axis="spec"))
+
+        self.assertEqual(self.untracked_files(), before)
 
     def test_a_gh_failure_degrades_the_spec_axis_instead_of_stopping_it(self):
         self.fake_gh(

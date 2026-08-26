@@ -251,8 +251,11 @@ class DeliveryContractTests(unittest.TestCase):
                 fork_point="fed321",
             ),
             commit_list="def456 feature change",
-            spec_source="docs/feature.md",
-            spec_contents="Feature spec.",
+            spec=self.bridge.SpecSlot(
+                source="docs/feature.md",
+                text="Spec: docs/feature.md. Read it before reviewing.",
+                file="docs/feature.md",
+            ),
             standards_files=("AGENTS.md",),
         )
         args = base_args(preparation=preparation, axis="standards")
@@ -352,7 +355,7 @@ class DeliverySeamTests(FakePaneTestCase):
         lane = RecordingLane.instances[0]
         self.assertEqual([brief.axis for brief in lane.briefs], ["standards", "spec"])
         self.assertIn("Standards sources:", lane.briefs[0].text)
-        self.assertIn("\nSpec:\n", lane.briefs[1].text)
+        self.assertIn("\nSpec: spec.md.", lane.briefs[1].text)
 
     def test_the_lane_result_is_the_result_the_run_reports(self):
         self.use_recording_lane()
@@ -446,6 +449,7 @@ class ReviewDeliveryTests(FakePaneTestCase):
             {
                 "fixedPoint": fixed_point,
                 "specSource": "spec.md",
+                "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
                 "codeGraphUsed": False,
             },
@@ -493,7 +497,7 @@ class ReviewDeliveryTests(FakePaneTestCase):
         prompts = [turn["input"][0]["text"] for turn in self.codex.started_turns]
         self.assertEqual(len(prompts), 2)
         self.assertEqual(sum("Standards sources:" in prompt for prompt in prompts), 1)
-        self.assertEqual(sum("\nSpec:\n" in prompt for prompt in prompts), 1)
+        self.assertEqual(sum("\nSpec: spec.md." in prompt for prompt in prompts), 1)
 
     def test_half_open_run_keeps_the_completed_report_and_failed_reason(self):
         self.codex.concurrent_turn_count = 2
@@ -658,7 +662,7 @@ class PerAxisModelAndEffortTests(FakePaneTestCase):
         turn_choices = {
             (
                 "spec"
-                if "\nSpec:\n" in turn["input"][0]["text"]
+                if "\nSpec: spec.md." in turn["input"][0]["text"]
                 else "standards"
             ): (turn.get("model"), turn.get("effort"))
             for turn in self.codex.started_turns

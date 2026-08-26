@@ -49,6 +49,7 @@ class StaticPreparation:
         return {
             "fixedPoint": "resolved-main",
             "specSource": "docs/feature.md",
+            "specFile": "docs/feature.md",
             "standardsFiles": [],
             "codeGraphUsed": False,
         }
