@@ -93,12 +93,18 @@ class FakeStore:
     def __init__(self, client):
         self.client = client
         self.written = {}
+        self.reports = {}
         self.brief_queued_at_first_write = None
 
     def write(self, session_id, state):
         if self.brief_queued_at_first_write is None:
             self.brief_queued_at_first_write = self.client.brief_queued
         self.written[session_id] = state
+
+    def write_report(self, session_id, final_message):
+        """These tests pin the startup order, not what a settled report leaves."""
+        self.reports[session_id] = final_message
+        return f"/reports/{session_id}.md" if final_message.strip() else None
 
 
 class CodexDeliveryStartupTests(unittest.TestCase):

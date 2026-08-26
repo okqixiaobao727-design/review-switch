@@ -32,7 +32,8 @@ review-bridge --reviewer codex --base main --spec '#42' --axis both
 ```
 
 It prints one JSON object: a `preparation` receipt, and one entry per axis under `axes` carrying
-that axis's `status`, `finalMessage`, `reviewSessionId`, and `next` — the one action you are
+that axis's `status`, `finalMessage`, `reviewSessionId`, `reportFile` — a markdown file holding
+that axis's report, or `null` where it produced none — and `next`, the one action you are
 permitted after that result. `--model` and `--effort` pin the whole review;
 `--standards-model`, `--standards-effort`, `--spec-model`, and `--spec-effort` pin one axis at a
 time. Omit them and the vendor's own configuration applies. `--recover-session` re-attaches to a

@@ -460,6 +460,42 @@ class LifecycleHookTests(HookRecordingTestCase):
             self.assertEqual(record[variable], str(ROUND_ONE_COUNTERS[counter]))
         self.assertNotIn("REVIEW_COST_DETAIL", record)
 
+    def test_the_axis_end_hook_names_the_file_holding_that_axis_report(self):
+        """The hook is told where the report is, not handed the report."""
+        self.codex.finish("one standards finding")
+
+        code = self.main(*self.review_argv())
+
+        self.assertEqual(code, 0)
+        record = self.firings_at("axis-end")[0]
+        report_file = pathlib.Path(record["REVIEW_REPORT_FILE"])
+        self.assertEqual(
+            report_file.read_text(encoding="utf-8"), "one standards finding"
+        )
+
+    def test_an_axis_torn_down_before_it_opened_names_no_report_file(self):
+        """A sibling that cannot open ends this axis before it has anything to report.
+
+        No session, so no report — the rule `REVIEW_SESSION` already follows.
+        """
+        opened = self.bridge.CodexLane.open
+
+        def refuse_the_spec_pane(lane, brief):
+            if brief.axis == "spec":
+                raise RuntimeError("no pane could be split for the spec axis")
+            return opened(lane, brief)
+
+        with mock.patch.object(
+            self.bridge.CodexLane, "open", refuse_the_spec_pane
+        ):
+            code = self.main(*self.review_argv(axis="both"))
+
+        self.assertEqual(code, 1)
+        record = self.firings_at("axis-end")[0]
+        self.assertEqual(record["REVIEW_AXIS"], "standards")
+        self.assertEqual(record["REVIEW_SESSION"], "")
+        self.assertEqual(record["REVIEW_REPORT_FILE"], "")
+
     def test_an_axis_whose_cost_cannot_be_read_says_why_instead(self):
         self.codex.finish("no findings")
 

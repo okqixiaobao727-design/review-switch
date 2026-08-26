@@ -108,6 +108,7 @@ HOOK_VARS = frozenset({
     "REVIEW_AXIS",
     "REVIEW_STATUS",
     "REVIEW_SESSION",
+    "REVIEW_REPORT_FILE",
     *COUNTER_VARS.values(),
 })
 # What a review that never reached a result of its own is: the result contract's
@@ -141,6 +142,17 @@ class AppServerError(RuntimeError):
 
 class NoLiveSessionError(RuntimeError):
     """No recoverable review session belongs to the caller's owner identity."""
+
+
+def has_report(final_message):
+    """Whether an axis came back with a report at all.
+
+    Whitespace is no more a report than nothing is, and one rule decides it for
+    everything that asks — whether the axis completed, and whether there is a
+    file to write. Two thresholds would let an axis complete and still have no
+    report to point its caller at.
+    """
+    return bool(final_message and final_message.strip())
 
 
 def hook_command(args, point):
@@ -223,14 +235,16 @@ def cost_facts(counters, detail):
     return {COUNTER_VARS[name]: str(counters[name]) for name in COUNTERS}
 
 
-def hook_axis_end(args, axis, status, session, cost):
-    """End one axis: how it finished, and what its own reviewer spent.
+def hook_axis_end(args, axis, status, session, report_file, cost):
+    """End one axis: how it finished, where its report is, and what it spent.
 
     What an axis spent is the Lane's to read — a rollout on one Lane, a printed
     result on the other — so it arrives here already read, as the counters or as
     the reason there are none. The model reported is the one the reviewer
     resolved to and nothing else: the alias the caller asked for is already
-    theirs to remember.
+    theirs to remember. The report is named rather than carried: a hook command
+    that wants the text opens the file, and one that does not pays nothing for
+    it.
     """
     counters, model, detail = cost
     run_hook(
@@ -239,6 +253,7 @@ def hook_axis_end(args, axis, status, session, cost):
         REVIEW_AXIS=axis,
         REVIEW_STATUS=status,
         REVIEW_SESSION=session or "",
+        REVIEW_REPORT_FILE=report_file or "",
         REVIEW_MODEL=model or "",
         **cost_facts(counters, detail),
     )
@@ -571,6 +586,22 @@ class SessionStore:
 
     def state_path(self, session_id):
         return self.root / f"{self._safe_id(session_id)}.json"
+
+    def report_path(self, session_id):
+        return self.root / f"{self._safe_id(session_id)}.md"
+
+    def write_report(self, session_id, final_message):
+        """Write one axis's report where a human can open it, and name the file.
+
+        A report with nothing in it is no report: an empty file would be a path
+        that leads nowhere, so there is none and the caller is told so.
+        """
+        if not has_report(final_message):
+            return None
+        destination = self.report_path(session_id)
+        destination.write_text(final_message, encoding="utf-8")
+        os.chmod(destination, 0o600)
+        return str(destination)
 
     def lock_path(self, key):
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -2089,7 +2120,7 @@ def update_session_after_turn(state, turn, target):
 
 def axis_result(state, turn, final_message):
     status = turn.get("status")
-    if status == "completed" and not final_message:
+    if status == "completed" and not has_report(final_message):
         status = "failed"
     result = {
         "status": status,
@@ -2257,6 +2288,8 @@ def result_from_report(report):
         name: report[name]
         for name in ("status", "finalMessage", "reviewSessionId")
     }
+    # A record stored before reports had files of their own names no file.
+    result["reportFile"] = report.get("reportFile")
     if "reason" in report:
         result["reason"] = report["reason"]
     return result
@@ -2486,12 +2519,21 @@ class Lane:
         raise NotImplementedError
 
     def store_report(self, run, result):
-        """Persist one report and its hook facts before recovery is dismantled."""
+        """Persist one report and its hook facts before recovery is dismantled.
+
+        Returns the file this axis's report is readable in, or None where there
+        was no report to write. The store owns where its files live, so this is
+        the only place the path is composed and no caller resolves it again.
+        """
         if run.state is None:
-            return
+            return None
         counters, model, detail = self.axis_cost(run)
+        report_file = self.store.write_report(
+            run.state["reviewSessionId"], result["finalMessage"]
+        )
         report = dict(result)
         report.update({
+            "reportFile": report_file,
             "resolvedModel": model,
             "costCounters": {
                 name: counters.get(name) if counters is not None else None
@@ -2503,6 +2545,7 @@ class Lane:
         run.state["report"] = report
         run.state["updatedAt"] = time.time()
         self.store.write(run.state["reviewSessionId"], run.state)
+        return report_file
 
     def settle_result(self, run):
         """Return a stored report, or persist the result still held by its Lane."""
@@ -2510,7 +2553,9 @@ class Lane:
         if report is not None:
             return result_from_report(report)
         result = self.result_for(run)
-        self.store_report(run, result)
+        # Every axis names its report file, and an axis that wrote none says so,
+        # the way every axis names its session and a sessionless one says None.
+        result["reportFile"] = self.store_report(run, result)
         return result
 
     def mark_delivered(self, run):
@@ -2531,6 +2576,7 @@ class Lane:
             axis,
             result["status"],
             result["reviewSessionId"],
+            result["reportFile"],
             self.axis_cost(run),
         )
 
@@ -2541,7 +2587,7 @@ class Lane:
         anything, and the point still owes the caller one end for the child it
         was told about.
         """
-        hook_axis_end(self.args, axis, FAILED_STATUS, None, self.NO_COST)
+        hook_axis_end(self.args, axis, FAILED_STATUS, None, None, self.NO_COST)
 
     def recovered_preparation(self, runs):
         """What a recovered review was prepared from, read back off its own records."""
@@ -2876,7 +2922,7 @@ def claude_failure_reason(parsed):
     """Why this axis's report is not one, or `None` when it is."""
     if parsed.is_error:
         return f"the reviewer ended in error: {parsed.subtype or 'unknown'}"
-    if not parsed.result:
+    if not has_report(parsed.result):
         return "review completed without a final message"
     if parsed.permission_denials:
         return (
