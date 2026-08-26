@@ -8,7 +8,12 @@ import subprocess
 import unittest
 from unittest import mock
 
-from bridge_harness import FakePaneTestCase, base_args, load_bridge
+from bridge_harness import (
+    FakePaneTestCase,
+    base_args,
+    graph_navigation_result,
+    load_bridge,
+)
 
 # Every `gh` double below is a response captured from real `gh` 2.88.1 on
 # 2026-08-26, so that no test here can pass against output `gh` never
@@ -95,16 +100,13 @@ class AxisBriefTests(unittest.TestCase):
             graph_result, "/workspace/project"
         )
 
-        self.assertEqual(
-            block,
-            "src/first.py:5–9  read_first\n"
-            "src/later.py:30–35  late_change",
-        )
+        self.assertEqual(block, "src/first.py:5–9  read_first")
+        self.assertNotIn("late_change", block)
         for excluded in ("risk_score", "test_gaps", "context_savings"):
             self.assertNotIn(excluded, block)
 
-    def test_navigation_keeps_every_changed_function_without_a_cap(self):
-        changed_functions = [
+    def test_navigation_keeps_every_review_priority_without_a_cap(self):
+        review_priorities = [
             {
                 "file_path": f"/workspace/project/src/change_{index}.py",
                 "line_start": index + 1,
@@ -116,17 +118,37 @@ class AxisBriefTests(unittest.TestCase):
 
         block = self.bridge.build_navigation_block(
             {
-                "changed_functions": changed_functions,
+                "changed_functions": list(review_priorities),
+                "review_priorities": review_priorities,
+            },
+            "/workspace/project",
+        )
+
+        self.assertEqual(len(block.splitlines()), len(review_priorities))
+        self.assertEqual(
+            block.splitlines()[-1],
+            "src/change_11.py:12–12  change_11",
+        )
+
+    def test_a_scope_with_no_ranked_priorities_contributes_no_navigation(self):
+        """No priorities is the absent-tool case, not a heading over nothing."""
+        block = self.bridge.build_navigation_block(
+            {
+                "changed_functions": [
+                    {
+                        "file_path": f"/workspace/project/src/change_{index}.py",
+                        "line_start": index + 1,
+                        "line_end": index + 1,
+                        "name": f"change_{index}",
+                    }
+                    for index in range(12)
+                ],
                 "review_priorities": [],
             },
             "/workspace/project",
         )
 
-        self.assertEqual(len(block.splitlines()), len(changed_functions))
-        self.assertEqual(
-            block.splitlines()[-1],
-            "src/change_11.py:12–12  change_11",
-        )
+        self.assertIsNone(block)
 
     def test_standards_axis_brief_matches_the_fixed_text(self):
         brief = self.bridge.build_standards_brief(
@@ -278,22 +300,28 @@ class PreparationTests(FakePaneTestCase):
 
     def test_the_graph_cli_runs_once_and_its_navigation_reaches_the_brief(self):
         (self.worktree / ".code-review-graph").mkdir()
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+            "risk_score": 0.93,
+        }
+        unranked_test = {
+            "file_path": str(self.worktree / "tests/test_feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "test_feature",
+            "risk_score": 0.04,
+        }
         call_log = self.install_graph_stub(
-            {
-                "risk_score": 0.93,
-                "test_gaps": [{"name": "feature"}],
-                "context_savings": {"estimated_tokens_saved": 1200},
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                        "risk_score": 0.93,
-                    }
-                ],
-                "review_priorities": [],
-            }
+            graph_navigation_result(
+                feature,
+                changed_functions=[feature, unranked_test],
+                risk_score=0.93,
+                test_gaps=[{"name": "feature"}],
+                context_savings={"estimated_tokens_saved": 1200},
+            )
         )
         self.codex.finish("no findings")
 
@@ -329,15 +357,14 @@ class PreparationTests(FakePaneTestCase):
             "feature.py:1–1  feature",
             prompt,
         )
+        self.assertNotIn("test_feature", prompt)
         for excluded in ("risk_score", "test_gaps", "context_savings"):
             self.assertNotIn(excluded, prompt)
         self.assertTrue(output["preparation"]["codeGraphUsed"])
 
     def test_an_empty_graph_result_contributes_no_navigation(self):
         (self.worktree / ".code-review-graph").mkdir()
-        self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []}
-        )
+        self.install_graph_stub(graph_navigation_result())
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(axis="standards"))
@@ -366,19 +393,13 @@ class PreparationTests(FakePaneTestCase):
                 clear=False,
             )
         )
-        call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                    }
-                ],
-                "review_priorities": [],
-            }
-        )
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+        }
+        call_log = self.install_graph_stub(graph_navigation_result(feature))
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(axis="spec"))
@@ -396,18 +417,14 @@ class PreparationTests(FakePaneTestCase):
         self.assertTrue(output["preparation"]["codeGraphUsed"])
 
     def test_a_main_checkout_with_no_graph_is_built_rather_than_skipped(self):
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+        }
         call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                    }
-                ],
-                "review_priorities": [],
-            },
+            graph_navigation_result(feature),
             graph_status=GRAPH_STATUS_NEVER_BUILT,
         )
         self.codex.finish("no findings")
@@ -426,7 +443,7 @@ class PreparationTests(FakePaneTestCase):
 
     def test_an_unreadable_graph_status_contributes_no_navigation(self):
         call_log = self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []},
+            graph_navigation_result(),
             graph_status=[],
         )
         self.codex.finish("no findings")
@@ -455,19 +472,13 @@ class PreparationTests(FakePaneTestCase):
     def test_a_dirty_main_checkout_still_gets_its_navigation_block(self):
         """`update --brief` re-parses changed files from disk, dirty or not."""
         (self.worktree / ".code-review-graph").mkdir()
-        call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "pending.py"),
-                        "line_start": 1,
-                        "line_end": 4,
-                        "name": "pending",
-                    }
-                ],
-                "review_priorities": [],
-            }
-        )
+        pending = {
+            "file_path": str(self.worktree / "pending.py"),
+            "line_start": 1,
+            "line_end": 4,
+            "name": "pending",
+        }
+        call_log = self.install_graph_stub(graph_navigation_result(pending))
         (self.worktree / "pending.py").write_text(
             "def pending():\n    return True\n", encoding="utf-8"
         )
@@ -489,19 +500,13 @@ class PreparationTests(FakePaneTestCase):
         """A fixed point that has moved on names a range the diff never reads."""
         (self.worktree / ".code-review-graph").mkdir()
         moved_fixed_point = self.fixed_point_that_has_moved_on()
-        call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                    }
-                ],
-                "review_priorities": [],
-            }
-        )
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+        }
+        call_log = self.install_graph_stub(graph_navigation_result(feature))
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(
@@ -523,18 +528,14 @@ class PreparationTests(FakePaneTestCase):
         """The worktree owns its graph, so it is built there, not consulted elsewhere."""
         main_checkout = self.use_linked_worktree()
         (main_checkout / ".code-review-graph").mkdir()
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+        }
         call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                    }
-                ],
-                "review_priorities": [],
-            },
+            graph_navigation_result(feature),
             graph_status=GRAPH_STATUS_NEVER_BUILT,
         )
         self.codex.finish("no findings")
@@ -572,19 +573,13 @@ class PreparationTests(FakePaneTestCase):
 
     def test_a_worktree_with_a_graph_is_updated_rather_than_built(self):
         self.use_linked_worktree()
-        call_log = self.install_graph_stub(
-            {
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                    }
-                ],
-                "review_priorities": [],
-            }
-        )
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+        }
+        call_log = self.install_graph_stub(graph_navigation_result(feature))
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(axis="standards"))
@@ -608,7 +603,7 @@ class PreparationTests(FakePaneTestCase):
     def test_a_failing_build_leaves_the_brief_unchanged(self):
         self.use_linked_worktree()
         call_log = self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []},
+            graph_navigation_result(),
             graph_status=GRAPH_STATUS_NEVER_BUILT,
             build_returncode=1,
         )
@@ -629,7 +624,7 @@ class PreparationTests(FakePaneTestCase):
         """The one unbounded call in the flow, bounded; overrunning it is absence."""
         self.use_linked_worktree()
         call_log = self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []},
+            graph_navigation_result(),
             graph_status=GRAPH_STATUS_NEVER_BUILT,
             build_seconds=30,
         )

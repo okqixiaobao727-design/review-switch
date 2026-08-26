@@ -8,7 +8,12 @@ import sys
 import unittest
 from unittest import mock
 
-from bridge_harness import DriverKilled, FakePaneTestCase, MARKER_PATTERN
+from bridge_harness import (
+    DriverKilled,
+    FakePaneTestCase,
+    MARKER_PATTERN,
+    graph_navigation_result,
+)
 
 
 def delivered_brief(prompt):
@@ -110,22 +115,20 @@ class ClaudeDeliveryTests(FakePaneTestCase):
 
     def test_the_lane_makes_no_code_graph_call_of_its_own(self):
         (self.worktree / ".code-review-graph").mkdir()
+        feature = {
+            "file_path": str(self.worktree / "feature.py"),
+            "line_start": 1,
+            "line_end": 1,
+            "name": "feature",
+            "risk_score": 0.93,
+        }
         call_log = self.install_graph_stub(
-            {
-                "risk_score": 0.93,
-                "test_gaps": [],
-                "context_savings": {"estimated_tokens_saved": 1200},
-                "changed_functions": [
-                    {
-                        "file_path": str(self.worktree / "feature.py"),
-                        "line_start": 1,
-                        "line_end": 1,
-                        "name": "feature",
-                        "risk_score": 0.93,
-                    }
-                ],
-                "review_priorities": [],
-            }
+            graph_navigation_result(
+                feature,
+                risk_score=0.93,
+                test_gaps=[],
+                context_savings={"estimated_tokens_saved": 1200},
+            )
         )
         self.claude.finish("standards clear", axis="standards")
         self.claude.finish("spec clear", axis="spec")
