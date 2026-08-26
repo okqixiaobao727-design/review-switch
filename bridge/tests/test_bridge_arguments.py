@@ -3,6 +3,8 @@
 
 import contextlib
 import io
+import pathlib
+import tempfile
 import unittest
 
 from bridge_harness import load_bridge
@@ -231,6 +233,141 @@ class LifecycleHookParserTests(unittest.TestCase):
         self.assertIsNone(args.on_review_start)
         self.assertIsNone(args.on_axis_end)
         self.assertIsNone(args.on_review_end)
+
+
+class CallerResponseParserTests(unittest.TestCase):
+    """`--response`: what a resume must bring, and what no other call may.
+
+    The rule lives on the command line because that is before preparation,
+    before the owner lock, and before the round is granted: a caller that
+    forgot the file loses the call and nothing else.
+    """
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name)
+
+    def response_file(self, contents='1. "the lock" — fixed in the Bridge\n'):
+        """A Response where the Dispatcher writes one: outside any checkout."""
+        path = self.root / "response.md"
+        path.write_text(contents, encoding="utf-8")
+        return str(path)
+
+    def parse_failure(self, argv):
+        """The message a rejected command line leaves on stderr."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self.bridge.parse_args(argv)
+        return stderr.getvalue()
+
+    def resume_argv(self, *arguments):
+        return [
+            "--reviewer", "codex",
+            "--base", "main",
+            "--axis", "spec",
+            "--resume-session", "session-ticket-50",
+            *arguments,
+        ]
+
+    def test_a_resume_carries_the_response_it_was_given(self):
+        path = self.response_file()
+
+        args = self.bridge.parse_args(self.resume_argv("--response", path))
+
+        self.assertEqual(args.response, path)
+
+    def test_a_resume_without_a_response_is_refused_by_name(self):
+        message = self.parse_failure(self.resume_argv())
+
+        self.assertIn("--response", message)
+        self.assertIn("--resume-session", message)
+
+    def test_a_first_review_is_refused_a_response(self):
+        message = self.parse_failure(
+            [
+                "--reviewer", "codex",
+                "--base", "main",
+                "--response", self.response_file(),
+            ]
+        )
+
+        self.assertIn("--response", message)
+
+    def test_a_recovery_is_refused_a_response(self):
+        message = self.parse_failure(
+            [
+                "--reviewer", "codex",
+                "--recover-session",
+                "--response", self.response_file(),
+            ]
+        )
+
+        self.assertIn("--response", message)
+
+    def test_a_call_that_is_not_a_resume_carries_no_response(self):
+        args = self.bridge.parse_args(["--reviewer", "codex", "--base", "main"])
+
+        self.assertIsNone(args.response)
+
+    def test_a_response_with_nothing_in_it_is_no_response(self):
+        for contents in ("", "\n", "  \n\t\n"):
+            with self.subTest(contents=contents):
+                message = self.parse_failure(
+                    self.resume_argv("--response", self.response_file(contents))
+                )
+
+                self.assertIn("--response", message)
+
+    def test_a_response_file_that_is_not_there_is_refused(self):
+        message = self.parse_failure(
+            self.resume_argv("--response", str(self.root / "absent.md"))
+        )
+
+        self.assertIn("--response", message)
+
+    def test_a_response_that_cannot_be_read_as_text_is_refused(self):
+        """Unreadable is unreadable, whether the file or its bytes are at fault."""
+        path = self.root / "binary.md"
+        path.write_bytes(b"\xff\xfe\x00garbled")
+
+        message = self.parse_failure(self.resume_argv("--response", str(path)))
+
+        self.assertIn("--response", message)
+
+    def test_a_health_probe_takes_no_resume_handle(self):
+        """A probe answers no round, so it may not spend one.
+
+        It is prepared for nothing and carries its own fixed text, so a probe
+        allowed to resume would take the lineage's one re-review, hand the Lane
+        the probe brief, and leave a receipt naming no Response at all.
+        """
+        for flag in ("--probe", "--browser-probe"):
+            with self.subTest(flag=flag):
+                message = self.parse_failure(
+                    [
+                        "--reviewer", "codex",
+                        flag,
+                        "--resume-session", "session-ticket-50",
+                        "--response", self.response_file(),
+                    ]
+                )
+
+                self.assertIn(flag, message)
+                self.assertIn("--resume-session", message)
+
+    def test_help_says_a_resume_requires_a_response(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                self.bridge.parse_args(["--help"])
+
+        described = " ".join(stdout.getvalue().split())
+
+        self.assertIn("--response", described)
+        self.assertIn("required with --resume-session", described)
 
 
 class LaneArgumentTests(unittest.TestCase):

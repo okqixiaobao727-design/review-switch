@@ -452,6 +452,7 @@ class ReviewDeliveryTests(FakePaneTestCase):
                 "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
                 "codeGraphUsed": False,
+                "responseFile": None,
             },
         )
 
