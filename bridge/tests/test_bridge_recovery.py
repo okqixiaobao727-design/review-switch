@@ -268,6 +268,27 @@ class RecoveryTests(FakePaneTestCase):
         self.assertEqual(len(self.codex.started_turns), turns_before)
         self.assertEqual(self.codex.panes, [])
 
+    def test_recovering_a_record_older_than_spec_files_still_names_one(self):
+        """A review prepared before #33 was held to no spec file, and says so.
+
+        The receipt is read back off the record rather than rebuilt, so a
+        record written when the field did not exist would otherwise return a
+        receipt missing it, and every caller reading the JSON would have to
+        handle two shapes.
+        """
+        state = self.kill_the_driver()
+        del state["preparation"]["specFile"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        self.codex.finish("legacy review findings")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertIn("specFile", output["preparation"])
+        self.assertIsNone(output["preparation"]["specFile"])
+
     def test_recovery_tolerates_a_record_with_no_preparation_report(self):
         state = self.kill_the_driver()
         del state["preparation"]

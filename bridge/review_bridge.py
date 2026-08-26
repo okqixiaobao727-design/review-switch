@@ -582,6 +582,32 @@ class SessionStore:
     def report_path(self, session_id):
         return self.root / f"{self._safe_id(session_id)}.md"
 
+    def spec_path(self, spec_id):
+        return self.root / f"{self._safe_id(spec_id)}-spec.md"
+
+    def _write_readable(self, destination, contents):
+        """Put one file in the store where a human or a Lane can open it, and name it.
+
+        Every file the store hands a path to is written the same way — private
+        to its owner, and named by the store rather than by whoever asked — so
+        the mode is set in one place instead of once per kind of file.
+        """
+        destination.write_text(contents, encoding="utf-8")
+        os.chmod(destination, 0o600)
+        return str(destination)
+
+    def write_spec(self, contents):
+        """Write the fetched spec where a Lane can open it, and name the file.
+
+        Its own id rather than the review's: the spec is written while the
+        brief that names it is filled, which is before any session exists to
+        name it after, and one per preparation is what keeps two reviews
+        running at once from reading each other's spec.
+        """
+        return self._write_readable(
+            self.spec_path(str(uuid.uuid4())), contents
+        )
+
     def write_report(self, session_id, final_message):
         """Write one axis's report where a human can open it, and name the file.
 
@@ -590,10 +616,9 @@ class SessionStore:
         """
         if not has_report(final_message):
             return None
-        destination = self.report_path(session_id)
-        destination.write_text(final_message, encoding="utf-8")
-        os.chmod(destination, 0o600)
-        return str(destination)
+        return self._write_readable(
+            self.report_path(session_id), final_message
+        )
 
     def lock_path(self, key):
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -958,23 +983,56 @@ def build_standards_brief(scope, commit_list, standards_files):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class SpecSlot:
+    """The Spec slot of an Axis Brief, and the file it sends the Lane to.
+
+    Every way of naming a spec ends here — an issue the Bridge wrote out, a
+    file already in the checkout, a reference it could not fetch, or none at
+    all — so the brief is filled from one shape rather than from four. `text`
+    is the slot as the Lane reads it and is `None` only when no reference was
+    given, which is the one case the Spec axis cannot run on. `file` is the
+    spec the review was held to, and is the same path the receipt reports.
+    """
+
+    source: str
+    text: str | None
+    file: str | None = None
+
+
+SPEC_SLOT_TEMPLATE = "Spec: {path}{summary}. Read it before reviewing."
+
+
+def build_spec_slot(path, summary=None):
+    """The one line that sends a Lane to the spec, saying what it will find.
+
+    Naming the file rather than pasting it keeps a long comment thread out of
+    every first turn, and lets a Lane read the body before the thread; the
+    brief's closing instruction to quote the spec line is what keeps reading it
+    from being optional (#33). A spec already in the checkout carries no
+    summary: the Lane can see for itself what a path it was given holds.
+    """
+    return SPEC_SLOT_TEMPLATE.format(
+        path=path, summary=f" — {summary}" if summary else ""
+    )
+
+
 SPEC_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
 
 Diff: {diff_command}
 New files not in that diff: {untracked_command}
 Commits:
 {commit_list}
-Spec:
-{spec_contents}
+{spec_slot}
 Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."""
 
 
-def build_spec_brief(scope, commit_list, spec_contents):
+def build_spec_brief(scope, commit_list, spec_slot):
     return SPEC_BRIEF_TEMPLATE.format(
         diff_command=scope.diff_command,
         untracked_command=scope.untracked_command,
         commit_list=with_trailing_newline(commit_list),
-        spec_contents=with_trailing_newline(spec_contents),
+        spec_slot=with_trailing_newline(spec_slot),
     )
 
 
@@ -982,8 +1040,7 @@ def build_spec_brief(scope, commit_list, spec_contents):
 class ReviewPreparation:
     scope: ReviewScope
     commit_list: str
-    spec_source: str
-    spec_contents: str | None
+    spec: SpecSlot
     standards_files: tuple[str, ...]
     navigation_block: str | None = None
     code_graph_used: bool = False
@@ -1006,14 +1063,14 @@ class ReviewPreparation:
                 self.navigation_block,
             )
         if axis == "spec":
-            if self.spec_contents is None:
+            if self.spec.text is None:
                 raise RuntimeError(
                     "spec source was not provided; run with --axis standards "
                     "when no spec exists"
                 )
             return append_navigation_block(
                 build_spec_brief(
-                    self.scope, self.commit_list, self.spec_contents
+                    self.scope, self.commit_list, self.spec.text
                 ),
                 self.navigation_block,
             )
@@ -1022,7 +1079,8 @@ class ReviewPreparation:
     def report(self):
         return {
             "fixedPoint": self.scope.resolved_fixed_point,
-            "specSource": self.spec_source,
+            "specSource": self.spec.source,
+            "specFile": self.spec.file,
             "standardsFiles": list(self.standards_files),
             "codeGraphUsed": self.code_graph_used,
         }
@@ -1069,7 +1127,8 @@ def find_standards_files(repo_root):
     return tuple(documented)
 
 
-UNFETCHED_SPEC_TEMPLATE = """The spec could not be fetched, so this review has no requirements to check against.
+UNFETCHED_SPEC_TEMPLATE = """Spec:
+The spec could not be fetched, so this review has no requirements to check against.
 Reference as given: {reference}
 Failure: {detail}
 Report exactly that: the spec was unreachable, naming the reference and the failure above. Do not infer from the diff, the commits, or the code what the spec asked for, and report no other spec finding."""
@@ -1081,11 +1140,14 @@ def spec_not_fetched(reference, detail):
     A reference that cannot be fetched costs the caller a weaker review, never
     the review: the Spec slot carries the reference and the failure, and the
     source records that the spec was not fetched, so a spec-less review is told
-    apart from an ordinary one without re-deriving it (#30).
+    apart from an ordinary one without re-deriving it (#30). There is no file
+    to name, so the receipt names none (#33).
     """
-    return (
-        f"not fetched: {reference}",
-        UNFETCHED_SPEC_TEMPLATE.format(reference=reference, detail=detail),
+    return SpecSlot(
+        source=f"not fetched: {reference}",
+        text=UNFETCHED_SPEC_TEMPLATE.format(
+            reference=reference, detail=detail
+        ),
     )
 
 
@@ -1094,6 +1156,24 @@ def spec_not_fetched(reference, detail):
 #: requested" — `--comments` replaces the body with the thread rather than
 #: adding to it, and its return code says nothing about either (#30).
 ISSUE_SPEC_FIELDS = "number,title,body,comments"
+
+
+@dataclasses.dataclass(frozen=True)
+class IssueSpec:
+    """One fetched issue: the text written out, and what the slot says is in it."""
+
+    contents: str
+    summary: str
+
+
+def describe_issue_parts(has_body, comment_count):
+    """What a written-out issue holds, for the Lane deciding how much to read."""
+    parts = ["body"] if has_body else []
+    if comment_count:
+        parts.append(
+            "1 comment" if comment_count == 1 else f"{comment_count} comments"
+        )
+    return " and ".join(parts)
 
 
 def build_issue_spec(issue):
@@ -1110,16 +1190,20 @@ def build_issue_spec(issue):
     ]
     if not body and not comments:
         return None
-    sections = [f"#{issue['number']} {issue['title']}".strip()]
+    heading = f"#{issue['number']} {issue['title']}".strip()
+    sections = [heading]
     if body:
         sections.append(body)
     for comment in comments:
         author = (comment.get("author") or {}).get("login") or "unknown"
         sections.append(f"Comment from {author}:\n{comment['body'].strip()}")
-    return "\n\n".join(sections)
+    return IssueSpec(
+        contents="\n\n".join(sections),
+        summary=f"{heading}, {describe_issue_parts(bool(body), len(comments))}",
+    )
 
 
-def read_issue_spec(repo_root, reference):
+def read_issue_spec(repo_root, reference, store):
     try:
         result = subprocess.run(
             ["gh", "issue", "view", reference, "--json", ISSUE_SPEC_FIELDS],
@@ -1134,17 +1218,31 @@ def read_issue_spec(repo_root, reference):
         detail = result.stderr.strip() or "gh issue view failed"
         return spec_not_fetched(reference, f"gh issue view failed: {detail}")
     try:
-        contents = build_issue_spec(json.loads(result.stdout))
+        issue = build_issue_spec(json.loads(result.stdout))
     except (AttributeError, KeyError, TypeError, ValueError):
         return spec_not_fetched(
             reference, "gh issue view returned output that could not be read"
         )
-    if contents is None:
+    if issue is None:
         return spec_not_fetched(reference, "the issue has no body and no comments")
-    return reference, contents
+    # Beside the report files and never in the reviewed checkout, whose own
+    # untracked files are part of the Review Scope: a spec dropped there would
+    # be reviewed as work (#33).
+    try:
+        path = store.write_spec(issue.contents)
+    except OSError as error:
+        return spec_not_fetched(
+            reference, f"spec file could not be written: {error}"
+        )
+    return SpecSlot(
+        source=reference,
+        text=build_spec_slot(path, issue.summary),
+        file=path,
+    )
 
 
 def read_spec_file(reference, candidate):
+    """A spec already in the checkout is named where it lies; nothing is copied."""
     try:
         contents = candidate.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -1153,20 +1251,22 @@ def read_spec_file(reference, candidate):
         )
     if not contents.strip():
         return spec_not_fetched(reference, "spec file is empty")
-    return reference, contents
+    return SpecSlot(
+        source=reference, text=build_spec_slot(reference), file=reference
+    )
 
 
-def read_spec(repo_root, reference):
-    """The spec's text, or the failure a Lane is handed in its place.
+def read_spec(repo_root, reference, store):
+    """The Spec slot a Lane is handed, however the reference turned out.
 
-    Only a reference the caller never gave leaves the contents empty; every
-    other outcome is text. So `None` keeps exactly one meaning — the Spec axis
-    was asked for without a spec — and preparation still fails on that alone.
+    Only a reference the caller never gave leaves the slot empty; every other
+    outcome is text. So `None` keeps exactly one meaning — the Spec axis was
+    asked for without a spec — and preparation still fails on that alone.
     """
     if reference is None:
-        return "not provided", None
+        return SpecSlot(source="not provided", text=None)
     if reference.startswith(("http://", "https://")):
-        return read_issue_spec(repo_root, reference)
+        return read_issue_spec(repo_root, reference, store)
     candidate = pathlib.Path(reference)
     if not candidate.is_absolute():
         candidate = pathlib.Path(repo_root) / candidate
@@ -1174,26 +1274,46 @@ def read_spec(repo_root, reference):
         return read_spec_file(reference, candidate)
     if "/" in reference or candidate.suffix:
         return spec_not_fetched(reference, "spec file not found")
-    return read_issue_spec(repo_root, reference)
+    return read_issue_spec(repo_root, reference, store)
 
 
-def prepare_review(args):
+def ensure_store_is_outside_the_checkout(repo_root, store):
+    """Refuse a state root the review would end up reviewing.
+
+    The Review Scope is the tree as it stands, so a store inside the checkout
+    feeds a review its own spec file — written during preparation, before the
+    Scope is read — and feeds round two round one's report. That is the Scope
+    being wrong rather than a spec being unreachable, and #30's rule that a
+    missing spec costs the review nothing does not reach it: a review of a
+    polluted Scope is worse than no review, so none runs (#33).
+    """
+    root = pathlib.Path(store.root).resolve()
+    checkout = pathlib.Path(repo_root).resolve()
+    if root == checkout or checkout in root.parents:
+        raise RuntimeError(
+            f"state directory is inside the reviewed checkout: {store.root}"
+        )
+
+
+def prepare_review(args, store):
     """Everything every requested axis needs, or the failure that there is not.
 
     Each requested axis's brief is built here rather than where its Lane opens,
     so an axis that cannot be briefed fails preparation — before this review is
-    reported started, and before any pane exists to tear down.
+    reported started, and before any pane exists to tear down. The store comes
+    in because a fetched issue is written out here, where the brief that names
+    it is filled, rather than at the delivery that reads the brief.
     """
     repo_root = canonical_worktree_root(args.cwd)
-    source, contents = read_spec(repo_root, args.spec)
+    ensure_store_is_outside_the_checkout(repo_root, store)
+    spec = read_spec(repo_root, args.spec, store)
     navigation_block = read_code_graph_navigation(
         repo_root, args.scope.fork_point
     )
     preparation = ReviewPreparation(
         scope=args.scope,
         commit_list=read_commit_list(args.cwd, args.base),
-        spec_source=source,
-        spec_contents=contents,
+        spec=spec,
         standards_files=find_standards_files(repo_root),
         navigation_block=navigation_block,
         code_graph_used=navigation_block is not None,
@@ -2591,7 +2711,7 @@ class Lane:
 
     def recovered_preparation(self, runs):
         """What a recovered review was prepared from, read back off its own records."""
-        return next(
+        preparation = next(
             (
                 run.state.get("preparation")
                 for run in runs
@@ -2599,6 +2719,13 @@ class Lane:
             ),
             None,
         )
+        if preparation is None:
+            return None
+        # A record written before the Bridge wrote spec files names none, which
+        # is the truth about that review rather than a gap in its receipt. The
+        # field is filled in so every result carries it and no caller reading
+        # the JSON has to handle two shapes (#33).
+        return {**preparation, "specFile": preparation.get("specFile")}
 
 
 class CodexLane(Lane):
@@ -3299,7 +3426,7 @@ async def run_bridge(args):
     if not args.recover_session and not probe:
         args.scope = resolve_review_scope(args.cwd, args.base)
         ensure_scope_holds_work(args.cwd, args.scope)
-        args.preparation = prepare_review(args)
+        args.preparation = prepare_review(args, store)
     elif probe:
         args.preparation = None
     # Preparation has succeeded and no Lane has opened yet, which is what this
