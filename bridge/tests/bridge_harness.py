@@ -763,7 +763,20 @@ class FakePaneTestCase(unittest.TestCase):
         )
         return calls
 
-    def install_graph_stub(self, graph_result, graph_status=None):
+    def install_graph_stub(
+        self,
+        graph_result,
+        graph_status=None,
+        build_returncode=0,
+        build_seconds=0,
+    ):
+        """Stand the graph CLI up on `PATH`, logging every call it is handed.
+
+        `build_returncode` and `build_seconds` are the two ways a build goes
+        wrong — it fails, or it runs past the Bridge's bound — and both are
+        answered by the real executable rather than by patching the Bridge, so
+        a test asserts on the same process boundary a review crosses.
+        """
         graph_bin = self.root / "graph-bin"
         graph_bin.mkdir()
         call_log = self.root / "graph-calls.jsonl"
@@ -784,6 +797,7 @@ class FakePaneTestCase(unittest.TestCase):
             "import os\n"
             "import pathlib\n"
             "import sys\n"
+            "import time\n"
             "with pathlib.Path(os.environ['GRAPH_CALL_LOG']).open(\n"
             "    'a', encoding='utf-8'\n"
             ") as stream:\n"
@@ -795,7 +809,10 @@ class FakePaneTestCase(unittest.TestCase):
             "if sys.argv[1] == 'status':\n"
             f"    print({encoded_status!r})\n"
             "elif sys.argv[1] == 'detect-changes':\n"
-            f"    print({encoded_result!r})\n",
+            f"    print({encoded_result!r})\n"
+            "elif sys.argv[1] == 'build':\n"
+            f"    time.sleep({build_seconds!r})\n"
+            f"    sys.exit({build_returncode!r})\n",
             encoding="utf-8",
         )
         executable.chmod(0o755)
@@ -818,6 +835,34 @@ class FakePaneTestCase(unittest.TestCase):
             json.loads(line)
             for line in call_log.read_text(encoding="utf-8").splitlines()
         ]
+
+    def use_linked_worktree(self, branch="feature-graph"):
+        """Move this test into a linked worktree, and hand back the checkout it left.
+
+        A worktree is reviewed exactly as its main checkout is, so everything
+        the harness points at the checkout under review — the `cwd` an
+        invocation carries, the worktree root it is keyed by — moves with it.
+        """
+        main_checkout = self.worktree
+        linked_worktree = self.root / "linked-worktree"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(main_checkout),
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                branch,
+                str(linked_worktree),
+                "HEAD",
+            ],
+            check=True,
+        )
+        self.worktree = linked_worktree
+        self.worktree_root = str(linked_worktree)
+        return main_checkout
 
     def use_graphless_path(self):
         graphless_bin = self.root / "graphless-bin"

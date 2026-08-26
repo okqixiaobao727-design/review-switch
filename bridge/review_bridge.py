@@ -68,6 +68,21 @@ NO_LIVE_SESSION_EXIT = 3
 REVIEWER_CODEX = "codex"
 REVIEWER_CLAUDE = "claude"
 CODE_GRAPH_CLI = "code-review-graph"
+# The tool's own "put the graph somewhere else" variable, which the Bridge
+# takes out of the environment it hands the CLI. One data directory holds one
+# graph — measured: two repositories built against one `CRG_DATA_DIR` leave a
+# single `graph.db`, the second build evicting the first — so honouring it
+# would give every checkout under review the previous one's map. A checkout
+# owns its graph (ADR-0005), which is a rule about where the graph is, not a
+# preference an operator's environment can settle.
+CODE_GRAPH_DATA_DIR_VAR = "CRG_DATA_DIR"
+# A build is the one call in the graph flow whose cost is the whole checkout
+# rather than the change, and it scales with source-file count: 1.75 s for 53
+# files, measured in ADR-0005. The bound is that with room for a repository
+# some fifty times the size, and is deliberately not configurable — a review
+# that outgrows it falls back to running without the graph, as any other
+# failure of the tool does.
+CODE_GRAPH_BUILD_TIMEOUT_SECONDS = 120
 # The four disjoint counters one axis's spend is reported as.
 COUNTERS = ("input", "output", "cache_read", "cache_creation")
 # The four points in a review's life a caller may hand one command for, each
@@ -493,29 +508,6 @@ def ensure_scope_holds_work(cwd, scope):
         )
 
 
-def resolve_graph_checkout(cwd):
-    """The checkout whose code graph covers `cwd`, or nothing when none does.
-
-    Only the main checkout's does, and only for itself: `.code-review-graph/`
-    is gitignored, so a linked worktree has no graph of its own and the main
-    checkout's holds none of the worktree's files. Where a worktree's graph
-    should live is #29's decision; until it lands, a worktree has no checkout
-    to consult.
-    """
-    result = run_git(
-        cwd,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    main_checkout = pathlib.Path(result.stdout.strip()).parent
-    if main_checkout.resolve() != pathlib.Path(cwd).resolve():
-        return None
-    return str(main_checkout)
-
-
 def tmux_server_identity(value):
     parts = value.rsplit(",", 2)
     if len(parts) != 3 or not parts[0] or not parts[1]:
@@ -875,32 +867,48 @@ def append_navigation_block(brief, navigation_block):
     )
 
 
-def read_code_graph_navigation(cwd, fork_point):
+def read_code_graph_navigation(checkout, fork_point):
     """The navigation block for the Scope, or nothing when the graph can't see it.
+
+    A checkout owns its graph, so the CLI is pointed at the one under review —
+    a linked worktree as readily as a main checkout, since a worktree's graph
+    lives in the worktree and dies with it (ADR-0005). Where nothing has been
+    built the Bridge builds it, and where something has it updates instead:
+    the two are exclusive, because a build re-parses every file the update
+    would have. Three calls, then, however the checkout arrives — and none of
+    them inherits the operator's `CRG_DATA_DIR`, which would put every
+    checkout's graph in the one file.
 
     The base is the Scope's fork point, not the fixed point it was named by, so
     the graph's changed set covers exactly the range the Axis Brief's diff does.
-    Uncommitted work is in that range: `update --brief` re-parses changed files
-    from disk before `detect-changes` reads them, and a git diff base compares
-    against the working tree. So a dirty tree is no reason to skip; only having
-    no checkout to consult is.
+    Uncommitted work is in that range: build and `update --brief` alike re-parse
+    from disk before `detect-changes` reads the graph, and a git diff base
+    compares against the working tree. So a dirty tree is no reason to skip.
     """
-    main_checkout = resolve_graph_checkout(cwd)
-    if main_checkout is None:
-        return None
     executable = shutil.which(CODE_GRAPH_CLI)
     if executable is None:
         return None
 
-    common_arguments = ["--base", fork_point, "--repo", main_checkout]
-    try:
-        status = subprocess.run(
-            [executable, "status", "--json", "--repo", main_checkout],
-            cwd=main_checkout,
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name != CODE_GRAPH_DATA_DIR_VAR
+    }
+
+    def graph_call(arguments, timeout=None):
+        return subprocess.run(
+            [executable, *arguments, "--repo", checkout],
+            cwd=checkout,
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
+            timeout=timeout,
         )
+
+    scoped_arguments = ["--base", fork_point]
+    try:
+        status = graph_call(["status", "--json"])
         if status.returncode != 0:
             return None
         status_result = json.loads(status.stdout)
@@ -916,31 +924,22 @@ def read_code_graph_navigation(cwd, fork_point):
                 "built_at_commit",
             )
         )
-        if not graph_exists:
+        if graph_exists:
+            refresh = graph_call(["update", "--brief", *scoped_arguments])
+        else:
+            refresh = graph_call(
+                ["build"], timeout=CODE_GRAPH_BUILD_TIMEOUT_SECONDS
+            )
+        if refresh.returncode != 0:
             return None
-        update = subprocess.run(
-            [executable, "update", "--brief", *common_arguments],
-            cwd=main_checkout,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if update.returncode != 0:
-            return None
-        detection = subprocess.run(
-            [executable, "detect-changes", *common_arguments],
-            cwd=main_checkout,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except (OSError, TypeError, ValueError):
+        detection = graph_call(["detect-changes", *scoped_arguments])
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
         return None
     if detection.returncode != 0:
         return None
     try:
         result = json.loads(detection.stdout)
-        return build_navigation_block(result, main_checkout)
+        return build_navigation_block(result, checkout)
     except (KeyError, TypeError, ValueError):
         return None
 
