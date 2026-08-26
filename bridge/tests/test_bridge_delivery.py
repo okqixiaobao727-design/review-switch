@@ -226,6 +226,9 @@ class DeliveryContractTests(unittest.TestCase):
             store = self.bridge.SessionStore(temp_dir)
             with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
                 store.read("../another-task")
+            # The report file is composed from the same id and guarded the same way.
+            with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
+                store.write_report("../another-task", "a report")
 
     def test_same_pane_rejects_concurrent_bridge_calls(self):
         owner = self.bridge.InvocationOwner(
@@ -517,6 +520,57 @@ class ReviewDeliveryTests(FakePaneTestCase):
             {state["axis"] for state in self.stored_sessions(expected_count=2)},
             {"standards", "spec"},
         )
+
+    def test_each_axis_report_is_written_where_a_human_can_open_it(self):
+        """The result names a file, and the file holds that axis's report as markdown.
+
+        The caller is given a path rather than the report a second time, so the
+        path has to lead somewhere readable on its own.
+        """
+        self.codex.concurrent_turn_count = 2
+        self.codex.finish("standards clear", axis="standards")
+        self.codex.finish("spec clear", axis="spec")
+
+        code, output = self.run_bridge(self.args(axis="both"))
+
+        self.assertEqual(code, 0)
+        paths = set()
+        for axis in ("standards", "spec"):
+            result = output["axes"][axis]
+            report_file = pathlib.Path(result["reportFile"])
+            self.assertEqual(report_file.suffix, ".md")
+            self.assertEqual(
+                report_file.read_text(encoding="utf-8"), result["finalMessage"]
+            )
+            paths.add(result["reportFile"])
+        self.assertEqual(len(paths), 2)
+
+    def test_an_axis_that_reported_nothing_names_no_report_file(self):
+        """No report body, no file: an empty one would be a path to nothing."""
+        self.codex.finish("")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(output["axes"]["standards"]["reportFile"])
+        self.assertEqual(list(self.state_dir.glob("*.md")), [])
+
+    def test_an_axis_that_reported_only_whitespace_is_a_failed_axis(self):
+        """Whitespace is not a report, and one rule says so everywhere.
+
+        Were the file rule stricter than the status rule, an axis could complete
+        and still have no report to point its caller at.
+        """
+        self.codex.finish("  \n\t ")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        self.assertEqual(code, 1)
+        result = output["axes"]["standards"]
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["reason"])
+        self.assertIsNone(result["reportFile"])
+        self.assertEqual(list(self.state_dir.glob("*.md")), [])
 
     def test_completed_turn_without_a_report_is_a_failed_axis(self):
         self.codex.finish("")

@@ -104,18 +104,22 @@ class RecoveryTests(FakePaneTestCase):
     def assert_stored_report_recovers_with_its_cost(
         self, state, reviewer, message, resolved_model
     ):
+        report_file = self.state_dir / f"{state['reviewSessionId']}.md"
         self.assertEqual(
             state["report"],
             {
                 "status": "completed",
                 "finalMessage": message,
                 "reviewSessionId": state["reviewSessionId"],
+                "reportFile": str(report_file),
                 "resolvedModel": resolved_model,
                 "costCounters": ROUND_ONE_COUNTERS,
                 "costDetail": None,
                 "delivered": False,
             },
         )
+        # The readable rendering outlives the driver the same way the record does.
+        self.assertEqual(report_file.read_text(encoding="utf-8"), message)
         hook, hook_record = self.recording_axis_hook()
 
         code, output = self.run_bridge(self.args(
@@ -128,8 +132,11 @@ class RecoveryTests(FakePaneTestCase):
         result = output["axes"]["standards"]
         self.assertTrue(result["recovered"])
         self.assertEqual(result["finalMessage"], message)
+        # A recovered delivery names the file the first delivery wrote, not a new one.
+        self.assertEqual(result["reportFile"], str(report_file))
         self.assertEqual(output["preparation"], state["preparation"])
         hook_facts = json.loads(hook_record.read_text(encoding="utf-8"))
+        self.assertEqual(hook_facts["REVIEW_REPORT_FILE"], str(report_file))
         self.assertEqual(hook_facts["REVIEW_MODEL"], resolved_model)
         self.assertEqual(
             {
