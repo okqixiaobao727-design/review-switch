@@ -52,6 +52,7 @@ class StaticPreparation:
             "specFile": "docs/feature.md",
             "standardsFiles": [],
             "codeGraphUsed": False,
+            "responseFile": None,
         }
 
 
@@ -71,6 +72,7 @@ def base_args(**overrides):
         "network": False,
         "tmux_target": None,
         "resume_session": None,
+        "response": None,
         "recover_session": False,
         "model": None,
         "effort": None,
@@ -742,7 +744,25 @@ class FakePaneTestCase(unittest.TestCase):
             "startup_timeout": 5,
         }
         values.update(overrides)
+        if values.get("resume_session") and "response" not in overrides:
+            values["response"] = self.default_response_file()
         return base_args(**values)
+
+    def default_response_file(self):
+        """The Response a resume carries when a test is about something else.
+
+        Every resume a caller makes carries one, so every resume the harness
+        makes does too: a test that leaves it out would otherwise drive a
+        command line the Bridge refuses (#37). A test that is *about* the
+        Response passes its own, or `response=None` for a resume without one.
+        """
+        path = self.root / "caller-response.md"
+        if not path.exists():
+            path.write_text(
+                '1. "the previous round\'s finding" — fixed in feature.py\n',
+                encoding="utf-8",
+            )
+        return str(path)
 
     def fake_gh(self, returncode=0, stdout="", stderr="", plain_stdout=""):
         """Stand `gh issue view` up at the process boundary, faithful to its flags.

@@ -55,6 +55,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
                 "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
                 "codeGraphUsed": False,
+                "responseFile": None,
             },
         )
         state = self.stored_session()

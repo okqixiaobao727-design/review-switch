@@ -1,7 +1,7 @@
 ---
 name: review-switch
 description: Dispatch a code review to the reviewer lane this machine is configured for. Use when a review is asked for without naming a lane, or when a review-skill invocation was refused and pointed here.
-allowed-tools: Read, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh:*), Bash(review-bridge:*)
+allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh:*), Bash(review-bridge:*)
 ---
 
 !`bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh`
@@ -70,10 +70,55 @@ Read the single JSON result through `axes`:
 Then do what the axis's `next` field names, and nothing else: the Bridge holds the round cap
 and every result says what this lineage is permitted after it. Where `next` is `escalate`, the
 act is this skill's to choose, and here it is to end the review as a disagreement and put both
-positions to whoever asked for it.
+positions to whoever asked for it — naming `axes.<axis>.reportFile` and
+`preparation.responseFile`, so the reader opens each side where it was written. A `refused`
+result carries no `preparation`; name the Response file you passed to the round that was granted.
 
 Treat `preparation` as the Bridge's receipt. If the result explicitly names a gap or a required
 action, act on it exactly as named before declaring the review complete.
+
+### The re-review
+
+Where `next` is `fix then one re-review`, the Bridge grants that round only against a
+**Response**: one line saying what you did with each finding of the round just delivered. A
+finding you decided not to fix and never said so about looks to the reviewer exactly like one you
+ignored, so it is retained and the lineage escalates over a message that never arrived.
+
+Write the Response before you call:
+
+1. One line per finding, in the order the report file lists them, identified by a short quote —
+   the reviewer numbers nothing, and you need not ask it to:
+
+   ```
+   N. <short quote from the finding> — fixed <where> | declined <why> | deferred <ticket>
+   ```
+
+   A `fixed` line names where in one clause, so the reviewer checks it against the diff instead of
+   hunting for it. Keep every line as short as the decision allows: what you owe the reviewer is
+   your decisions, not a second report.
+2. Write it to a file under the system temporary directory, named after the handle so two
+   reviews never collide: `/tmp/review-response-<REVIEW_SESSION_ID>.md`. Never inside the
+   checkout under review — the Spec brief lists that checkout's untracked files, and a Response
+   written there is a file the reviewer is asked to review.
+3. Call the Bridge with the axis's handle and that file:
+
+```bash
+review-bridge --reviewer '<LANE>' \
+  --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis spec \
+  --resume-session '<REVIEW_SESSION_ID>' --response '<RESPONSE_FILE>' \
+  <LIFECYCLE_HOOK_OPTIONS>
+```
+
+A resume without `--response`, or with an empty file, is an ordinary command-line error: no round
+is spent, nothing is `refused`, and you simply call again with the file. `--response` is accepted
+only with `--resume-session`; a first review and a recovery take none.
+
+The Bridge appends the Response to the re-review's turn under a heading of its own and asks the
+reviewer to close each finding or retain it, and to report anything new only where a fix
+introduced it — the round is scoped to the fixes, not a second sweep of the diff.
+
+Nothing you write binds the reviewer. A finding it retains after reading your reason is a
+disagreement with a rationale on both sides, and that result's `next` is `escalate`.
 
 ### What you write
 

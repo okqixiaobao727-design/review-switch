@@ -111,6 +111,14 @@ class HookRecordingTestCase(FakePaneTestCase):
         return code
 
     def review_argv(self, *arguments, timeout="5", axis="standards", hooks=None):
+        # Every resume a caller makes carries a Response, so every resume this
+        # file makes does too; a resume without one never reaches a hook point
+        # at all, which is `test_bridge_response.py`'s to assert (#37).
+        response = (
+            ("--response", self.default_response_file())
+            if "--resume-session" in arguments
+            else ()
+        )
         return (
             "--base", self.fixed_point,
             "--spec", "spec.md",
@@ -119,6 +127,7 @@ class HookRecordingTestCase(FakePaneTestCase):
             "--timeout", timeout,
             "--startup-timeout", "5",
             *(self.hooks() if hooks is None else hooks),
+            *response,
             *arguments,
         )
 

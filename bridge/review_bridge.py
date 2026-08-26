@@ -585,14 +585,19 @@ class SessionStore:
     def spec_path(self, spec_id):
         return self.root / f"{self._safe_id(spec_id)}-spec.md"
 
+    def response_path(self, session_id):
+        return self.root / f"{self._safe_id(session_id)}-response.md"
+
     def _write_readable(self, destination, contents):
         """Put one file in the store where a human or a Lane can open it, and name it.
 
         Every file the store hands a path to is written the same way — private
-        to its owner, and named by the store rather than by whoever asked — so
-        the mode is set in one place instead of once per kind of file.
+        to its owner, byte for byte what it was handed, and named by the store
+        rather than by whoever asked — so the mode is set in one place instead
+        of once per kind of file. `newline=""` is what makes it byte for byte:
+        without it, text mode rewrites every line ending to the platform's.
         """
-        destination.write_text(contents, encoding="utf-8")
+        destination.write_text(contents, encoding="utf-8", newline="")
         os.chmod(destination, 0o600)
         return str(destination)
 
@@ -606,6 +611,19 @@ class SessionStore:
         """
         return self._write_readable(
             self.spec_path(str(uuid.uuid4())), contents
+        )
+
+    def write_response(self, session_id, contents):
+        """Keep this resume's Response beside the report it answers, and name it.
+
+        Named after the session it answers rather than after itself, because
+        one resume answers one round: the file a human opens on an escalation
+        is found from the same handle the report is. The caller wrote it under
+        a temporary directory it is free to clear, so it is copied here rather
+        than pointed at where it lies.
+        """
+        return self._write_readable(
+            self.response_path(session_id), contents
         )
 
     def write_report(self, session_id, final_message):
@@ -971,6 +989,57 @@ def read_code_graph_navigation(checkout, fork_point):
         return None
 
 
+@dataclasses.dataclass(frozen=True)
+class CallerResponse:
+    """What the caller did with the previous round's findings, and where it is kept.
+
+    `text` is the caller's own words, delivered to the reviewer verbatim;
+    `file` is the copy in the state root a human opens beside the report when
+    the lineage escalates. The Bridge holds a Response to nothing but being
+    non-empty, so that the shape of it stays the caller's to change without the
+    Bridge changing with it (ADR-0008).
+    """
+
+    text: str
+    file: str
+
+
+#: The line that separates the caller's dispositions from the brief above them.
+CALLER_RESPONSE_HEADING = "Caller's response to the previous round:"
+#: What the re-review is asked to do with them. Fixed text, owned by the Bridge:
+#: the reviewer closes a finding or keeps it, and a caller that declared every
+#: finding declined has argued its case, not passed its own review.
+#:
+#: The second sentence is where the Rounds Contract's scope reaches the turn.
+#: The brief above names the whole diff and says nothing about rounds, so this
+#: block is the only place a Lane learns it is answering a previous one; told
+#: nothing further, it would sweep that diff again and spend the scoped
+#: re-review as a third round.
+CALLER_RESPONSE_INSTRUCTION = (
+    "For each numbered finding, close it, or retain it against the stated "
+    "reason. Report anything new only where a fix introduced it."
+)
+
+
+def append_caller_response(brief, response):
+    """The caller's dispositions, after a brief this leaves character for character.
+
+    A re-review's turn is round one's brief and this block, and nothing else
+    (ADR-0008): the instructions on scope, diff, spec, and report format have
+    to be the ones round one was held to, or a finding that survives is a
+    finding about a different review. A first review answers nothing and gets
+    no block.
+    """
+    if response is None:
+        return brief
+    return (
+        f"{brief}\n\n"
+        f"{CALLER_RESPONSE_HEADING}\n"
+        f"{with_trailing_newline(response.text)}\n"
+        f"{CALLER_RESPONSE_INSTRUCTION}"
+    )
+
+
 def build_standards_brief(scope, commit_list, standards_files):
     return STANDARDS_BRIEF_TEMPLATE.format(
         diff_command=scope.diff_command,
@@ -1045,6 +1114,7 @@ class ReviewPreparation:
     standards_files: tuple[str, ...]
     navigation_block: str | None = None
     code_graph_used: bool = False
+    response: CallerResponse | None = None
 
     def brief(self, axis):
         """This axis's Axis Brief, ready for whichever Lane delivers it."""
@@ -1055,13 +1125,25 @@ class ReviewPreparation:
         return tuple(self.brief(axis) for axis in axes)
 
     def brief_text(self, axis):
-        """The text of one axis's brief, or the failure that there is none."""
+        """The whole turn one axis is delivered: its brief, and what follows it.
+
+        The two blocks are appended in the order they were added to the turn —
+        navigation (#32), then the caller's Response (#37) — so that neither
+        moves a line of the brief itself, and a re-review reads its own
+        instructions exactly where round one read them.
+        """
+        return append_caller_response(
+            append_navigation_block(
+                self.axis_brief_text(axis), self.navigation_block
+            ),
+            self.response,
+        )
+
+    def axis_brief_text(self, axis):
+        """The Axis Brief itself, or the failure that this axis has none."""
         if axis == "standards":
-            return append_navigation_block(
-                build_standards_brief(
-                    self.scope, self.commit_list, self.standards_files
-                ),
-                self.navigation_block,
+            return build_standards_brief(
+                self.scope, self.commit_list, self.standards_files
             )
         if axis == "spec":
             if self.spec.text is None:
@@ -1069,11 +1151,8 @@ class ReviewPreparation:
                     "spec source was not provided; run with --axis standards "
                     "when no spec exists"
                 )
-            return append_navigation_block(
-                build_spec_brief(
-                    self.scope, self.commit_list, self.spec.text
-                ),
-                self.navigation_block,
+            return build_spec_brief(
+                self.scope, self.commit_list, self.spec.text
             )
         raise RuntimeError("axis 'both' requires the two-pane fan-out")
 
@@ -1084,6 +1163,9 @@ class ReviewPreparation:
             "specFile": self.spec.file,
             "standardsFiles": list(self.standards_files),
             "codeGraphUsed": self.code_graph_used,
+            "responseFile": (
+                self.response.file if self.response is not None else None
+            ),
         }
 
 
@@ -1276,6 +1358,50 @@ def read_spec(repo_root, reference, store):
     if "/" in reference or candidate.suffix:
         return spec_not_fetched(reference, "spec file not found")
     return read_issue_spec(repo_root, reference, store)
+
+
+def read_response_text(path):
+    """One Response exactly as its file holds it, line endings and all.
+
+    Read as bytes and decoded rather than read as text, because text mode
+    translates CRLF to LF: a Response written on Windows would otherwise reach
+    the reviewer, and the state root, as something other than what the caller
+    wrote, and verbatim is the one thing the Bridge promises about it.
+    """
+    return pathlib.Path(path).read_bytes().decode("utf-8")
+
+
+def take_caller_response(preparation, args, store):
+    """Read this round's Response, keep a copy, and name it — or refuse the round.
+
+    Read here and nowhere else. The command line's check is the early answer,
+    and it exists so that a caller who forgot the file loses nothing; reading
+    the file a second time to deliver it would be reading a file that may no
+    longer be the one that was checked, and an emptied Response would go to the
+    reviewer unread. One read, one check, and the bytes delivered are the bytes
+    stored.
+
+    Under the owner's lock, and before the round is spent, for two more
+    reasons. Preparation runs before that lock, so two callers resuming one
+    handle would both write the single file that handle names, and whichever
+    took the round could deliver its own text while its receipt named the
+    other's. And a Response that cannot be read at the moment it is needed
+    costs its caller no round, exactly as a forgotten one costs none.
+    """
+    if preparation is None or not args.response:
+        return preparation
+    text = read_response_text(args.response)
+    if not text.strip():
+        raise RuntimeError(
+            f"--response has nothing in it: {args.response}"
+        )
+    return dataclasses.replace(
+        preparation,
+        response=CallerResponse(
+            text=text,
+            file=store.write_response(args.resume_session, text),
+        ),
+    )
 
 
 def ensure_store_is_outside_the_checkout(repo_root, store):
@@ -1530,6 +1656,12 @@ def grant_round(args, owner, store):
     a resume that then fails has still had it, and a fresh lineage is the way
     back.
 
+    The round, the Response it is granted against, and the receipt naming that
+    Response are taken together and written once. Once, because a record saying
+    a second round has been had while still naming the first round's spec file
+    and no Response describes a review nobody ran, and two writes leave a
+    process room to die between them holding exactly that.
+
     Returns the record the Lane resumes, and the refusal that it may not.
     """
     state = store.read(args.resume_session)
@@ -1537,7 +1669,13 @@ def grant_round(args, owner, store):
     refusal = refusal_for(state)
     if refusal is not None:
         return state, refusal
+    # Past the refusal and before the round is spent, so a Response that cannot
+    # be read here costs no round; why it is read here and not in preparation
+    # is `take_caller_response`'s to say.
+    args.preparation = take_caller_response(args.preparation, args, store)
     state["rounds"] = rounds_had(state) + 1
+    state["preparation"] = preparation_report(args)
+    state["updatedAt"] = time.time()
     store.write(state["reviewSessionId"], state)
     return state, None
 
@@ -2722,11 +2860,16 @@ class Lane:
         )
         if preparation is None:
             return None
-        # A record written before the Bridge wrote spec files names none, which
-        # is the truth about that review rather than a gap in its receipt. The
-        # field is filled in so every result carries it and no caller reading
-        # the JSON has to handle two shapes (#33).
-        return {**preparation, "specFile": preparation.get("specFile")}
+        # A record written before the Bridge wrote spec files (#33) or copied a
+        # Response (#37) names neither, which is the truth about that review
+        # rather than a gap in its receipt. Both fields are filled in so every
+        # result carries them and no caller reading the JSON has to handle two
+        # shapes.
+        return {
+            **preparation,
+            "specFile": preparation.get("specFile"),
+            "responseFile": preparation.get("responseFile"),
+        }
 
 
 class CodexLane(Lane):
@@ -3550,6 +3693,12 @@ def build_parser():
     )
     parser.add_argument("--resume-session")
     parser.add_argument(
+        "--response",
+        help="file holding this caller's disposition of the previous round's "
+             "findings: required with --resume-session, and refused without "
+             "it",
+    )
+    parser.add_argument(
         "--recover-session",
         action="store_true",
         help=(
@@ -3572,6 +3721,36 @@ def build_parser():
     return parser
 
 
+def check_caller_response(parser, args):
+    """Hold every resume to a Response, and hold every other call to none.
+
+    Checked here, on the command line, because here is before preparation,
+    before the owner lock, and before the round is granted: a resume that
+    cannot say what became of round one's findings opens no Lane, writes no
+    record, and bills nothing, so its caller simply calls again with the file.
+    Failing it is an ordinary command-line error and not a `refused` result,
+    which is the round cap's word and means something else entirely.
+
+    Non-empty is the whole of the check. The Response's format is the
+    Dispatcher's, and a Bridge that parsed it would have to change with it.
+    """
+    if not args.resume_session:
+        if args.response:
+            parser.error("--response is accepted only with --resume-session")
+        return
+    if not args.response:
+        parser.error(
+            "--resume-session requires --response: a re-review is delivered "
+            "the caller's disposition of the previous round's findings"
+        )
+    try:
+        text = read_response_text(args.response)
+    except (OSError, UnicodeDecodeError) as error:
+        parser.error(f"--response could not be read: {error}")
+    if not text.strip():
+        parser.error(f"--response has nothing in it: {args.response}")
+
+
 def parse_args(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3580,6 +3759,17 @@ def parse_args(argv=None):
             parser.error("--recover-session and --resume-session are exclusive")
     elif not (args.probe or args.browser_probe) and not args.base:
         parser.error("--base is required")
+    if (args.probe or args.browser_probe) and args.resume_session:
+        # A probe is prepared for nothing and brings its own fixed text, so it
+        # has no round-one findings to answer and can carry no Response. Left
+        # accepted, it would spend a lineage's one re-review on a health check:
+        # the round is granted, the Lane is handed the probe brief, and the
+        # record's receipt is overwritten with nothing.
+        parser.error(
+            "--probe and --browser-probe run a health probe rather than a "
+            "review, and take no --resume-session"
+        )
+    check_caller_response(parser, args)
     return args
 
 
