@@ -25,6 +25,26 @@ GH_ISSUE_WITH_ONLY_A_COMMENT = '{"body":"","comments":[{"id":"IC_kwDODKw3uc8AAAA
 GH_ISSUE_WITHOUT_A_BODY_OR_COMMENT = '{"body":"","comments":[],"number":11230,"title":"Brew install"}'
 GH_ISSUE_THE_COMMENTS_FLAG_WAY = 'author:\tokqixiaobao727-design\nassociation:\towner\nedited:\tfalse\nstatus:\tnone\n--\n/crew crewtask/2\n--\n'
 
+# What `code-review-graph status --json` really answers in a checkout that has
+# never been built, captured from real code-review-graph on 2026-08-26 in a
+# throwaway repository. It is the reply that now sends the Bridge to `build`,
+# so no test here may pass against a shape the tool never produces (#30).
+#   code-review-graph status --json --repo <fresh checkout>
+GRAPH_STATUS_NEVER_BUILT = {
+    "nodes": 0,
+    "edges": 0,
+    "files": 0,
+    "languages": [],
+    "last_updated": None,
+    "vcs": "git",
+    "built_on_branch": None,
+    "built_at_commit": None,
+    "current_branch": "main",
+    "current_sha": "fb2fa8fda4ff0ff2f3148bf366480a8dbb1666f0",
+    "svn_branch": None,
+    "svn_revision": None,
+}
+
 
 class AxisBriefTests(unittest.TestCase):
     """The fixed text each axis is briefed with, and the navigation block in it."""
@@ -327,7 +347,16 @@ class PreparationTests(FakePaneTestCase):
         self.assertNotIn("Start here (from the code graph", prompt)
         self.assertIs(output["preparation"]["codeGraphUsed"], False)
 
-    def test_the_cli_resolves_a_graph_outside_the_main_checkout(self):
+    def test_an_operator_data_dir_never_reaches_the_graph_cli(self):
+        """One data directory holds one graph, so honouring it crosses checkouts.
+
+        Measured against real code-review-graph: two repositories built with
+        one `CRG_DATA_DIR` leave a single `graph.db`, the second build evicting
+        the first, and `status` then answers both with the same
+        `built_at_commit`. A checkout owns its graph (ADR-0005), so the Bridge
+        takes the variable out rather than letting a review navigate by the
+        previous review's map.
+        """
         external_graph = self.root / "external-graph"
         external_graph.mkdir()
         self.enter(
@@ -361,21 +390,25 @@ class PreparationTests(FakePaneTestCase):
             ["status", "update", "detect-changes"],
         )
         for call in calls:
-            self.assertEqual(call["dataDirEnv"], str(external_graph))
+            self.assertIsNone(call["dataDirEnv"])
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertIn("feature.py:1–1  feature", prompt)
         self.assertTrue(output["preparation"]["codeGraphUsed"])
 
-    def test_a_main_checkout_with_no_graph_is_treated_as_unavailable(self):
+    def test_a_main_checkout_with_no_graph_is_built_rather_than_skipped(self):
         call_log = self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []},
-            graph_status={
-                "nodes": 0,
-                "files": 0,
-                "last_updated": None,
-                "built_on_branch": None,
-                "built_at_commit": None,
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                    }
+                ],
+                "review_priorities": [],
             },
+            graph_status=GRAPH_STATUS_NEVER_BUILT,
         )
         self.codex.finish("no findings")
 
@@ -384,9 +417,12 @@ class PreparationTests(FakePaneTestCase):
         calls = self.graph_calls(call_log)
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
-        self.assertEqual([call["argv"][0] for call in calls], ["status"])
-        self.assertNotIn("Start here (from the code graph", prompt)
-        self.assertIs(output["preparation"]["codeGraphUsed"], False)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "build", "detect-changes"],
+        )
+        self.assertIn("feature.py:1–1  feature", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
 
     def test_an_unreadable_graph_status_contributes_no_navigation(self):
         call_log = self.install_graph_stub(
@@ -483,33 +519,64 @@ class PreparationTests(FakePaneTestCase):
         self.assertIn(f"Diff: git diff {self.fixed_point}", prompt)
         self.assertTrue(output["preparation"]["codeGraphUsed"])
 
-    def test_a_linked_worktree_never_queries_or_mentions_the_graph(self):
-        """#29 settles where a worktree's graph lives; until then, skip it."""
-        main_checkout = self.worktree
-        linked_worktree = self.root / "linked-worktree"
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(main_checkout),
-                "worktree",
-                "add",
-                "--quiet",
-                "-b",
-                "feature-graph",
-                str(linked_worktree),
-                "HEAD",
-            ],
-            check=True,
-        )
+    def test_a_worktree_with_no_graph_is_built_where_it_stands(self):
+        """The worktree owns its graph, so it is built there, not consulted elsewhere."""
+        main_checkout = self.use_linked_worktree()
         (main_checkout / ".code-review-graph").mkdir()
-        self.worktree = linked_worktree
-        self.worktree_root = str(linked_worktree)
         call_log = self.install_graph_stub(
             {
                 "changed_functions": [
                     {
-                        "file_path": str(main_checkout / "feature.py"),
+                        "file_path": str(self.worktree / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                    }
+                ],
+                "review_priorities": [],
+            },
+            graph_status=GRAPH_STATUS_NEVER_BUILT,
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="spec"))
+
+        calls = self.graph_calls(call_log)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "build", "detect-changes"],
+        )
+        for call in calls:
+            self.assertEqual(
+                pathlib.Path(
+                    call["argv"][call["argv"].index("--repo") + 1]
+                ).resolve(),
+                self.worktree.resolve(),
+            )
+            self.assertEqual(
+                pathlib.Path(call["cwd"]).resolve(), self.worktree.resolve()
+            )
+        self.assertNotIn("--base", calls[1]["argv"])
+        self.assertEqual(
+            calls[2]["argv"][calls[2]["argv"].index("--base") + 1],
+            self.fixed_point,
+        )
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn(
+            "Start here (from the code graph; the diff is the full scope):\n"
+            "feature.py:1–1  feature",
+            prompt,
+        )
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
+    def test_a_worktree_with_a_graph_is_updated_rather_than_built(self):
+        self.use_linked_worktree()
+        call_log = self.install_graph_stub(
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "feature.py"),
                         "line_start": 1,
                         "line_end": 1,
                         "name": "feature",
@@ -520,13 +587,69 @@ class PreparationTests(FakePaneTestCase):
         )
         self.codex.finish("no findings")
 
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        calls = self.graph_calls(call_log)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "update", "detect-changes"],
+        )
+        self.assertIn("--brief", calls[1]["argv"])
+        for call in calls[1:]:
+            self.assertEqual(
+                call["argv"][call["argv"].index("--base") + 1],
+                self.fixed_point,
+            )
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn("feature.py:1–1  feature", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
+    def test_a_failing_build_leaves_the_brief_unchanged(self):
+        self.use_linked_worktree()
+        call_log = self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []},
+            graph_status=GRAPH_STATUS_NEVER_BUILT,
+            build_returncode=1,
+        )
+        self.codex.finish("no findings")
+
         code, output = self.run_bridge(self.args(axis="spec"))
 
+        calls = self.graph_calls(call_log)
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
-        self.assertFalse(call_log.exists())
+        self.assertEqual(
+            [call["argv"][0] for call in calls], ["status", "build"]
+        )
         self.assertNotIn("Start here (from the code graph", prompt)
-        self.assertFalse(output["preparation"]["codeGraphUsed"])
+        self.assertIs(output["preparation"]["codeGraphUsed"], False)
+
+    def test_a_build_past_its_bound_leaves_the_brief_unchanged(self):
+        """The one unbounded call in the flow, bounded; overrunning it is absence."""
+        self.use_linked_worktree()
+        call_log = self.install_graph_stub(
+            {"changed_functions": [], "review_priorities": []},
+            graph_status=GRAPH_STATUS_NEVER_BUILT,
+            build_seconds=30,
+        )
+        self.enter(
+            mock.patch.object(
+                self.bridge, "CODE_GRAPH_BUILD_TIMEOUT_SECONDS", 0.5
+            )
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        calls = self.graph_calls(call_log)
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [call["argv"][0] for call in calls], ["status", "build"]
+        )
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertIs(output["preparation"]["codeGraphUsed"], False)
 
     def test_an_unresolvable_fixed_point_fails_before_a_pane_opens(self):
         with mock.patch.object(

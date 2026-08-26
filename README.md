@@ -82,7 +82,10 @@ that runs `review-bridge`, and `git`.
   startup settles. The pane is torn down when the turn ends and the lineage is left resumable.
 - **claude Lane** — the `claude` CLI. Each axis is a headless process, and no tmux is involved.
 
-`code-review-graph` is optional on either Lane: when its CLI and an existing graph are available,
-the Bridge adds navigation pointers to each Axis Brief. The review still runs without it.
+`code-review-graph` is optional on either Lane: when its CLI is available, the Bridge adds
+navigation pointers to each Axis Brief. It points the CLI at the checkout under review — a
+linked worktree as readily as a main checkout — and builds the graph there when none exists,
+so a first review in a fresh worktree takes a few seconds longer than later ones. The review
+still runs without it, and any failure of the tool is simply the tool being absent.
 
 Running the test suites additionally needs `pytest`.
