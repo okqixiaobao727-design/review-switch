@@ -4,6 +4,7 @@
 import argparse
 import pathlib
 import re
+import subprocess
 import sys
 
 
@@ -92,16 +93,77 @@ def ignored_directory_names(root):
     return names
 
 
+def git_output(root, *arguments):
+    """One git command's stdout at `root`, or nothing when git cannot answer."""
+    try:
+        finished = subprocess.run(
+            ("git", "-C", str(root)) + arguments,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if finished.returncode != 0:
+        return None
+    return finished.stdout.decode("utf-8", "surrogateescape")
+
+
+def tracked_paths(root):
+    """What git tracks at `root`, or nothing unless `root` is itself a checkout.
+
+    git searches upwards for a repository, so an export unpacked inside one
+    gets its host's answer — an index that says nothing about the export, and
+    so a scan of nothing at all. Only the tree that is the checkout may answer
+    with git; every other tree is walked.
+    """
+    toplevel = git_output(root, "rev-parse", "--show-toplevel")
+    if toplevel is None:
+        return None
+    if pathlib.Path(toplevel.strip()).resolve() != root.resolve():
+        return None
+    listing = git_output(root, "ls-files", "-z")
+    if listing is None:
+        return None
+    return [pathlib.Path(name) for name in listing.split("\0") if name]
+
+
+def walked_paths(root):
+    """Every file lying in the tree, less the directories its ignore policy names."""
+    ignored_directories = ignored_directory_names(root)
+    return [
+        path.relative_to(root)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and not any(
+            part in ignored_directories
+            for part in path.relative_to(root).parts[:-1]
+        )
+    ]
+
+
+def shipped_paths(root):
+    """The files this tree publishes: what git tracks, or what lies in it.
+
+    A checkout publishes what git tracks. Walking the disk instead lets
+    anything untracked that no `.gitignore` directory name happens to cover
+    decide the answer — another session's worktree under `.claude/worktrees/`,
+    whose `.git` pointer file carries an absolute path and so the developer's
+    user name, failed the lint this way (#35). The question is whether what we
+    publish carries private residue, and that cannot depend on what else is on
+    the disk. Only a tree with no checkout to ask, such as one validated after
+    export, falls back to the walk.
+    """
+    tracked = tracked_paths(root)
+    return walked_paths(root) if tracked is None else tracked
+
+
 def shipped_text_files(root):
     """Yield readable shipped files while skipping VCS/build artifacts and policy data."""
-    ignored_directories = ignored_directory_names(root)
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(root)
-        if any(part in ignored_directories for part in relative.parts[:-1]):
-            continue
+    for relative in shipped_paths(root):
         if relative.name == LOCAL_IDENTIFIERS_FILE:
+            continue
+        path = root / relative
+        if not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8")
