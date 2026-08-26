@@ -227,6 +227,35 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
 class PreparationTests(FakePaneTestCase):
     """What a review is prepared from before any pane opens."""
 
+    def fixed_point_that_has_moved_on(self):
+        """A branch at the fork point that then commits on without this tree.
+
+        The shape a stale fixed point has in life: the branch names a commit
+        the working tree forked away from, so the branch and
+        `git merge-base <branch> HEAD` are two different revisions. Its name is
+        handed back for the review to be based on.
+        """
+        def git(*arguments):
+            result = subprocess.run(
+                ["git", "-C", str(self.worktree), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+
+        moved = git(
+            "commit-tree",
+            f"{self.fixed_point}^{{tree}}",
+            "-p",
+            self.fixed_point,
+            "-m",
+            "the fixed point moves on",
+        )
+        self.assertNotEqual(moved, self.fixed_point)
+        git("update-ref", "refs/heads/trunk", moved)
+        return "trunk"
+
     def test_the_graph_cli_runs_once_and_its_navigation_reaches_the_brief(self):
         (self.worktree / ".code-review-graph").mkdir()
         call_log = self.install_graph_stub(
@@ -250,10 +279,7 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(axis="standards"))
 
-        calls = [
-            json.loads(line)
-            for line in call_log.read_text(encoding="utf-8").splitlines()
-        ]
+        calls = self.graph_calls(call_log)
         self.assertEqual(code, 0)
         self.assertEqual(
             [call["argv"][0] for call in calls],
@@ -328,10 +354,7 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(axis="spec"))
 
-        calls = [
-            json.loads(line)
-            for line in call_log.read_text(encoding="utf-8").splitlines()
-        ]
+        calls = self.graph_calls(call_log)
         self.assertEqual(code, 0)
         self.assertEqual(
             [call["argv"][0] for call in calls],
@@ -358,10 +381,7 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(axis="standards"))
 
-        calls = [
-            json.loads(line)
-            for line in call_log.read_text(encoding="utf-8").splitlines()
-        ]
+        calls = self.graph_calls(call_log)
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
         self.assertEqual([call["argv"][0] for call in calls], ["status"])
@@ -377,10 +397,7 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(axis="spec"))
 
-        calls = [
-            json.loads(line)
-            for line in call_log.read_text(encoding="utf-8").splitlines()
-        ]
+        calls = self.graph_calls(call_log)
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
         self.assertEqual([call["argv"][0] for call in calls], ["status"])
@@ -399,25 +416,75 @@ class PreparationTests(FakePaneTestCase):
         self.assertNotIn("Start here (from the code graph", prompt)
         self.assertFalse(output["preparation"]["codeGraphUsed"])
 
-    def test_a_dirty_worktree_never_queries_or_mentions_the_graph(self):
+    def test_a_dirty_main_checkout_still_gets_its_navigation_block(self):
+        """`update --brief` re-parses changed files from disk, dirty or not."""
         (self.worktree / ".code-review-graph").mkdir()
         call_log = self.install_graph_stub(
-            {"changed_functions": [], "review_priorities": []}
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "pending.py"),
+                        "line_start": 1,
+                        "line_end": 4,
+                        "name": "pending",
+                    }
+                ],
+                "review_priorities": [],
+            }
         )
-        (self.worktree / "pending.txt").write_text(
-            "uncommitted\n", encoding="utf-8"
+        (self.worktree / "pending.py").write_text(
+            "def pending():\n    return True\n", encoding="utf-8"
         )
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(axis="standards"))
 
+        calls = self.graph_calls(call_log)
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
-        self.assertFalse(call_log.exists())
-        self.assertNotIn("Start here (from the code graph", prompt)
-        self.assertFalse(output["preparation"]["codeGraphUsed"])
+        self.assertEqual(
+            [call["argv"][0] for call in calls],
+            ["status", "update", "detect-changes"],
+        )
+        self.assertIn("pending.py:1–4  pending", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
 
-    def test_a_linked_worktree_queries_the_graph_at_the_main_checkout(self):
+    def test_the_graph_is_based_on_the_fork_point_the_diff_uses(self):
+        """A fixed point that has moved on names a range the diff never reads."""
+        (self.worktree / ".code-review-graph").mkdir()
+        moved_fixed_point = self.fixed_point_that_has_moved_on()
+        call_log = self.install_graph_stub(
+            {
+                "changed_functions": [
+                    {
+                        "file_path": str(self.worktree / "feature.py"),
+                        "line_start": 1,
+                        "line_end": 1,
+                        "name": "feature",
+                    }
+                ],
+                "review_priorities": [],
+            }
+        )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(
+            self.args(base=moved_fixed_point, axis="spec")
+        )
+
+        calls = self.graph_calls(call_log)
+        self.assertEqual(code, 0)
+        for call in calls[1:]:
+            self.assertEqual(
+                call["argv"][call["argv"].index("--base") + 1],
+                self.fixed_point,
+            )
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertIn(f"Diff: git diff {self.fixed_point}", prompt)
+        self.assertTrue(output["preparation"]["codeGraphUsed"])
+
+    def test_a_linked_worktree_never_queries_or_mentions_the_graph(self):
+        """#29 settles where a worktree's graph lives; until then, skip it."""
         main_checkout = self.worktree
         linked_worktree = self.root / "linked-worktree"
         subprocess.run(
@@ -455,34 +522,11 @@ class PreparationTests(FakePaneTestCase):
 
         code, output = self.run_bridge(self.args(axis="spec"))
 
-        calls = [
-            json.loads(line)
-            for line in call_log.read_text(encoding="utf-8").splitlines()
-        ]
-        expected_base = f"{self.fixed_point}...feature-graph"
-        self.assertEqual(code, 0)
-        self.assertEqual(
-            [call["argv"][0] for call in calls],
-            ["status", "update", "detect-changes"],
-        )
-        for call in calls:
-            self.assertEqual(
-                pathlib.Path(call["cwd"]).resolve(), main_checkout.resolve()
-            )
-            self.assertEqual(
-                pathlib.Path(
-                    call["argv"][call["argv"].index("--repo") + 1]
-                ).resolve(),
-                main_checkout.resolve(),
-            )
-        for call in calls[1:]:
-            self.assertEqual(
-                call["argv"][call["argv"].index("--base") + 1],
-                expected_base,
-            )
         prompt = self.codex.started_turns[0]["input"][0]["text"]
-        self.assertIn("feature.py:1–1  feature", prompt)
-        self.assertTrue(output["preparation"]["codeGraphUsed"])
+        self.assertEqual(code, 0)
+        self.assertFalse(call_log.exists())
+        self.assertNotIn("Start here (from the code graph", prompt)
+        self.assertFalse(output["preparation"]["codeGraphUsed"])
 
     def test_an_unresolvable_fixed_point_fails_before_a_pane_opens(self):
         with mock.patch.object(
