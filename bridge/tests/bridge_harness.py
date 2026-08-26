@@ -755,6 +755,14 @@ class FakePaneTestCase(unittest.TestCase):
         )
         return call_log
 
+    @staticmethod
+    def graph_calls(call_log):
+        """Every call the stubbed graph CLI recorded, in the order it took them."""
+        return [
+            json.loads(line)
+            for line in call_log.read_text(encoding="utf-8").splitlines()
+        ]
+
     def use_graphless_path(self):
         graphless_bin = self.root / "graphless-bin"
         graphless_bin.mkdir()

@@ -478,7 +478,15 @@ def ensure_scope_holds_work(cwd, scope):
         )
 
 
-def resolve_main_checkout(cwd):
+def resolve_graph_checkout(cwd):
+    """The checkout whose code graph covers `cwd`, or nothing when none does.
+
+    Only the main checkout's does, and only for itself: `.code-review-graph/`
+    is gitignored, so a linked worktree has no graph of its own and the main
+    checkout's holds none of the worktree's files. Where a worktree's graph
+    should live is #29's decision; until it lands, a worktree has no checkout
+    to consult.
+    """
     result = run_git(
         cwd,
         "rev-parse",
@@ -487,27 +495,10 @@ def resolve_main_checkout(cwd):
     )
     if result.returncode != 0 or not result.stdout.strip():
         return None
-    return str(pathlib.Path(result.stdout.strip()).parent)
-
-
-def has_uncommitted_changes(cwd):
-    result = run_git(cwd, "status", "--porcelain")
-    return result.returncode != 0 or bool(result.stdout.strip())
-
-
-def review_graph_base(cwd, main_checkout, fixed_point):
-    if pathlib.Path(cwd).resolve() == pathlib.Path(main_checkout).resolve():
-        return fixed_point
-    result = run_git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    if result.returncode != 0 or not result.stdout.strip():
+    main_checkout = pathlib.Path(result.stdout.strip()).parent
+    if main_checkout.resolve() != pathlib.Path(cwd).resolve():
         return None
-    tip = result.stdout.strip()
-    if tip == "HEAD":
-        result = run_git(cwd, "rev-parse", "HEAD")
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        tip = result.stdout.strip()
-    return f"{fixed_point}...{tip}"
+    return str(main_checkout)
 
 
 def tmux_server_identity(value):
@@ -853,20 +844,24 @@ def append_navigation_block(brief, navigation_block):
     )
 
 
-def read_code_graph_navigation(cwd, fixed_point):
-    if has_uncommitted_changes(cwd):
-        return None
-    main_checkout = resolve_main_checkout(cwd)
+def read_code_graph_navigation(cwd, fork_point):
+    """The navigation block for the Scope, or nothing when the graph can't see it.
+
+    The base is the Scope's fork point, not the fixed point it was named by, so
+    the graph's changed set covers exactly the range the Axis Brief's diff does.
+    Uncommitted work is in that range: `update --brief` re-parses changed files
+    from disk before `detect-changes` reads them, and a git diff base compares
+    against the working tree. So a dirty tree is no reason to skip; only having
+    no checkout to consult is.
+    """
+    main_checkout = resolve_graph_checkout(cwd)
     if main_checkout is None:
         return None
     executable = shutil.which(CODE_GRAPH_CLI)
     if executable is None:
         return None
-    graph_base = review_graph_base(cwd, main_checkout, fixed_point)
-    if graph_base is None:
-        return None
 
-    common_arguments = ["--base", graph_base, "--repo", main_checkout]
+    common_arguments = ["--base", fork_point, "--repo", main_checkout]
     try:
         status = subprocess.run(
             [executable, "status", "--json", "--repo", main_checkout],
@@ -1080,7 +1075,9 @@ def prepare_review(args):
     """
     repo_root = canonical_worktree_root(args.cwd)
     source, contents = read_spec(repo_root, args.spec)
-    navigation_block = read_code_graph_navigation(repo_root, args.base)
+    navigation_block = read_code_graph_navigation(
+        repo_root, args.scope.fork_point
+    )
     preparation = ReviewPreparation(
         scope=args.scope,
         commit_list=read_commit_list(args.cwd, args.base),
