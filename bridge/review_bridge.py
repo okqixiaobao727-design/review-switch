@@ -830,6 +830,14 @@ def with_trailing_newline(text):
 
 
 def build_navigation_block(graph_result, repo_root):
+    """The graph's review priorities, in its order, and nothing else.
+
+    The brief already tells the Lane the diff is the full scope, so listing
+    every changed function after the priorities only reprints the diff's
+    symbol table — hundreds of lines, most of them tests, paid for on both
+    axes (#32). What the Lane cannot work out from the diff is which few to
+    open first, and that is exactly what `review_priorities` ranks.
+    """
     root = pathlib.Path(repo_root).resolve()
 
     def navigation_fields(node):
@@ -843,15 +851,8 @@ def build_navigation_block(graph_result, repo_root):
             node["name"],
         )
 
-    priorities = graph_result["review_priorities"]
-    priority_fields = {navigation_fields(node) for node in priorities}
-    ordered = priorities + [
-        node
-        for node in graph_result["changed_functions"]
-        if navigation_fields(node) not in priority_fields
-    ]
     lines = []
-    for node in ordered:
+    for node in graph_result["review_priorities"]:
         path, line_start, line_end, name = navigation_fields(node)
         lines.append(f"{path}:{line_start}–{line_end}  {name}")
     return "\n".join(lines) or None

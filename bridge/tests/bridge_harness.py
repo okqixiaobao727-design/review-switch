@@ -615,6 +615,23 @@ def gh_requested_fields(captured, command):
     return json.dumps({field: payload[field] for field in requested})
 
 
+def graph_navigation_result(*priorities, changed_functions=None, **fields):
+    """A `detect-changes` result the Bridge can navigate by.
+
+    The tool ranks a subset of what changed, so a priority is a changed
+    function too and both keys carry it. A test that needs a changed function
+    the tool ranked nothing in names `changed_functions` itself; that
+    asymmetry is the only thing the navigation block turns on (#32).
+    """
+    return {
+        "changed_functions": list(
+            priorities if changed_functions is None else changed_functions
+        ),
+        "review_priorities": list(priorities),
+        **fields,
+    }
+
+
 class FakePaneTestCase(unittest.TestCase):
     """One stubbed Codex pane, driven through the bridge's own entry points.
 
