@@ -76,6 +76,81 @@ class ArgumentTests(unittest.TestCase):
         self.assertIsNone(args.spec_model)
         self.assertIsNone(args.spec_effort)
 
+    def test_parser_drops_no_public_option_the_caller_passed(self):
+        hook = "notify first\nnotify second --exactly"
+        argv = [
+            "--reviewer", "claude",
+            "--cwd", "/workspace/ticket 39",
+            "--base", "main",
+            "--spec=docs/feature spec.md",
+            "--axis", "spec",
+            "--account", "/profiles/reviewer one",
+            "--model", "model-alias",
+            "--effort", "high",
+            "--standards-model", "standards-model",
+            "--standards-effort", "medium",
+            "--spec-model", "spec-model",
+            "--spec-effort", "xhigh",
+            "--no-network",
+            "--on-child-launch", hook,
+            "--on-review-start", "notify start",
+            "--on-axis-end", "notify axis",
+            "--on-review-end", "notify end",
+            "--timeout", "11",
+            "--startup-timeout", "12",
+            "--sandbox", "read-only",
+            "--approval", "on-request",
+            "--tmux-target", "%90",
+            "--claude-binary", "/tmp/claude-test",
+        ]
+
+        args = self.bridge.parse_args(argv)
+
+        self.assertEqual(
+            args.caller_arguments,
+            [
+                "--reviewer", "claude",
+                "--cwd", "/workspace/ticket 39",
+                "--base", "main",
+                "--spec=docs/feature spec.md",
+                "--account", "/profiles/reviewer one",
+                "--model", "model-alias",
+                "--effort", "high",
+                "--standards-model", "standards-model",
+                "--standards-effort", "medium",
+                "--spec-model", "spec-model",
+                "--spec-effort", "xhigh",
+                "--no-network",
+                "--on-child-launch", hook,
+                "--on-review-start", "notify start",
+                "--on-axis-end", "notify axis",
+                "--on-review-end", "notify end",
+                "--timeout", "11",
+                "--startup-timeout", "12",
+                "--sandbox", "read-only",
+                "--approval", "on-request",
+            ],
+        )
+
+    def test_parser_keeps_accepted_long_option_abbreviations_verbatim(self):
+        args = self.bridge.parse_args([
+            "--rev", "codex",
+            "--cw", "/workspace/ticket-39",
+            "--bas", "main",
+            "--spec", "docs/feature.md",
+            "--axis", "spec",
+        ])
+
+        self.assertEqual(
+            args.caller_arguments,
+            [
+                "--rev", "codex",
+                "--cw", "/workspace/ticket-39",
+                "--bas", "main",
+                "--spec", "docs/feature.md",
+            ],
+        )
+
     def test_parser_rejects_the_old_free_text_target(self):
         with self.assertRaises(SystemExit):
             self.bridge.parse_args(
@@ -152,6 +227,19 @@ class RecoveryParserTests(unittest.TestCase):
             self.bridge.parse_args(
                 ["--reviewer", "codex", "--recover-session", "HEAD"]
             )
+
+    def test_help_says_only_exit_three_permits_a_fresh_review(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                self.bridge.parse_args(["--help"])
+
+        described = " ".join(stdout.getvalue().split())
+
+        self.assertIn(
+            "exit 3 is the only result that permits a fresh review",
+            described,
+        )
 
 
 class ReviewerParserTests(unittest.TestCase):
@@ -368,6 +456,7 @@ class CallerResponseParserTests(unittest.TestCase):
 
         self.assertIn("--response", described)
         self.assertIn("required with --resume-session", described)
+        self.assertIn("the result's nextCall names the file", described)
 
 
 class LaneArgumentTests(unittest.TestCase):

@@ -32,5 +32,7 @@ jobs:
         run: bash hook/tests/test-review-adjudicator.sh
       - name: Run Dispatcher resolver tests
         run: bash skills/review-switch/tests/test-resolve-machine-config.sh
+      - name: Run Dispatcher contract tests
+        run: bash skills/review-switch/tests/test-skill-contract.sh
       - name: Run Residue Lint
         run: python scripts/validate_plugin_tree.py --root .

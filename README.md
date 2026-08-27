@@ -34,7 +34,10 @@ review-bridge --reviewer codex --base main --spec '#42' --axis both
 It prints one JSON object: a `preparation` receipt, and one entry per axis under `axes` carrying
 that axis's `status`, `finalMessage`, `reviewSessionId`, `reportFile` — a markdown file holding
 that axis's report, or `null` where it produced none — and `next`, the one action you are
-permitted after that result. `--model` and `--effort` pin the whole review;
+permitted after that result: `fix and stop`, `fix then one re-review`, `run again`, or `escalate`.
+Every axis also carries `nextCall`: the exact Bridge argv for a permitted re-review or fresh
+single-axis run, including the Response file and line shape for a re-review, or `null` when no
+Bridge call is permitted. `--model` and `--effort` pin the whole review;
 `--standards-model`, `--standards-effort`, `--spec-model`, and `--spec-effort` pin one axis at a
 time. Omit them and the vendor's own configuration applies. `--recover-session` re-attaches to a
 review whose driver died, and exits `3` when no live review belongs here. `--help` lists every

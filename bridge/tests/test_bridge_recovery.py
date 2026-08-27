@@ -322,6 +322,65 @@ class RecoveryTests(FakePaneTestCase):
         )
         self.assertEqual(self.codex.panes, [])
 
+    def test_a_recovered_result_carries_the_call_its_original_invocation_recorded(self):
+        caller_arguments = [
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--no-network",
+        ]
+        self.codex.error("spec", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(
+                self.args(
+                    axis="spec",
+                    network=False,
+                    caller_arguments=caller_arguments,
+                )
+            )
+        del self.codex.axis_errors["spec"]
+        state = self.stored_session()
+        self.codex.finish("round one findings", axis="spec")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0, output)
+        result = output["axes"]["spec"]
+        response_file = str(
+            self.state_dir / f"{state['reviewSessionId']}-response.md"
+        )
+        self.assertEqual(
+            result["nextCall"]["argv"],
+            [
+                "review-bridge",
+                *caller_arguments,
+                "--axis", "spec",
+                "--resume-session", state["reviewSessionId"],
+                "--response", response_file,
+            ],
+        )
+        self.assertEqual(result["nextCall"]["responseFile"], response_file)
+
+    def test_a_record_from_before_next_calls_recovers_with_the_old_next_only(self):
+        self.codex.error("spec", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args(axis="spec"))
+        state = self.stored_session()
+        del state[self.bridge.NEXT_CALL_ARGUMENTS_FIELD]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        self.codex.error("spec", "the recovered reviewer went away")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 1, output)
+        result = output["axes"]["spec"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["next"], "fix then one re-review")
+        self.assertIsNone(result["nextCall"])
+
     def test_a_recovered_axis_resumes_the_handle_it_was_recovered_under(self):
         """Recovery of a `both` call leaves each axis's own handle usable.
 

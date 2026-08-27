@@ -62,17 +62,22 @@ is the one thing this skill must not do.
 
 Read the single JSON result through `axes`:
 
-- `status == "completed"`: retain every axis's `reviewSessionId`.
-- `status == "partially_completed"`: retain every non-empty handle, then run an incomplete axis
-  again as an ordinary single-axis review.
+- Retain every non-empty `reviewSessionId`.
 - A hard error or malformed result ends this review. Report it exactly.
 
 Then do what the axis's `next` field names, and nothing else: the Bridge holds the round cap
-and every result says what this lineage is permitted after it. Where `next` is `escalate`, the
-act is this skill's to choose, and here it is to end the review as a disagreement and put both
-positions to whoever asked for it — naming `axes.<axis>.reportFile` and
-`preparation.responseFile`, so the reader opens each side where it was written. A `refused`
-result carries no `preparation`; name the Response file you passed to the round that was granted.
+and every result says what this lineage is permitted after it. When that action is a Bridge call,
+run `nextCall.argv` exactly; the result already carries the fresh or resumed single-axis call.
+Follow `run again` at most once per axis per invocation. If that same axis returns `run again`
+again, make no further Bridge call; report that axis as incomplete with its `reason`, and leave
+the next decision to the user.
+If `next` names a Bridge call but `nextCall` is `null`, this is a legacy result; report that no
+safe follow-up call is available and stop rather than reconstructing one from prose.
+Where `next` is `escalate`, the act is this skill's to choose, and here it is to end the review as
+a disagreement and put both positions to whoever asked for it — naming
+`axes.<axis>.reportFile` and `preparation.responseFile`, so the reader opens each side where it was
+written. A `refused` result carries no `preparation` or Next Call;
+name the Response file you passed to the round that was granted.
 
 Treat `preparation` as the Bridge's receipt. If the result explicitly names a gap or a required
 action, act on it exactly as named before declaring the review complete.
@@ -84,34 +89,10 @@ Where `next` is `fix then one re-review`, the Bridge grants that round only agai
 finding you decided not to fix and never said so about looks to the reviewer exactly like one you
 ignored, so it is retained and the lineage escalates over a message that never arrived.
 
-Write the Response before you call:
-
-1. One line per finding, in the order the report file lists them, identified by a short quote —
-   the reviewer numbers nothing, and you need not ask it to:
-
-   ```
-   N. <short quote from the finding> — fixed <where> | declined <why> | deferred <ticket>
-   ```
-
-   A `fixed` line names where in one clause, so the reviewer checks it against the diff instead of
-   hunting for it. Keep every line as short as the decision allows: what you owe the reviewer is
-   your decisions, not a second report.
-2. Write it to a file under the system temporary directory, named after the handle so two
-   reviews never collide: `/tmp/review-response-<REVIEW_SESSION_ID>.md`. Never inside the
-   checkout under review — the Spec brief lists that checkout's untracked files, and a Response
-   written there is a file the reviewer is asked to review.
-3. Call the Bridge with the axis's handle and that file:
-
-```bash
-review-bridge --reviewer '<LANE>' \
-  --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis spec \
-  --resume-session '<REVIEW_SESSION_ID>' --response '<RESPONSE_FILE>' \
-  <LIFECYCLE_HOOK_OPTIONS>
-```
-
-A resume without `--response`, or with an empty file, is an ordinary command-line error: no round
-is spent, nothing is `refused`, and you simply call again with the file. `--response` is accepted
-only with `--resume-session`; a first review and a recovery take none.
+Write one line per finding, in report order and in the shape `nextCall.responseFormat` shows, to
+`nextCall.responseFile`. A `fixed` line names where in one clause, so the reviewer checks it
+against the diff instead of hunting for it. Keep every line as short as the decision allows: what
+you owe the reviewer is your decisions, not a second report. Then run `nextCall.argv` exactly.
 
 The Bridge appends the Response to the re-review's turn under a heading of its own and asks the
 reviewer to close each finding or retain it, and to report anything new only where a fix
@@ -147,10 +128,8 @@ Keep the Standards handle too, solely so a human can wake that session by hand.
 ## Recovery
 
 When a review started but its JSON result was lost, use the Bridge's recovery mode before
-starting another review. Recovery re-attaches to every live axis owned by this tmux pane and
-worktree; retain every recovered handle and process the result above. Exit code 3 means no live
-review belongs here and licenses a new first review. A partially complete recovery follows the
-same ordinary single-axis re-run rule.
+starting another review: run the same command with `--recover-session`. `--help` is the recovery
+rule. Retain every recovered handle and process the result above.
 
 **Completion criterion:** every returned axis has its line — summary and report path, or
 `reason` — every preparation gap is handled, and every follow-up is the one that axis's `next`

@@ -89,6 +89,16 @@ def base_args(**overrides):
         "status": "failed",
     }
     values.update(overrides)
+    if "caller_arguments" not in overrides:
+        arguments = [
+            "--reviewer", values["reviewer"],
+            "--cwd", values["cwd"],
+            "--base", values["base"],
+        ]
+        if values["spec"] is not None:
+            arguments.extend(["--spec", values["spec"]])
+        arguments.append("--network" if values["network"] else "--no-network")
+        values["caller_arguments"] = arguments
     return argparse.Namespace(**values)
 
 

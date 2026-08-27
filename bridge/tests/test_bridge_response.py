@@ -10,6 +10,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -178,6 +179,49 @@ class ResponseReceiptTests(CallerResponseTestCase):
         self.assertTrue(kept.is_absolute())
         self.assertEqual(kept.parent, self.state_dir)
         self.assertEqual(kept.read_text(encoding="utf-8"), RESPONSE_TEXT)
+
+    def test_the_next_call_names_an_absolute_response_file_from_a_relative_store(self):
+        with contextlib.chdir(self.root), mock.patch.dict(
+            os.environ,
+            {"CODE_REVIEW_TUI_STATE_DIR": "relative-state"},
+            clear=False,
+        ):
+            self.codex.finish("one spec finding", axis="spec")
+
+            code, output = self.run_bridge(self.args(axis="spec"))
+
+        self.assertEqual(code, 0, output)
+        response_file = pathlib.Path(
+            output["axes"]["spec"]["nextCall"]["responseFile"]
+        )
+        self.assertTrue(response_file.is_absolute())
+        self.assertEqual(
+            response_file.parent,
+            (self.root / "relative-state").resolve(),
+        )
+
+    def test_the_result_named_response_file_is_not_copied_over_itself(self):
+        self.codex.finish("one spec finding", axis="spec")
+        first_code, first_output = self.run_bridge(self.args(axis="spec"))
+        self.assertEqual(first_code, 0, first_output)
+        first = first_output["axes"]["spec"]
+        response_file = pathlib.Path(first["nextCall"]["responseFile"])
+        response_file.write_text(RESPONSE_TEXT, encoding="utf-8")
+        original_timestamp = 1_000_000_000
+        os.utime(
+            response_file,
+            ns=(original_timestamp, original_timestamp),
+        )
+
+        code, output = self.resume(
+            "codex",
+            first["reviewSessionId"],
+            str(response_file),
+        )
+
+        self.assertEqual(code, 0, output)
+        self.assertEqual(response_file.stat().st_mtime_ns, original_timestamp)
+        self.assertIn(RESPONSE_TEXT, self.delivered_briefs("codex")[-1])
 
     def test_a_sibling_resume_cannot_leave_its_response_in_the_winners_receipt(self):
         """Preparation runs before the lock, so only the round's winner writes.

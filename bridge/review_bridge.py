@@ -567,7 +567,7 @@ class SessionStore:
                     )
                 )
                 root = claude_root / "state" / "code-review-tui"
-        self.root = pathlib.Path(root)
+        self.root = pathlib.Path(root).absolute()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
 
@@ -1395,11 +1395,16 @@ def take_caller_response(preparation, args, store):
         raise RuntimeError(
             f"--response has nothing in it: {args.response}"
         )
+    response_path = store.response_path(args.resume_session)
+    if pathlib.Path(args.response).resolve() == response_path.resolve():
+        kept_file = str(response_path)
+    else:
+        kept_file = store.write_response(args.resume_session, text)
     return dataclasses.replace(
         preparation,
         response=CallerResponse(
             text=text,
-            file=store.write_response(args.resume_session, text),
+            file=kept_file,
         ),
     )
 
@@ -1569,6 +1574,12 @@ SINGLE_ROUND = 1
 NEXT_FIX_AND_STOP = "fix and stop"
 NEXT_FIX_THEN_ONE_RE_REVIEW = "fix then one re-review"
 NEXT_ESCALATE = "escalate"
+NEXT_RUN_AGAIN = "run again"
+NEXT_CALL_ARGUMENTS_FIELD = "nextCallArguments"
+NEXT_CALL_RESPONSE_FORMAT = (
+    "N. <short quote from the finding> — fixed <where> | declined <why> | "
+    "deferred <ticket>"
+)
 
 
 def rounds_per_lineage(axis):
@@ -1596,6 +1607,52 @@ def next_action(axis, rounds):
     return NEXT_FIX_AND_STOP
 
 
+def result_next_action(axis, result, state):
+    """The next action after the settled result, including an incomplete axis."""
+    legacy_record = (
+        state is not None and NEXT_CALL_ARGUMENTS_FIELD not in state
+    )
+    if not legacy_record and (
+        result["status"] != "completed"
+        or not has_report(result["finalMessage"])
+    ):
+        return NEXT_RUN_AGAIN
+    return next_action(axis, rounds_had(state))
+
+
+def next_call(action, axis, state, args, store):
+    """The Bridge call this result permits, or none where it permits no call."""
+    if action not in (NEXT_FIX_THEN_ONE_RE_REVIEW, NEXT_RUN_AGAIN):
+        return None
+    caller_arguments = (
+        state.get(NEXT_CALL_ARGUMENTS_FIELD) if state is not None else None
+    )
+    if caller_arguments is None and not args.recover_session:
+        caller_arguments = getattr(args, "caller_arguments", None)
+    if caller_arguments is None:
+        return None
+    argv = ["review-bridge", *caller_arguments, "--axis", axis]
+    if action == NEXT_RUN_AGAIN:
+        return {
+            "argv": argv,
+            "responseFile": None,
+            "responseFormat": None,
+        }
+    if state is None:
+        return None
+    session_id = state["reviewSessionId"]
+    response_file = str(store.response_path(session_id))
+    return {
+        "argv": [
+            *argv,
+            "--resume-session", session_id,
+            "--response", response_file,
+        ],
+        "responseFile": response_file,
+        "responseFormat": NEXT_CALL_RESPONSE_FORMAT,
+    }
+
+
 def refusal_for(state):
     """The refusal this lineage's next round gets, or `None` when it has one.
 
@@ -1620,6 +1677,7 @@ def refusal_for(state):
                     f"lineage, and this one has had {rounds}"
                 ),
                 "next": NEXT_ESCALATE,
+                "nextCall": None,
             }
         },
         "preparation": None,
@@ -2330,13 +2388,14 @@ def write_runtime_prompt(runtime_dir, prompt):
 
 def session_state(
     session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort,
-    marker, axis,
+    marker, axis, caller_arguments,
 ):
     now = time.time()
     return {
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
         "axis": axis,
+        NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
         # Rounds this lineage has had, which the Rounds Contract caps.
         "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
@@ -2503,6 +2562,7 @@ async def drive_new_review(launch, owner, store):
             args.effort,
             launch.marker,
             args.axis,
+            getattr(args, "caller_arguments", ()),
         )
         state["preparation"] = preparation_report(args)
         # The TUI is already attached to an idle thread. The record goes down
@@ -3217,7 +3277,8 @@ def claude_axis_result(state, parsed):
 
 
 def headless_session_state(
-    session_id, owner, runtime_dir, pid, target, model, effort, axis
+    session_id, owner, runtime_dir, pid, target, model, effort, axis,
+    caller_arguments,
 ):
     """The record one headless axis leaves: the reviewer, and where it prints."""
     now = time.time()
@@ -3225,6 +3286,7 @@ def headless_session_state(
         "version": SESSION_STATE_VERSION,
         "reviewSessionId": session_id,
         "axis": axis,
+        NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
         # Rounds this lineage has had, which the Rounds Contract caps.
         "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
@@ -3322,6 +3384,7 @@ class ClaudeLane(Lane):
             axis_args.model,
             axis_args.effort,
             brief.axis,
+            getattr(self.args, "caller_arguments", ()),
         )
         state["preparation"] = preparation_report(self.args)
         self.store.write(state["reviewSessionId"], state)
@@ -3600,7 +3663,12 @@ async def run_bridge(args):
             result = lane.settle(run)
             # Named here rather than in either Lane: what a caller may do next
             # is the review's answer, and both Lanes give the same one.
-            result["next"] = next_action(axis, rounds_had(run.state))
+            result["next"] = result_next_action(
+                axis, result, run.state
+            )
+            result["nextCall"] = next_call(
+                result["next"], axis, run.state, args, store
+            )
             if args.recover_session:
                 result["recovered"] = True
             results[axis] = result
@@ -3696,15 +3764,16 @@ def build_parser():
         "--response",
         help="file holding this caller's disposition of the previous round's "
              "findings: required with --resume-session, and refused without "
-             "it",
+             "it; the result's nextCall names the file",
     )
     parser.add_argument(
         "--recover-session",
         action="store_true",
         help=(
             "recover a live reviewer or undelivered report this tmux pane and "
-            f"worktree already own, instead of starting one (exit "
-            f"{NO_LIVE_SESSION_EXIT} when there is none)"
+            "worktree already own, instead of starting one; exit "
+            f"{NO_LIVE_SESSION_EXIT} is the only result that permits a fresh "
+            "review"
         ),
     )
     for point, fires in HOOK_POINTS.items():
@@ -3719,6 +3788,84 @@ def build_parser():
     parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-probe", action="store_true", help=argparse.SUPPRESS)
     return parser
+
+
+NEXT_CALL_OWNED_DESTINATIONS = frozenset({
+    "axis",
+    "resume_session",
+    "response",
+    "recover_session",
+})
+
+
+def option_action(parser, token):
+    """Return the argparse action one accepted option token resolved to."""
+    option = token.split("=", 1)[0]
+    exact = parser._option_string_actions.get(option)
+    if exact is not None:
+        return exact
+    if not parser.allow_abbrev or not option.startswith("--"):
+        return None
+    matches = {
+        id(action): action
+        for spelling, action in parser._option_string_actions.items()
+        if spelling.startswith(option)
+    }
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def option_argument_count(parser, action, argv, index, token):
+    """How many following tokens this already-accepted option consumed."""
+    if "=" in token or action.nargs == 0:
+        return 0
+    if action.nargs is None:
+        return 1
+    if isinstance(action.nargs, int):
+        return action.nargs
+    if action.nargs == "?":
+        next_index = index + 1
+        return int(
+            next_index < len(argv)
+            and option_action(parser, argv[next_index]) is None
+        )
+    if action.nargs in ("*", "+"):
+        count = 0
+        for candidate in argv[index + 1:]:
+            if option_action(parser, candidate) is not None:
+                break
+            count += 1
+        return count
+    return 0
+
+
+def caller_arguments(parser, argv):
+    """Return the caller-owned options a later Bridge call must repeat.
+
+    The original tokens are retained rather than reconstructed from argparse's
+    values: a hook may contain spaces or newlines, and an omitted option must
+    stay omitted. The parser is the authority for which options are public;
+    axis, resume, Response, and recovery belong to the call being built, while
+    hidden/test options never cross the result boundary.
+    """
+    echoed = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        action = option_action(parser, token)
+        if action is None:
+            index += 1
+            continue
+        argument_count = option_argument_count(
+            parser, action, argv, index, token
+        )
+        end = index + argument_count + 1
+        if (
+            action.help != argparse.SUPPRESS
+            and action.dest not in NEXT_CALL_OWNED_DESTINATIONS
+        ):
+            echoed.extend(argv[index:end])
+        index = end
+    return echoed
 
 
 def check_caller_response(parser, args):
@@ -3753,7 +3900,8 @@ def check_caller_response(parser, args):
 
 def parse_args(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
     if args.recover_session:
         if args.resume_session:
             parser.error("--recover-session and --resume-session are exclusive")
@@ -3770,6 +3918,7 @@ def parse_args(argv=None):
             "review, and take no --resume-session"
         )
     check_caller_response(parser, args)
+    args.caller_arguments = caller_arguments(parser, raw_argv)
     return args
 
 
