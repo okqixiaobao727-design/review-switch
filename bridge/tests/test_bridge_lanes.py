@@ -54,6 +54,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
                 "specSource": "spec.md",
                 "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
+                "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
             },

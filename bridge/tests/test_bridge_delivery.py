@@ -256,7 +256,7 @@ class DeliveryContractTests(unittest.TestCase):
                 text="Spec: docs/feature.md. Read it before reviewing.",
                 file="docs/feature.md",
             ),
-            standards_files=("AGENTS.md",),
+            standards=self.bridge.StandardsSources(files=("AGENTS.md",)),
         )
         args = base_args(preparation=preparation, axis="standards")
         prompt = self.bridge.build_prompt(
@@ -451,6 +451,7 @@ class ReviewDeliveryTests(FakePaneTestCase):
                 "specSource": "spec.md",
                 "specFile": "spec.md",
                 "standardsFiles": ["AGENTS.md"],
+                "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
             },

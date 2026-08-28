@@ -46,6 +46,34 @@ option.
 The Bridge reads no configuration file of its own, so a review resolves the same way on every
 machine it is invoked from.
 
+## Standards sources
+
+The Standards axis is held to the documents the checkout **tracks**: `CODING_STANDARDS.md`,
+`CONTRIBUTING.md`, `AGENTS.md`, and `CLAUDE.md` at the root, and every `*.md` directly under
+`docs/agents/`. These are repository configuration, so git's record answers for them rather than
+the disk, and one commit resolves the same list reviewed from a main worktree and from a linked
+one.
+
+`preparation.standardsCondition` states how this checkout carries them:
+
+- `all tracked` — `docs/agents/` states a convention and every standards document found is
+  tracked, so every checkout of the commit has the same list.
+- `present but untracked: <paths>` — those documents lie in this checkout and git does not track
+  them. They reach no other checkout, so they are not briefed. Commit them to put them back in
+  the review; the `setup-matt-pocock-skills` skill is what installs `docs/agents/`, and committing
+  them is its business, not the Bridge's.
+- `absent` — no convention document is in this checkout at all, tracked or not, so the repository
+  states no tracker convention and none may be inferred. Whatever root standards documents it
+  tracks are still briefed.
+- `not a git checkout; read from the disk` — the tree has no index to ask, so what lies in it is
+  the list.
+
+The first two are independent — a checkout can state no convention and still carry an untracked
+`CONTRIBUTING.md` — so where both hold, both are stated, separated by `; `.
+
+The Bridge reads these files and reports on them. It never writes a standards document and never
+writes a repository's ignore rules.
+
 ## The round cap
 
 One lineage gets one standards pass and at most one spec re-review, scoped to the fixes the

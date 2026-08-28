@@ -51,6 +51,7 @@ class StaticPreparation:
             "specSource": "docs/feature.md",
             "specFile": "docs/feature.md",
             "standardsFiles": [],
+            "standardsCondition": "absent",
             "codeGraphUsed": False,
             "responseFile": None,
         }

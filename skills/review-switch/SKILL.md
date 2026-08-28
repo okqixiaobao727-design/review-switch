@@ -26,7 +26,10 @@ When the caller supplies no spec reference, locate the reference without opening
 
 1. Identify the originating issue reference in the commit messages (`#123`, `Closes #45`, GitLab
    `!67`, etc.) using the convention in `docs/agents/issue-tracker.md`; pass the reference rather
-   than fetching or reading the issue.
+   than fetching or reading the issue. Read that file by path. An ignore-aware search reports an
+   ignored file as absent, so its silence is no evidence the convention does not exist. When the
+   path genuinely holds nothing, pass the reference the commit messages carry and say in the
+   preparation line that the repository documents no tracker convention — never infer one.
 2. Otherwise locate a spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name
    or feature.
 3. If neither yields a reference, ask the user once where the spec is. Pass the reference they
@@ -119,6 +122,13 @@ Spec — <n> findings; worst: <one clause>. Report: <axes.spec.reportFile>
 The preparation line states `preparation.specSource` verbatim and `preparation.codeGraphUsed`, on
 every review. `not fetched: <reference>` means the Bridge could not obtain that spec and the Lane
 reviewed without it — say so, rather than passing the Spec axis off as an ordinary one.
+
+Whenever `preparation.standardsCondition` is anything other than `all tracked`, append
+` · Standards: <preparation.standardsCondition>` to that line and state it verbatim. A
+`present but untracked: <paths>` condition means those documents live in this checkout alone and
+were left out of the review: name `setup-matt-pocock-skills` as the skill that installs
+`docs/agents/`, and say that committing those files is what puts them back in every checkout's
+review. Review-Switch changes no file's contents and no repository's ignore rules to fix it.
 
 An incomplete axis has `reportFile` as `null`; its line carries its `reason` instead.
 

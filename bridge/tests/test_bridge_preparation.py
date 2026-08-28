@@ -5,12 +5,14 @@ import json
 import os
 import pathlib
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
 from bridge_harness import (
     FakePaneTestCase,
     base_args,
+    initialize_review_repo,
     graph_navigation_result,
     load_bridge,
 )
@@ -258,7 +260,7 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
                 text="Spec: spec.md. Read it before reviewing.",
                 file="spec.md",
             ),
-            standards_files=("AGENTS.md",),
+            standards=self.bridge.StandardsSources(files=("AGENTS.md",)),
             navigation_block=(
                 "src/first.py:5–9  read_first\n"
                 "src/later.py:30–35  late_change"
@@ -301,6 +303,161 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
         self.assertIn(
             "Standards sources: none documented; baseline only", brief
         )
+
+
+CONVENTION_DOCUMENT = "docs/agents/issue-tracker.md"
+
+
+def write_convention(root, relative=CONVENTION_DOCUMENT):
+    """Put a convention document in a checkout, without tracking it."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Issues live in GitHub.\n", encoding="utf-8")
+    return path
+
+
+def exclude_convention_directory(root):
+    """Ignore it the way the reported repository ignored it: locally (#40)."""
+    info = root / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "exclude").write_text("/docs/agents/\n", encoding="utf-8")
+
+
+class StandardsSourcesTests(unittest.TestCase):
+    """Which documents a review is held to, and how the checkout carries them.
+
+    Every fixture here is a real checkout: the defect (#40) is a disagreement
+    between what lies on the disk and what git tracks, and a stubbed git
+    cannot disagree with itself.
+    """
+
+    CONVENTION = CONVENTION_DOCUMENT
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name) / "checkout"
+        self.root.mkdir()
+        initialize_review_repo(self.root)
+
+    def git(self, *arguments, cwd=None):
+        return subprocess.run(
+            ["git", "-C", str(cwd or self.root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def commit_all(self):
+        self.git("add", "-A")
+        self.git("commit", "--quiet", "-m", "the convention as it ships")
+
+    def linked_worktree(self):
+        """A second checkout of the same commit, as `git worktree add` makes one."""
+        linked = pathlib.Path(self.work.name) / "linked"
+        self.git("worktree", "add", "--quiet", "--detach", str(linked))
+        return linked
+
+    def sources(self, root=None):
+        return self.bridge.read_standards_sources(str(root or self.root))
+
+    def test_a_tracked_convention_is_a_standards_source(self):
+        write_convention(self.root)
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md", self.CONVENTION))
+        self.assertEqual(sources.untracked, ())
+        self.assertEqual(sources.condition, "all tracked")
+
+    def test_a_convention_present_but_untracked_is_named_not_included(self):
+        """The reported shape: on the disk, excluded, reaching no other checkout."""
+        exclude_convention_directory(self.root)
+        write_convention(self.root)
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md",))
+        self.assertEqual(sources.untracked, (self.CONVENTION,))
+        self.assertEqual(
+            sources.condition, f"present but untracked: {self.CONVENTION}"
+        )
+
+    def test_a_convention_that_was_never_installed_is_absent_not_all_tracked(self):
+        """A checkout keeping `AGENTS.md` and no `docs/agents/` states no tracker."""
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md",))
+        self.assertEqual(sources.untracked, ())
+        self.assertEqual(sources.condition, "absent")
+
+    def test_absence_is_stated_beside_whatever_else_is_untracked(self):
+        """One untracked file elsewhere must not swallow the convention's absence."""
+        (self.root / "CONTRIBUTING.md").write_text("house style\n", encoding="utf-8")
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md",))
+        self.assertEqual(sources.untracked, ("CONTRIBUTING.md",))
+        self.assertEqual(
+            sources.condition, "absent; present but untracked: CONTRIBUTING.md"
+        )
+
+    def test_a_checkout_documenting_nothing_at_all_reports_absence(self):
+        (self.root / "AGENTS.md").unlink()
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ())
+        self.assertEqual(sources.untracked, ())
+        self.assertEqual(sources.condition, "absent")
+
+    def test_a_linked_worktree_resolves_what_the_main_worktree_resolves(self):
+        """The defect: the same commit, two checkouts, two answers (#40)."""
+        exclude_convention_directory(self.root)
+        write_convention(self.root)
+        tracked = "docs/agents/triage-labels.md"
+        write_convention(self.root, tracked)
+        self.git("add", "-f", tracked)
+        self.commit_all()
+
+        main = self.sources()
+        linked = self.sources(self.linked_worktree())
+
+        self.assertEqual(linked.files, main.files)
+        self.assertEqual(linked.files, ("AGENTS.md", tracked))
+        self.assertEqual(main.untracked, (self.CONVENTION,))
+        self.assertEqual(linked.untracked, ())
+
+    def test_a_tree_that_is_no_checkout_keeps_reading_the_disk(self):
+        """An export has no index to ask, so the walk stays its answer (085dbed)."""
+        exported = pathlib.Path(self.work.name) / "exported"
+        exported.mkdir()
+        (exported / "AGENTS.md").write_text("standards\n", encoding="utf-8")
+        (exported / "docs" / "agents").mkdir(parents=True)
+        (exported / self.CONVENTION).write_text("convention\n", encoding="utf-8")
+
+        sources = self.sources(exported)
+
+        self.assertEqual(sources.files, ("AGENTS.md", self.CONVENTION))
+        self.assertIsNone(sources.untracked)
+        self.assertEqual(
+            sources.condition, "not a git checkout; read from the disk"
+        )
+
+    def test_a_non_checkout_tree_inside_a_checkout_is_read_from_the_disk(self):
+        """git searches upwards, so an unpacked tree must not get its host's answer."""
+        nested = self.root / "vendor" / "exported"
+        nested.mkdir(parents=True)
+        (nested / "AGENTS.md").write_text("standards\n", encoding="utf-8")
+
+        sources = self.sources(nested)
+
+        self.assertEqual(sources.files, ("AGENTS.md",))
+        self.assertIsNone(sources.untracked)
 
 
 class PreparationTests(FakePaneTestCase):
@@ -1050,6 +1207,52 @@ class PreparationTests(FakePaneTestCase):
             output["preparation"]["specSource"], "not fetched: 11230"
         )
         self.assertIn("the issue has no body and no comments", prompt)
+
+
+    def install_convention(self, ignored):
+        """Put the tracker convention in the checkout, tracked or excluded."""
+        write_convention(self.worktree)
+        if ignored:
+            exclude_convention_directory(self.worktree)
+            return
+        for arguments in (
+            ("add", "-A"),
+            ("commit", "--quiet", "-m", "convention"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(self.worktree), *arguments], check=True
+            )
+
+    def test_the_receipt_reports_a_tracked_convention_as_a_standards_source(self):
+        self.install_convention(ignored=False)
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["standardsFiles"],
+            ["AGENTS.md", "docs/agents/issue-tracker.md"],
+        )
+        self.assertEqual(
+            output["preparation"]["standardsCondition"], "all tracked"
+        )
+
+    def test_the_receipt_tells_an_ignored_convention_apart_from_a_missing_one(self):
+        """What the Lane is briefed with, and what the caller is owed besides (#40)."""
+        self.install_convention(ignored=True)
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"]["standardsFiles"], ["AGENTS.md"])
+        self.assertEqual(
+            output["preparation"]["standardsCondition"],
+            "present but untracked: docs/agents/issue-tracker.md",
+        )
+        self.assertIn("Standards sources: AGENTS.md\n", prompt)
 
 
 class ReviewScopeTests(FakePaneTestCase):

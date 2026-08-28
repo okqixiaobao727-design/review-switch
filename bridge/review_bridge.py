@@ -1106,12 +1106,144 @@ def build_spec_brief(scope, commit_list, spec_slot):
     )
 
 
+#: The standards documents a review is held to: the four a repository may root
+#: at its top level, and the convention directory `setup-matt-pocock-skills`
+#: installs. Both lists are read as repository configuration — what the
+#: checkout tracks — never as whatever happens to lie on the disk (#40).
+STANDARDS_ROOT_FILES = (
+    "CODING_STANDARDS.md",
+    "CONTRIBUTING.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+)
+STANDARDS_CONVENTION_DIRECTORY = "docs/agents"
+
+
+@dataclasses.dataclass(frozen=True)
+class StandardsSources:
+    """The documents the Standards axis is briefed with, and how they are carried.
+
+    `files` is what a Lane is sent to read. `untracked` names the documents
+    lying in this checkout that git does not track: present here, and reaching
+    no other checkout until they are committed. It is `None` where there is no
+    index to ask, which is the one case `files` was read off the disk.
+    """
+
+    files: tuple[str, ...] = ()
+    untracked: tuple[str, ...] | None = ()
+
+    @property
+    def conventions(self):
+        """Every convention document this checkout carries, tracked or not.
+
+        What `docs/agents/` states is the convention; whether git carries it
+        to another checkout is the separate question `untracked` answers.
+        """
+        prefix = f"{STANDARDS_CONVENTION_DIRECTORY}/"
+        carried = self.files + (self.untracked or ())
+        return tuple(path for path in carried if path.startswith(prefix))
+
+    @property
+    def condition(self):
+        """How this checkout carries its standards, as one line a caller can state.
+
+        Telling "present but untracked" from "absent" is the whole point: an
+        ignore-aware search reports an excluded convention document as
+        missing, and a review that reads that as "this repository documents no
+        tracker" invents one (#40). The two are independent — a checkout can
+        state no convention and still carry an untracked `CONTRIBUTING.md` —
+        so both are stated, and neither hides the other.
+        """
+        if self.untracked is None:
+            return "not a git checkout; read from the disk"
+        stated = []
+        if not self.conventions:
+            stated.append("absent")
+        if self.untracked:
+            stated.append("present but untracked: " + ", ".join(self.untracked))
+        return "; ".join(stated) if stated else "all tracked"
+
+
+def standards_files_on_disk(root):
+    """Every standards document lying in the tree, tracked or not."""
+    documented = [
+        path for path in STANDARDS_ROOT_FILES if (root / path).is_file()
+    ]
+    documented.extend(
+        path.relative_to(root).as_posix()
+        for path in sorted((root / STANDARDS_CONVENTION_DIRECTORY).glob("*.md"))
+        if path.is_file()
+    )
+    return tuple(documented)
+
+
+def tracked_standards_files(root):
+    """What git tracks of them, or nothing unless `root` is itself a checkout.
+
+    git searches upwards for a repository, so `ls-files` alone would let a
+    tree unpacked inside a checkout be answered for by its host. The checkout
+    is therefore the tree whose `rev-parse --show-toplevel` is the root
+    itself; every other tree is read off the disk, as the residue lint reads
+    one (085dbed, #35).
+    """
+    toplevel = run_git(str(root), "rev-parse", "--show-toplevel")
+    if toplevel.returncode != 0 or not toplevel.stdout.strip():
+        return None
+    if pathlib.Path(toplevel.stdout.strip()).resolve() != root.resolve():
+        return None
+    listing = run_git(
+        str(root),
+        "ls-files",
+        "-z",
+        "--",
+        *STANDARDS_ROOT_FILES,
+        STANDARDS_CONVENTION_DIRECTORY,
+    )
+    if listing.returncode != 0:
+        return None
+    return frozenset(name for name in listing.stdout.split("\0") if name)
+
+
+def convention_documents(tracked):
+    """The convention directory's own documents, as the disk glob would list them."""
+    prefix = f"{STANDARDS_CONVENTION_DIRECTORY}/"
+    return sorted(
+        path
+        for path in tracked
+        if path.startswith(prefix)
+        and path.endswith(".md")
+        and "/" not in path[len(prefix):]
+    )
+
+
+def read_standards_sources(repo_root):
+    """What this checkout tracks as standards, and what it carries untracked.
+
+    Walking the disk made the answer depend on which checkout asked: a
+    convention document installed as ignored exists in the main worktree and
+    in no linked one, so the same commit was reviewed against different
+    standards and nothing said so (#40). git's record is the same in every
+    checkout of a commit, so the list is too.
+    """
+    root = pathlib.Path(repo_root)
+    on_disk = standards_files_on_disk(root)
+    tracked = tracked_standards_files(root)
+    if tracked is None:
+        return StandardsSources(files=on_disk, untracked=None)
+    files = [path for path in STANDARDS_ROOT_FILES if path in tracked]
+    files.extend(convention_documents(tracked))
+    return StandardsSources(
+        files=tuple(files),
+        untracked=tuple(path for path in on_disk if path not in tracked),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class ReviewPreparation:
     scope: ReviewScope
     commit_list: str
     spec: SpecSlot
-    standards_files: tuple[str, ...]
+    standards: StandardsSources
     navigation_block: str | None = None
     code_graph_used: bool = False
     response: CallerResponse | None = None
@@ -1143,7 +1275,7 @@ class ReviewPreparation:
         """The Axis Brief itself, or the failure that this axis has none."""
         if axis == "standards":
             return build_standards_brief(
-                self.scope, self.commit_list, self.standards_files
+                self.scope, self.commit_list, self.standards.files
             )
         if axis == "spec":
             if self.spec.text is None:
@@ -1161,7 +1293,8 @@ class ReviewPreparation:
             "fixedPoint": self.scope.resolved_fixed_point,
             "specSource": self.spec.source,
             "specFile": self.spec.file,
-            "standardsFiles": list(self.standards_files),
+            "standardsFiles": list(self.standards.files),
+            "standardsCondition": self.standards.condition,
             "codeGraphUsed": self.code_graph_used,
             "responseFile": (
                 self.response.file if self.response is not None else None
@@ -1188,26 +1321,6 @@ def read_commit_list(cwd, fixed_point):
         detail = result.stderr.strip() or "git log failed"
         raise RuntimeError(f"commit list could not be read: {detail}")
     return result.stdout
-
-
-def find_standards_files(repo_root):
-    root = pathlib.Path(repo_root)
-    documented = [
-        path
-        for path in (
-            "CODING_STANDARDS.md",
-            "CONTRIBUTING.md",
-            "AGENTS.md",
-            "CLAUDE.md",
-        )
-        if (root / path).is_file()
-    ]
-    documented.extend(
-        path.relative_to(root).as_posix()
-        for path in sorted((root / "docs" / "agents").glob("*.md"))
-        if path.is_file()
-    )
-    return tuple(documented)
 
 
 UNFETCHED_SPEC_TEMPLATE = """Spec:
@@ -1446,7 +1559,7 @@ def prepare_review(args, store):
         scope=args.scope,
         commit_list=read_commit_list(args.cwd, args.base),
         spec=spec,
-        standards_files=find_standards_files(repo_root),
+        standards=read_standards_sources(repo_root),
         navigation_block=navigation_block,
         code_graph_used=navigation_block is not None,
     )
