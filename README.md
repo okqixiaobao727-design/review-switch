@@ -31,6 +31,14 @@ From the repository being reviewed:
 review-bridge --reviewer codex --base main --spec '#42' --axis both
 ```
 
+A spec reference that is an issue number or issue URL is resolved with the `gh` CLI, so an
+issue-backed spec needs a GitHub remote that `gh` can resolve. A repository using any other
+tracker passes a path to a spec file instead — for example, `--spec docs/spec.md`, or an absolute
+path. The Bridge reads that file where it lies and never copies it. If an issue reference cannot
+be fetched, the review still runs with a weaker Spec axis: `preparation.specSource` reads
+`not fetched: <reference>`, and the axis is told the spec was unreachable and reports exactly
+that rather than inferring requirements from the diff.
+
 It prints one JSON object: a `preparation` receipt, and one entry per axis under `axes` carrying
 that axis's `status`, `finalMessage`, `reviewSessionId`, `reportFile` — a markdown file holding
 that axis's report, or `null` where it produced none — and `next`, the one action you are
