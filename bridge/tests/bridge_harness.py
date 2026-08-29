@@ -776,7 +776,15 @@ class FakePaneTestCase(unittest.TestCase):
             )
         return str(path)
 
-    def fake_gh(self, returncode=0, stdout="", stderr="", plain_stdout=""):
+    def fake_gh(
+        self,
+        returncode=0,
+        stdout="",
+        stderr="",
+        plain_stdout="",
+        error=None,
+        raw_stdout=None,
+    ):
         """Stand `gh issue view` up at the process boundary, faithful to its flags.
 
         `stdout` answers the `--json` form, cut down to the fields that form
@@ -797,12 +805,18 @@ class FakePaneTestCase(unittest.TestCase):
         def run(command, **kwargs):
             if list(command[:3]) == ["gh", "issue", "view"]:
                 calls.append(list(command))
+                if error is not None:
+                    raise error
                 return argparse.Namespace(
                     returncode=returncode,
                     stdout=(
-                        gh_requested_fields(stdout, command)
-                        if "--json" in command
-                        else plain_stdout
+                        raw_stdout
+                        if raw_stdout is not None
+                        else (
+                            gh_requested_fields(stdout, command)
+                            if "--json" in command
+                            else plain_stdout
+                        )
                     ),
                     stderr=stderr,
                 )

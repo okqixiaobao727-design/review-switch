@@ -1192,14 +1192,7 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(self.untracked_files(), before)
 
     def test_a_gh_binary_that_cannot_run_reports_the_process_failure(self):
-        real_run = subprocess.run
-
-        def run(command, **kwargs):
-            if list(command[:3]) == ["gh", "issue", "view"]:
-                raise OSError("gh is unavailable")
-            return real_run(command, **kwargs)
-
-        self.enter(mock.patch.object(self.bridge.subprocess, "run", side_effect=run))
+        self.fake_gh(error=OSError("gh is unavailable"))
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(spec="23", axis="spec"))
@@ -1211,16 +1204,7 @@ class PreparationTests(FakePaneTestCase):
         )
 
     def test_unreadable_issue_json_reports_the_complete_failure(self):
-        real_run = subprocess.run
-
-        def run(command, **kwargs):
-            if list(command[:3]) == ["gh", "issue", "view"]:
-                return subprocess.CompletedProcess(
-                    command, returncode=0, stdout="not json", stderr=""
-                )
-            return real_run(command, **kwargs)
-
-        self.enter(mock.patch.object(self.bridge.subprocess, "run", side_effect=run))
+        self.fake_gh(raw_stdout="not json")
         self.codex.finish("no findings")
 
         code, output = self.run_bridge(self.args(spec="23", axis="spec"))
