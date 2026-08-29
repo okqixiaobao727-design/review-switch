@@ -899,6 +899,9 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(
             output["preparation"]["specSource"], "not fetched: invalid-spec.md"
         )
+        failure = output["preparation"]["specFailure"]
+        self.assertTrue(failure.startswith("spec file could not be read: "))
+        self.assertIn(f"Failure: {failure}", prompt)
         self.assertIn("Reference as given: invalid-spec.md", prompt)
         self.assertIn("spec file could not be read", prompt)
 
@@ -916,6 +919,9 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(
             output["preparation"]["specSource"], "not fetched: docs/missing.md"
         )
+        self.assertEqual(
+            output["preparation"]["specFailure"], "spec file not found"
+        )
         self.assertIn("Reference as given: docs/missing.md", prompt)
         self.assertIn("Failure: spec file not found", prompt)
 
@@ -931,6 +937,9 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             output["preparation"]["specSource"], "not fetched: blank-spec.md"
+        )
+        self.assertEqual(
+            output["preparation"]["specFailure"], "spec file is empty"
         )
         self.assertIn("spec file is empty", prompt)
 
@@ -995,6 +1004,7 @@ class PreparationTests(FakePaneTestCase):
         spec_file = output["preparation"]["specFile"]
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["specSource"], "23")
+        self.assertIsNone(output["preparation"]["specFailure"])
         self.assertEqual(pathlib.Path(spec_file).parent, self.state_dir)
         self.assertTrue(pathlib.Path(spec_file).is_absolute())
         self.assertEqual(
@@ -1079,6 +1089,7 @@ class PreparationTests(FakePaneTestCase):
         prompt = self.codex.started_turns[0]["input"][0]["text"]
         self.assertEqual(code, 0)
         self.assertEqual(output["preparation"]["specFile"], "spec.md")
+        self.assertIsNone(output["preparation"]["specFailure"])
         self.assertEqual(
             self.spec_lines(prompt),
             ["Spec: spec.md. Read it before reviewing."],
@@ -1093,6 +1104,10 @@ class PreparationTests(FakePaneTestCase):
 
         self.assertEqual(code, 0)
         self.assertIsNone(output["preparation"]["specFile"])
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "gh issue view failed: no such issue",
+        )
         self.assertEqual(list(self.state_dir.glob("*-spec.md")), [])
 
     def test_a_spec_file_that_cannot_be_written_degrades_like_an_unfetched_one(self):
@@ -1111,6 +1126,10 @@ class PreparationTests(FakePaneTestCase):
             output["preparation"]["specSource"], "not fetched: 23"
         )
         self.assertIsNone(output["preparation"]["specFile"])
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "spec file could not be written: No space left on device",
+        )
         self.assertIn("No space left on device", prompt)
 
     def test_a_standards_only_review_still_names_the_spec_file(self):
@@ -1131,6 +1150,8 @@ class PreparationTests(FakePaneTestCase):
 
         self.assertIn("specFile", output["preparation"])
         self.assertIsNone(output["preparation"]["specFile"])
+        self.assertIn("specFailure", output["preparation"])
+        self.assertIsNone(output["preparation"]["specFailure"])
 
     def test_a_state_directory_inside_the_checkout_fails_before_a_pane_opens(self):
         """The Scope itself is wrong, so no review runs over it rather than a weak one.
@@ -1170,12 +1191,53 @@ class PreparationTests(FakePaneTestCase):
 
         self.assertEqual(self.untracked_files(), before)
 
+    def test_a_gh_binary_that_cannot_run_reports_the_process_failure(self):
+        real_run = subprocess.run
+
+        def run(command, **kwargs):
+            if list(command[:3]) == ["gh", "issue", "view"]:
+                raise OSError("gh is unavailable")
+            return real_run(command, **kwargs)
+
+        self.enter(mock.patch.object(self.bridge.subprocess, "run", side_effect=run))
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="23", axis="spec"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "gh could not be run: gh is unavailable",
+        )
+
+    def test_unreadable_issue_json_reports_the_complete_failure(self):
+        real_run = subprocess.run
+
+        def run(command, **kwargs):
+            if list(command[:3]) == ["gh", "issue", "view"]:
+                return subprocess.CompletedProcess(
+                    command, returncode=0, stdout="not json", stderr=""
+                )
+            return real_run(command, **kwargs)
+
+        self.enter(mock.patch.object(self.bridge.subprocess, "run", side_effect=run))
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(spec="23", axis="spec"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "gh issue view returned output that could not be read",
+        )
+
     def test_a_gh_failure_degrades_the_spec_axis_instead_of_stopping_it(self):
         self.fake_gh(
             returncode=1,
             stderr=(
                 "GraphQL: Could not resolve to an issue or pull request with "
                 "the number of 99999. (repository.issue)\n"
+                "Authenticate with gh auth login.\n"
             ),
         )
         self.codex.finish("no findings")
@@ -1186,6 +1248,12 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             output["preparation"]["specSource"], "not fetched: 99999"
+        )
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "gh issue view failed: GraphQL: Could not resolve to an issue or "
+            "pull request with the number of 99999. (repository.issue)\n"
+            "Authenticate with gh auth login.",
         )
         self.assertIn("Reference as given: 99999", prompt)
         self.assertIn(
@@ -1205,6 +1273,10 @@ class PreparationTests(FakePaneTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             output["preparation"]["specSource"], "not fetched: 11230"
+        )
+        self.assertEqual(
+            output["preparation"]["specFailure"],
+            "the issue has no body and no comments",
         )
         self.assertIn("the issue has no body and no comments", prompt)
 

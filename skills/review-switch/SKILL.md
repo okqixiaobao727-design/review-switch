@@ -122,6 +122,10 @@ Spec — <n> findings; worst: <one clause>. Report: <axes.spec.reportFile>
 The preparation line states `preparation.specSource` verbatim and `preparation.codeGraphUsed`, on
 every review. `not fetched: <reference>` means the Bridge could not obtain that spec and the Lane
 reviewed without it — say so, rather than passing the Spec axis off as an ordinary one.
+When `preparation.specFailure` is non-null,
+report its value without dropping or interpreting any detail.
+When it is `null`, add no failure text: a legacy `not fetched: <reference>` still says the spec
+was unavailable, but the Bridge has no stored reason for the Dispatcher to invent.
 
 Whenever `preparation.standardsCondition` is anything other than `all tracked`, append
 ` · Standards: <preparation.standardsCondition>` to that line and state it verbatim. A

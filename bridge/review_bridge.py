@@ -1063,11 +1063,14 @@ class SpecSlot:
     is the slot as the Lane reads it and is `None` only when no reference was
     given, which is the one case the Spec axis cannot run on. `file` is the
     spec the review was held to, and is the same path the receipt reports.
+    `failure` is the exact opaque detail both the brief and receipt carry for
+    an unfetched spec; every other slot leaves it `None`.
     """
 
     source: str
     text: str | None
     file: str | None = None
+    failure: str | None = None
 
 
 SPEC_SLOT_TEMPLATE = "Spec: {path}{summary}. Read it before reviewing."
@@ -1293,6 +1296,7 @@ class ReviewPreparation:
             "fixedPoint": self.scope.resolved_fixed_point,
             "specSource": self.spec.source,
             "specFile": self.spec.file,
+            "specFailure": self.spec.failure,
             "standardsFiles": list(self.standards.files),
             "standardsCondition": self.standards.condition,
             "codeGraphUsed": self.code_graph_used,
@@ -1344,6 +1348,7 @@ def spec_not_fetched(reference, detail):
         text=UNFETCHED_SPEC_TEMPLATE.format(
             reference=reference, detail=detail
         ),
+        failure=detail,
     )
 
 
@@ -3033,14 +3038,15 @@ class Lane:
         )
         if preparation is None:
             return None
-        # A record written before the Bridge wrote spec files (#33) or copied a
-        # Response (#37) names neither, which is the truth about that review
-        # rather than a gap in its receipt. Both fields are filled in so every
-        # result carries them and no caller reading the JSON has to handle two
-        # shapes.
+        # A record written before the Bridge wrote spec files (#33), copied a
+        # Response (#37), or reported a spec failure (#42) names none of them,
+        # which is the truth about that review rather than a gap in its receipt.
+        # The fields are filled in so every result carries them and no caller
+        # reading the JSON has to handle two shapes.
         return {
             **preparation,
             "specFile": preparation.get("specFile"),
+            "specFailure": preparation.get("specFailure"),
             "responseFile": preparation.get("responseFile"),
         }
 

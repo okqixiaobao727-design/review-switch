@@ -289,6 +289,42 @@ class RecoveryTests(FakePaneTestCase):
         self.assertIn("specFile", output["preparation"])
         self.assertIsNone(output["preparation"]["specFile"])
 
+    def test_recovering_a_record_older_than_spec_failures_names_none(self):
+        """A legacy receipt has no failure detail for the Bridge to reconstruct."""
+        state = self.kill_the_driver()
+        del state["preparation"]["specFailure"]
+        (self.state_dir / f"{state['reviewSessionId']}.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        self.codex.finish("legacy review findings")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertIn("specFailure", output["preparation"])
+        self.assertIsNone(output["preparation"]["specFailure"])
+
+    def test_recovery_preserves_the_recorded_spec_failure_exactly(self):
+        self.codex.error("spec", DriverKilled())
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(
+                self.args(axis="spec", spec="docs/missing-spec.md")
+            )
+        del self.codex.axis_errors["spec"]
+        state = self.stored_session()
+        self.assertEqual(
+            state["preparation"]["specFailure"], "spec file not found"
+        )
+        self.codex.finish("reviewed without the missing spec", axis="spec")
+
+        code, output = self.run_bridge(self.args(recover_session=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output["preparation"], state["preparation"])
+        self.assertEqual(
+            output["preparation"]["specFailure"], "spec file not found"
+        )
+
     def test_recovery_tolerates_a_record_with_no_preparation_report(self):
         state = self.kill_the_driver()
         del state["preparation"]

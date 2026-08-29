@@ -450,6 +450,7 @@ class ReviewDeliveryTests(FakePaneTestCase):
                 "fixedPoint": fixed_point,
                 "specSource": "spec.md",
                 "specFile": "spec.md",
+                "specFailure": None,
                 "standardsFiles": ["AGENTS.md"],
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,

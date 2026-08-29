@@ -36,8 +36,11 @@ issue-backed spec needs a GitHub remote that `gh` can resolve. A repository usin
 tracker passes a path to a spec file instead — for example, `--spec docs/spec.md`, or an absolute
 path. The Bridge reads that file where it lies and never copies it. If an issue reference cannot
 be fetched, the review still runs with a weaker Spec axis: `preparation.specSource` reads
-`not fetched: <reference>`, and the axis is told the spec was unreachable and reports exactly
-that rather than inferring requirements from the diff.
+`not fetched: <reference>`, `preparation.specFile` is `null`, and `preparation.specFailure`
+contains the exact human-readable failure detail given to the axis. The axis reports that the spec
+was unreachable rather than inferring requirements from the diff. `specFailure` is always present
+on a preparation receipt and is `null` after a successful fetch, for a usable local spec, when no
+spec was provided, and when a recovered legacy receipt never stored a reason.
 
 It prints one JSON object: a `preparation` receipt, and one entry per axis under `axes` carrying
 that axis's `status`, `finalMessage`, `reviewSessionId`, `reportFile` — a markdown file holding
