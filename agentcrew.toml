@@ -125,10 +125,12 @@ effort = "medium"
 # The command is a courtesy to what you already run: one that fails or hangs leaves the launch
 # itself standing.
 
-[hooks.on-child-launch]
-command = ""
+# Left undeclared: agentcrew-dev-skills 0.9.13's preflight rejects an empty command, so a repo
+# with no hook omits the section rather than declaring one with command = "".
+# [hooks.on-child-launch]
+# command = ""
 
-[hooks.on-child-launch.env]
+# [hooks.on-child-launch.env]
 
 # --- Dashboard --------------------------------------------------------------
 # Which surface a run draws itself on. `window` gives the run its own tmux window, as it always
