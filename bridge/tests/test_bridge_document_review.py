@@ -67,12 +67,6 @@ def briefs_with_parent(parent_line, document_lines):
 
 
 class DocumentReviewCommandTests(FakePaneTestCase):
-    def parsed_args(self, argv):
-        args = self.bridge.parse_args(argv)
-        args.status = "failed"
-        args.resume_state = self.bridge.resume_state_for_review(args)
-        return args
-
     def test_documents_without_a_parent_deliver_both_briefs_and_the_receipt(self):
         documents = ("docs/spec.md", "docs/ticket.md")
         for document in documents:

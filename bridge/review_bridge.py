@@ -3307,11 +3307,15 @@ class Lane:
         )
         if preparation is None:
             return None
+        if "specSource" not in preparation:
+            return preparation
         # A record written before the Bridge wrote spec files (#33), copied a
         # Response (#37), or reported a spec failure (#42) names none of them,
         # which is the truth about that review rather than a gap in its receipt.
-        # The fields are filled in so every result carries them and no caller
-        # reading the JSON has to handle two shapes.
+        # Code Review's legacy fields are filled in so every Code Review result
+        # carries them and no caller reading that receipt has to handle two
+        # shapes. A Document Review receipt has no legacy Code Review fields and
+        # is returned exactly as it was written.
         return {
             **preparation,
             "specFile": preparation.get("specFile"),

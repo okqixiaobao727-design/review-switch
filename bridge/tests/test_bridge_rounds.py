@@ -32,10 +32,6 @@ LANES = ("codex", "claude")
 class RoundsContractTestCase(FakePaneTestCase):
     """A review lineage driven round by round, on either Lane."""
 
-    def lane(self, reviewer):
-        """The stub standing in for this Lane's reviewer."""
-        return self.claude if reviewer == "claude" else self.codex
-
     def review(self, reviewer, axis, message):
         """Round one of a lineage: one axis reviewed and reported on."""
         self.lane(reviewer).finish(message, axis=axis)
@@ -53,12 +49,6 @@ class RoundsContractTestCase(FakePaneTestCase):
 
 class CodeReviewRoundCharacterizationTests(FakePaneTestCase):
     """Code Review's rounds and Next Call through the command entry."""
-
-    def parsed_args(self, argv):
-        args = self.bridge.parse_args(argv)
-        args.status = "failed"
-        args.resume_state = self.bridge.resume_state_for_review(args)
-        return args
 
     def review_argv(self, axis="both"):
         return [
@@ -141,6 +131,82 @@ class CodeReviewRoundCharacterizationTests(FakePaneTestCase):
             spent["axes"]["spec"]["reason"],
             "a spec axis earns 2 round(s) per review lineage, and this one has had 2",
         )
+
+
+class DocumentReviewRoundCharacterizationTests(FakePaneTestCase):
+    """Document Review's rounds and Next Call through the command entry."""
+
+    def test_each_document_axis_round_trips_its_re_review_call_on_both_lanes(self):
+        for name in ("parent.md", "first.md", "second.md"):
+            path = self.worktree / "docs" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{name}\n", encoding="utf-8")
+
+        for reviewer in LANES:
+            for axis in ("requirements", "design"):
+                with self.subTest(reviewer=reviewer, axis=axis):
+                    caller_arguments = [
+                        "--reviewer", reviewer,
+                        "--cwd", str(self.worktree),
+                        "--parent", "docs/parent.md",
+                        "--document", "docs/first.md",
+                        "--document", "docs/second.md",
+                        "--no-network",
+                    ]
+                    first_args = self.parsed_args([
+                        *caller_arguments,
+                        "--axis", axis,
+                    ])
+                    self.lane(reviewer).finish(
+                        f"{axis} round one findings",
+                        axis=axis,
+                    )
+
+                    first_code, first_output = self.run_bridge(first_args)
+
+                    self.assertEqual(first_code, 0, first_output)
+                    first_result = first_output["axes"][axis]
+                    session = first_result["reviewSessionId"]
+                    response_file = str(
+                        self.state_dir / f"{session}-response.md"
+                    )
+                    self.assertEqual(first_result["next"], FIX_THEN_ONE_RE_REVIEW)
+                    self.assertEqual(
+                        first_result["nextCall"],
+                        {
+                            "argv": [
+                                "review-bridge",
+                                *caller_arguments,
+                                "--axis", axis,
+                                "--resume-session", session,
+                                "--response", response_file,
+                            ],
+                            "responseFile": response_file,
+                            "responseFormat": RESPONSE_FORMAT,
+                        },
+                    )
+                    pathlib.Path(response_file).write_text(
+                        f'1. "{axis} round one findings" — fixed in docs/first.md\n',
+                        encoding="utf-8",
+                    )
+                    resumed_args = self.parsed_args(
+                        first_result["nextCall"]["argv"][1:]
+                    )
+                    self.lane(reviewer).finish(
+                        f"{axis} round two findings",
+                        axis=axis,
+                    )
+
+                    resumed_code, resumed_output = self.run_bridge(resumed_args)
+
+                    self.assertEqual(resumed_code, 0, resumed_output)
+                    resumed_result = resumed_output["axes"][axis]
+                    self.assertEqual(
+                        resumed_result["finalMessage"],
+                        f"{axis} round two findings",
+                    )
+                    self.assertEqual(resumed_result["next"], ESCALATE)
+                    self.assertIsNone(resumed_result["nextCall"])
 
 
 class NextActionTests(RoundsContractTestCase):

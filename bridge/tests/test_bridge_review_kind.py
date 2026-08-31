@@ -13,12 +13,6 @@ from bridge_harness import FakePaneTestCase
 class CodeReviewCharacterizationTests(FakePaneTestCase):
     """Code Review's command inputs, Axis Briefs, and receipt."""
 
-    def parsed_args(self, argv):
-        args = self.bridge.parse_args(argv)
-        args.status = "failed"
-        args.resume_state = self.bridge.resume_state_for_review(args)
-        return args
-
     def review_argv(self, axis="both"):
         return [
             "--reviewer", "codex",

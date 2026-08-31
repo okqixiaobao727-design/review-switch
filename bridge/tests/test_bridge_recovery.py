@@ -268,6 +268,77 @@ class RecoveryTests(FakePaneTestCase):
         self.assertEqual(len(self.codex.started_turns), turns_before)
         self.assertEqual(self.codex.panes, [])
 
+    def test_document_review_receipt_recovers_as_written_on_both_lanes(self):
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+
+        for reviewer in ("codex", "claude"):
+            with self.subTest(reviewer=reviewer):
+                lane = self.codex if reviewer == "codex" else self.claude
+                lane_class = (
+                    self.bridge.CodexLane
+                    if reviewer == "codex"
+                    else self.bridge.ClaudeLane
+                )
+                review_argv = [
+                    "--reviewer", reviewer,
+                    "--cwd", str(self.worktree),
+                    "--document", "docs/ticket.md",
+                    "--axis", "both",
+                    "--no-network",
+                ]
+                lane.finish("delivered requirements", axis="requirements")
+                lane.finish("delivered design", axis="design")
+
+                delivered_code, delivered = self.run_bridge(
+                    self.parsed_args(review_argv)
+                )
+
+                self.assertEqual(delivered_code, 0, delivered)
+                self.assertEqual(
+                    set(delivered["axes"]),
+                    {"requirements", "design"},
+                )
+
+                lane.finish("recovered requirements", axis="requirements")
+                lane.finish("recovered design", axis="design")
+                killed_driver = self.enter(mock.patch.object(
+                    lane_class,
+                    "end_axis",
+                    side_effect=DriverKilled,
+                ))
+
+                with self.assertRaises(DriverKilled):
+                    self.run_bridge(self.parsed_args(review_argv))
+                self.stop_patcher(killed_driver)
+
+                recover_args = self.parsed_args([
+                    "--reviewer", reviewer,
+                    "--cwd", str(self.worktree),
+                    "--recover-session",
+                    "--no-network",
+                ])
+                code, output = self.run_bridge(recover_args)
+
+                self.assertEqual(code, 0, output)
+                self.assertEqual(
+                    set(output["axes"]),
+                    {"requirements", "design"},
+                )
+                for axis in ("requirements", "design"):
+                    self.assertEqual(
+                        output["axes"][axis]["finalMessage"],
+                        f"recovered {axis}",
+                    )
+                    self.assertTrue(output["axes"][axis]["recovered"])
+                self.assertEqual(
+                    output["preparation"],
+                    delivered["preparation"],
+                )
+                self.assertNotIn("specFile", output["preparation"])
+                self.assertNotIn("specFailure", output["preparation"])
+
     def test_recovering_a_record_older_than_spec_files_still_names_one(self):
         """A review prepared before #33 was held to no spec file, and says so.
 

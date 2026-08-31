@@ -760,6 +760,17 @@ class FakePaneTestCase(unittest.TestCase):
             values["response"] = self.default_response_file()
         return base_args(**values)
 
+    def parsed_args(self, argv):
+        """Public command arguments ready to cross the Bridge command seam."""
+        args = self.bridge.parse_args(argv)
+        args.status = "failed"
+        args.resume_state = self.bridge.resume_state_for_review(args)
+        return args
+
+    def lane(self, reviewer):
+        """The stub standing in for the selected Lane's external process."""
+        return self.claude if reviewer == "claude" else self.codex
+
     def default_response_file(self):
         """The Response a resume carries when a test is about something else.
 
