@@ -1056,30 +1056,39 @@ def build_standards_brief(scope, commit_list, standards_files):
 
 
 @dataclasses.dataclass(frozen=True)
-class SpecSlot:
-    """The Spec slot of an Axis Brief, and the file it sends the Lane to.
+class DocumentSlot:
+    """One document reference, and the file it sends a Lane to read.
 
-    Every way of naming a spec ends here — an issue the Bridge wrote out, a
+    Every way of naming a document ends here — an issue the Bridge wrote out, a
     file already in the checkout, a reference it could not fetch, or none at
-    all — so the brief is filled from one shape rather than from four. `text`
-    is the slot as the Lane reads it and is `None` only when no reference was
-    given, which is the one case the Spec axis cannot run on. `file` is the
-    spec the review was held to, and is the same path the receipt reports.
+    all — so preparation reads one shape rather than four. `text` is the
+    Code Review Spec slot as its Lane reads it and is `None` only when no
+    reference was given. `file` is the document the review was held to, and is
+    the same path the receipt reports.
     `failure` is the exact opaque detail both the brief and receipt carry for
-    an unfetched spec; every other slot leaves it `None`.
+    an unfetched reference; every other slot leaves it `None`.
     """
 
     source: str
     text: str | None
     file: str | None = None
     failure: str | None = None
+    summary: str | None = None
 
 
-SPEC_SLOT_TEMPLATE = "Spec: {path}{summary}. Read it before reviewing."
+SPEC_SLOT_TEMPLATE = "Spec: {document_reference}"
+DOCUMENT_REFERENCE_TEMPLATE = "{path}{summary}. Read it before reviewing."
+
+
+def build_document_reference(path, summary=None):
+    """A file reference and the summary available for a fetched issue."""
+    return DOCUMENT_REFERENCE_TEMPLATE.format(
+        path=path, summary=f" — {summary}" if summary else ""
+    )
 
 
 def build_spec_slot(path, summary=None):
-    """The one line that sends a Lane to the spec, saying what it will find.
+    """The Code Review line that sends a Lane to its spec.
 
     Naming the file rather than pasting it keeps a long comment thread out of
     every first turn, and lets a Lane read the body before the thread; the
@@ -1088,8 +1097,13 @@ def build_spec_slot(path, summary=None):
     summary: the Lane can see for itself what a path it was given holds.
     """
     return SPEC_SLOT_TEMPLATE.format(
-        path=path, summary=f" — {summary}" if summary else ""
+        document_reference=build_document_reference(path, summary)
     )
+
+
+# Code Review tests written before Document Review name this shape by its role
+# in that adapter. Production preparation uses the general domain name above.
+SpecSlot = DocumentSlot
 
 
 SPEC_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
@@ -1265,7 +1279,7 @@ class ReviewKind:
 class ReviewPreparation:
     scope: ReviewScope
     commit_list: str
-    spec: SpecSlot
+    spec: DocumentSlot
     standards: StandardsSources
     navigation_block: str | None = None
     code_graph_used: bool = False
@@ -1370,7 +1384,7 @@ def spec_not_fetched(reference, detail):
     apart from an ordinary one without re-deriving it (#30). There is no file
     to name, so the receipt names none (#33).
     """
-    return SpecSlot(
+    return DocumentSlot(
         source=f"not fetched: {reference}",
         text=UNFETCHED_SPEC_TEMPLATE.format(
             reference=reference, detail=detail
@@ -1462,10 +1476,11 @@ def read_issue_spec(repo_root, reference, store):
         return spec_not_fetched(
             reference, f"spec file could not be written: {error}"
         )
-    return SpecSlot(
+    return DocumentSlot(
         source=reference,
         text=build_spec_slot(path, issue.summary),
         file=path,
+        summary=issue.summary,
     )
 
 
@@ -1479,20 +1494,20 @@ def read_spec_file(reference, candidate):
         )
     if not contents.strip():
         return spec_not_fetched(reference, "spec file is empty")
-    return SpecSlot(
+    return DocumentSlot(
         source=reference, text=build_spec_slot(reference), file=reference
     )
 
 
-def read_spec(repo_root, reference, store):
-    """The Spec slot a Lane is handed, however the reference turned out.
+def read_document(repo_root, reference, store):
+    """One document slot, however its reference turned out.
 
     Only a reference the caller never gave leaves the slot empty; every other
-    outcome is text. So `None` keeps exactly one meaning — the Spec axis was
-    asked for without a spec — and preparation still fails on that alone.
+    outcome is text. Code Review interprets `None` as a Spec axis requested
+    without a spec; Document Review interprets it as no Parent.
     """
     if reference is None:
-        return SpecSlot(source="not provided", text=None)
+        return DocumentSlot(source="not provided", text=None)
     if reference.startswith(("http://", "https://")):
         return read_issue_spec(repo_root, reference, store)
     candidate = pathlib.Path(reference)
@@ -1587,7 +1602,7 @@ def prepare_review(args, store):
     ensure_scope_holds_work(args.cwd, args.scope)
     repo_root = canonical_worktree_root(args.cwd)
     ensure_store_is_outside_the_checkout(repo_root, store)
-    spec = read_spec(repo_root, args.spec, store)
+    spec = read_document(repo_root, args.spec, store)
     navigation_block = read_code_graph_navigation(
         repo_root, args.scope.fork_point
     )
@@ -1598,6 +1613,142 @@ def prepare_review(args, store):
         standards=read_standards_sources(repo_root),
         navigation_block=navigation_block,
         code_graph_used=navigation_block is not None,
+    )
+    for axis in requested_axes(args):
+        preparation.brief(axis)
+    return preparation
+
+
+# ---------------------------------------------------------------------------
+# Document Review preparation.
+#
+# This is the second adapter at the preparation seam. A Lane still receives an
+# Axis Brief and reads one receipt; only the adapter filling those values knows
+# that its inputs are documents rather than a Review Scope.
+# ---------------------------------------------------------------------------
+REQUIREMENTS_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Parent: {parent_slot}
+Documents:
+{document_list}
+
+Template baseline (the rules these documents were written under; every item is a judgement call; report only what would change what gets built — not wording, format, or hypothetical future needs):
+- Vertical slice: a ticket cuts one complete path through every layer and is demoable or verifiable on its own. → a ticket that is one layer of several is recut.
+- Blocking edges: a ticket is blocked only by the tickets that genuinely gate it. → an edge that does not gate is removed; a gate that is missing is added.
+- Acceptance criteria: written from the user's perspective, each verifying the behaviour "What to build" claims. → a criterion that checks something else, or nothing observable, is rewritten.
+- One context window: a ticket is sized to finish in a single fresh session. → split it.
+- No parent (Document Review's own rule): a spec's Problem Statement, Solution, User Stories, Implementation Decisions, Testing Decisions, and Out of Scope are held to one another. → the section that contradicts the others is the finding.
+
+Report: (a) requirements in the parent that the documents miss or carry only in part; (b) scope or decisions the parent never asked for; (c) acceptance criteria that do not verify what their own document claims. With no parent, hold the documents to each other. Quote the line for each finding. Under 400 words."""
+
+DESIGN_BRIEF_TEMPLATE = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
+
+Load the codebase-design skill from the mattpocock-skills plugin before reviewing and judge in its vocabulary; if you cannot load it, say so in the first line of your report.
+Parent: {parent_slot}
+Documents:
+{document_list}
+Standards sources: {standards_files}
+
+Template baseline (the rules these documents were written under; every item is a judgement call; report only what would change what gets built — not wording, format, or hypothetical future needs):
+- Seams: existing seams are preferred to new ones, the highest possible, and as few as possible. → a new seam says why no existing one serves.
+- Testing decisions test external behaviour through the interface, not implementation. → a test plan that must cross the interface is a finding about the module's shape.
+- The glossary's vocabulary and the ADRs are followed. → name the term or the ADR.
+- No file paths or code snippets, except a prototype's snippet that carries a decision. → cut it.
+
+Report: (a) a Module the design adds that an existing one already owns; (b) a Seam or Interface the design adds where the checkout already has one; (c) a decision that contradicts an ADR or the glossary. Name the code or ADR beside the quoted line for each finding. Under 400 words."""
+
+
+def document_parent_slot(parent):
+    """The Parent line shared by both Document Review Axis Briefs."""
+    if parent.text is None:
+        return "not provided; hold the documents to each other."
+    return build_document_reference(parent.file, parent.summary)
+
+
+def document_list_line(document):
+    """One document file and the summary available for a fetched issue."""
+    summary = f" — {document.summary}" if document.summary else ""
+    return f"- {document.file}{summary}"
+
+
+@dataclasses.dataclass(frozen=True)
+class DocumentReviewPreparation:
+    parent: DocumentSlot
+    documents: tuple[DocumentSlot, ...]
+    standards: StandardsSources
+    response: CallerResponse | None = None
+
+    def brief(self, axis):
+        """This axis's Axis Brief, ready for whichever Lane delivers it."""
+        return AxisBrief(axis=axis, text=self.brief_text(axis))
+
+    def briefs(self, axes):
+        """One Axis Brief per axis, in the order a review runs them."""
+        return tuple(self.brief(axis) for axis in axes)
+
+    def brief_text(self, axis):
+        """The prepared Document Review brief and any caller Response."""
+        return append_caller_response(
+            review_kind_for_axis(axis).brief_text(self, axis),
+            self.response,
+        )
+
+    def report(self):
+        return {
+            "parentSource": self.parent.source,
+            "parentFile": self.parent.file,
+            "parentFailure": self.parent.failure,
+            "documents": [
+                {"source": document.source, "file": document.file}
+                for document in self.documents
+            ],
+            "standardsFiles": list(self.standards.files),
+            "standardsCondition": self.standards.condition,
+            "codeGraphUsed": False,
+            "responseFile": (
+                self.response.file if self.response is not None else None
+            ),
+        }
+
+
+def build_requirements_axis_brief(preparation):
+    """Fill Document Review's requirements Axis Brief."""
+    return REQUIREMENTS_BRIEF_TEMPLATE.format(
+        parent_slot=document_parent_slot(preparation.parent),
+        document_list="\n".join(
+            document_list_line(document)
+            for document in preparation.documents
+        ),
+    )
+
+
+def build_design_axis_brief(preparation):
+    """Fill Document Review's design Axis Brief."""
+    return DESIGN_BRIEF_TEMPLATE.format(
+        parent_slot=document_parent_slot(preparation.parent),
+        document_list="\n".join(
+            document_list_line(document)
+            for document in preparation.documents
+        ),
+        standards_files=(
+            ", ".join(preparation.standards.files)
+            if preparation.standards.files
+            else "none documented; baseline only"
+        ),
+    )
+
+
+def prepare_document_review(args, store):
+    """Everything both Document Review axes need before any Lane opens."""
+    repo_root = canonical_worktree_root(args.cwd)
+    ensure_store_is_outside_the_checkout(repo_root, store)
+    preparation = DocumentReviewPreparation(
+        parent=read_document(repo_root, args.parent, store),
+        documents=tuple(
+            read_document(repo_root, reference, store)
+            for reference in args.document
+        ),
+        standards=read_standards_sources(repo_root),
     )
     for axis in requested_axes(args):
         preparation.brief(axis)
@@ -1714,13 +1865,16 @@ def resolve_axis_choice(args, axis, choice):
 # What escalation *is* stays the caller's: nothing here names the act, only the
 # moment.
 # ---------------------------------------------------------------------------
-#: Code Review, the only review kind this table holds until Document Review.
+#: The two reviews the Bridge prepares through one seam.
 CODE_REVIEW_KIND = "code"
+DOCUMENT_REVIEW_KIND = "documents"
 STANDARDS_AXIS = "standards"
 #: The one Code Review axis whose findings earn a re-review.
 SPEC_AXIS = "spec"
-#: How many rounds the spec axis earns: the first, and the one re-review.
-SPEC_AXIS_ROUNDS = 2
+REQUIREMENTS_AXIS = "requirements"
+DESIGN_AXIS = "design"
+#: The first round plus the one re-review an eligible axis earns.
+ROUNDS_WITH_ONE_RE_REVIEW = 2
 #: How many rounds every other axis earns, the standards axis above all.
 SINGLE_ROUND = 1
 NEXT_FIX_AND_STOP = "fix and stop"
@@ -1742,7 +1896,7 @@ REVIEW_KINDS = MappingProxyType({
         axes=(STANDARDS_AXIS, SPEC_AXIS),
         rounds_per_axis=MappingProxyType({
             STANDARDS_AXIS: SINGLE_ROUND,
-            SPEC_AXIS: SPEC_AXIS_ROUNDS,
+            SPEC_AXIS: ROUNDS_WITH_ONE_RE_REVIEW,
         }),
         preparation=prepare_review,
         brief_dispatch=MappingProxyType({
@@ -1750,17 +1904,28 @@ REVIEW_KINDS = MappingProxyType({
             SPEC_AXIS: build_code_spec_axis_brief,
         }),
     ),
+    DOCUMENT_REVIEW_KIND: ReviewKind(
+        axes=(REQUIREMENTS_AXIS, DESIGN_AXIS),
+        rounds_per_axis=MappingProxyType({
+            REQUIREMENTS_AXIS: ROUNDS_WITH_ONE_RE_REVIEW,
+            DESIGN_AXIS: ROUNDS_WITH_ONE_RE_REVIEW,
+        }),
+        preparation=prepare_document_review,
+        brief_dispatch=MappingProxyType({
+            REQUIREMENTS_AXIS: build_requirements_axis_brief,
+            DESIGN_AXIS: build_design_axis_brief,
+        }),
+    ),
 })
 
 
 def review_kind_for(args):
-    """The review kind this call's axis names, including the sole-row fan-out."""
+    """The review kind inferred from documents, or named by one axis."""
+    if getattr(args, "document", None):
+        return REVIEW_KINDS[DOCUMENT_REVIEW_KIND]
     if args.axis != "both":
         return review_kind_for_axis(args.axis)
-    review_kinds = tuple(REVIEW_KINDS.values())
-    if len(review_kinds) != 1:
-        raise RuntimeError("axis 'both' requires one review kind")
-    return review_kinds[0]
+    return REVIEW_KINDS[CODE_REVIEW_KIND]
 
 
 def review_kind_for_axis(axis):
@@ -3907,7 +4072,7 @@ async def run_bridge(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Launch or resume a code review on the Lane --reviewer names."
+        description="Launch or resume a review on the Lane --reviewer names."
     )
     parser.add_argument(
         "--reviewer",
@@ -3919,6 +4084,14 @@ def build_parser():
         "--base", help="fixed point the Review Scope runs from"
     )
     parser.add_argument("--spec", help="issue reference or file path for the spec")
+    parser.add_argument(
+        "--parent", help="issue reference or file path for the document Parent"
+    )
+    parser.add_argument(
+        "--document",
+        action="append",
+        help="issue reference or file path for a document; repeat for a set",
+    )
     parser.add_argument(
         "--axis",
         choices=accepted_axis_names(),
@@ -4107,10 +4280,28 @@ def parse_args(argv=None):
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    document_axes = REVIEW_KINDS[DOCUMENT_REVIEW_KIND].axes
+    if not args.document and args.axis in document_axes:
+        parser.error(
+            f"--axis {args.axis} is a documents axis and requires --document"
+        )
+    if args.document:
+        for option, value in (("--base", args.base), ("--spec", args.spec)):
+            if value is not None:
+                parser.error(f"--document cannot be combined with {option}")
+        if args.axis in REVIEW_KINDS[CODE_REVIEW_KIND].axes:
+            parser.error(
+                f"--axis {args.axis} is a code axis and cannot be used with "
+                "--document"
+            )
     if args.recover_session:
         if args.resume_session:
             parser.error("--recover-session and --resume-session are exclusive")
-    elif not (args.probe or args.browser_probe) and not args.base:
+    elif (
+        not (args.probe or args.browser_probe)
+        and not args.document
+        and not args.base
+    ):
         parser.error("--base is required")
     if (args.probe or args.browser_probe) and args.resume_session:
         # A probe is prepared for nothing and brings its own fixed text, so it
