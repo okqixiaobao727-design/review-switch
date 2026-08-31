@@ -77,6 +77,8 @@ and every result says what this lineage is permitted after it. The five actions 
 `fix and stop`, `fix then one re-review`, `run again`, and `escalate`. When that action is a
 Bridge call, run `nextCall.argv` exactly; the result already carries the fresh or resumed
 single-axis call.
+The per-axis `nextCall` of one result may be run together: two re-reviews of one result are two
+lineages, and neither excludes the other. A call a lock refuses spends no round.
 Where `next` is `done`, the reviewer counted no finding on that round: end the review for that
 axis and report it as complete, naming `axes.<axis>.reportFile`. Nothing is in dispute, so none
 of the escalation wording below belongs to it.

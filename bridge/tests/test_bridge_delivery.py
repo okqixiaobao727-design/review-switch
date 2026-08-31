@@ -2,9 +2,13 @@
 """Delivering a review: the panes it opens, the turns it starts, the records it leaves."""
 
 import asyncio
+import contextlib
+import io
+import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -230,19 +234,6 @@ class DeliveryContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Invalid review session"):
                 store.write_report("../another-task", "a report")
 
-    def test_same_pane_rejects_concurrent_bridge_calls(self):
-        owner = self.bridge.InvocationOwner(
-            tmux_server="/private/tmp/tmux-501/default,11028",
-            origin_pane="%24",
-            worktree_root="/workspace/ticket-50",
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = self.bridge.SessionStore(temp_dir)
-            with self.bridge.owner_lock(store, owner):
-                with self.assertRaisesRegex(RuntimeError, "already running"):
-                    with self.bridge.owner_lock(store, owner):
-                        pass
-
     def test_review_prompts_carry_the_axis_brief_and_no_rounds_contract(self):
         preparation = self.bridge.ReviewPreparation(
             scope=self.bridge.ReviewScope(
@@ -279,6 +270,83 @@ class DeliveryContractTests(unittest.TestCase):
             "git ls-files --others --exclude-standard",
             prompt,
         )
+
+
+class OwnerLockTests(unittest.TestCase):
+    """Which two calls of one owner may hold their locks at the same time.
+
+    A resume holds the owner shared and its own lineage exclusive, so the two
+    per-axis re-reviews one result hands back run together; a fresh review and a
+    recovery hold the owner exclusive, as they always have.
+    """
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.store = self.bridge.SessionStore(self.work.name)
+
+    def owner(self, origin_pane="%24"):
+        return self.bridge.InvocationOwner(
+            tmux_server="/private/tmp/tmux-501/default,11028" if origin_pane else "",
+            origin_pane=origin_pane,
+            worktree_root="/workspace/ticket-50",
+        )
+
+    def test_resumes_of_different_lineages_hold_their_locks_together(self):
+        owner = self.owner()
+        with self.bridge.owner_lock(self.store, owner, "review-a"):
+            with self.bridge.owner_lock(self.store, owner, "review-b"):
+                pass
+
+    def test_a_second_resume_of_one_lineage_names_the_session_it_collided_with(self):
+        owner = self.owner()
+        with self.bridge.owner_lock(self.store, owner, "review-a"):
+            with self.assertRaisesRegex(
+                self.bridge.LockRefusedError,
+                "^Review session review-a is already being resumed$",
+            ):
+                with self.bridge.owner_lock(self.store, owner, "review-a"):
+                    pass
+
+    def test_a_fresh_call_is_refused_while_a_resume_is_live(self):
+        for origin_pane, named in (("%24", "this tmux pane"), ("", "this worktree")):
+            with self.subTest(origin_pane=origin_pane):
+                owner = self.owner(origin_pane)
+                with self.bridge.owner_lock(self.store, owner, "review-a"):
+                    with self.assertRaisesRegex(
+                        self.bridge.LockRefusedError,
+                        f"already running for {named}$",
+                    ):
+                        with self.bridge.owner_lock(self.store, owner):
+                            pass
+
+    def test_a_resume_is_refused_while_a_fresh_call_is_live(self):
+        owner = self.owner()
+        with self.bridge.owner_lock(self.store, owner):
+            with self.assertRaisesRegex(
+                self.bridge.LockRefusedError, "already running for this tmux pane$"
+            ):
+                with self.bridge.owner_lock(self.store, owner, "review-a"):
+                    pass
+
+    def test_two_fresh_calls_of_one_owner_still_exclude_each_other(self):
+        owner = self.owner()
+        with self.bridge.owner_lock(self.store, owner):
+            with self.assertRaisesRegex(
+                self.bridge.LockRefusedError, "already running for this tmux pane$"
+            ):
+                with self.bridge.owner_lock(self.store, owner):
+                    pass
+
+    def test_a_lineage_of_another_owner_is_no_obstacle(self):
+        with self.bridge.owner_lock(self.store, self.owner("%24"), "review-a"):
+            with self.bridge.owner_lock(self.store, self.owner("%25")):
+                pass
+
+    def test_a_refusal_is_still_a_runtime_error(self):
+        """`main` handles it as it handles every other refusal it prints."""
+        self.assertTrue(issubclass(self.bridge.LockRefusedError, RuntimeError))
 
 
 class DeliveredAxis:
@@ -866,6 +934,226 @@ class PerAxisModelAndEffortTests(FakePaneTestCase):
                 self.codex.started_turns[-1].get("effort"),
             ),
             ("spec-model-two", "high"),
+        )
+
+
+class ConcurrentCallTests(FakePaneTestCase):
+    """Two calls of one owner at the command entry: which coexist, which are refused.
+
+    Driven through a Document Review, because that is the review whose `both`
+    first round hands back a re-review for each of its two axes and so invites
+    the caller to run two resumes at once.
+    """
+
+    LANES = ("codex", "claude")
+
+    def setUp(self):
+        super().setUp()
+        for name in ("parent.md", "first.md"):
+            path = self.worktree / "docs" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{name}\n", encoding="utf-8")
+
+    def document_argv(self, reviewer, axis, *arguments):
+        return [
+            "--reviewer", reviewer,
+            "--cwd", str(self.worktree),
+            "--parent", "docs/parent.md",
+            "--document", "docs/first.md",
+            "--axis", axis,
+            "--no-network",
+            *arguments,
+        ]
+
+    def first_round(self, reviewer):
+        """One `--axis both` Document Review, and each axis's re-review argv."""
+        for axis in ("requirements", "design"):
+            self.lane(reviewer).finish(f"{axis} round one findings", axis=axis)
+
+        code, output = self.run_bridge(
+            self.parsed_args(self.document_argv(reviewer, "both"))
+        )
+
+        self.assertEqual(code, 0, output)
+        calls = []
+        for axis in ("requirements", "design"):
+            call = output["axes"][axis]["nextCall"]
+            pathlib.Path(call["responseFile"]).write_text(
+                f'1. "{axis} round one findings" — fixed in docs/first.md\n',
+                encoding="utf-8",
+            )
+            self.lane(reviewer).finish(f"{axis} round two findings", axis=axis)
+            calls.append(call["argv"][1:])
+        return calls
+
+    def held_until_all_have_started(self, stack, barrier):
+        """Hold every Lane's resume until its siblings have taken their locks.
+
+        The stub reviewers never yield to the event loop, so without this the
+        calls would take their locks one after another and prove nothing. The
+        barrier puts every call inside its own locks at the same moment, which
+        is the situation two per-axis Next Calls create.
+        """
+        for lane in self.bridge.LANES.values():
+            resume = lane.resume
+
+            async def resumed(self_lane, brief, _resume=resume):
+                await barrier.wait()
+                return await _resume(self_lane, brief)
+
+            stack.enter_context(mock.patch.object(lane, "resume", resumed))
+
+    def run_together(self, *argvs):
+        """Every call inside its locks at once, each with its own arguments."""
+        arguments = [self.parsed_args(argv) for argv in argvs]
+
+        async def calls():
+            return await asyncio.wait_for(
+                asyncio.gather(
+                    *(self.bridge.run_bridge(one) for one in arguments)
+                ),
+                timeout=10,
+            )
+
+        stdout = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            self.held_until_all_have_started(
+                stack, asyncio.Barrier(len(arguments))
+            )
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            codes = asyncio.run(calls())
+        return codes, [
+            json.loads(line)
+            for line in stdout.getvalue().splitlines()
+            if line.strip()
+        ]
+
+    def run_main(self, argv):
+        """One call across the command entry, with both its streams."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["review_bridge.py", *argv]):
+            with contextlib.redirect_stdout(stdout):
+                with contextlib.redirect_stderr(stderr):
+                    code = self.bridge.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def live_call(self, reviewer, resuming=None):
+        """The locks a call of this owner holds for as long as it runs."""
+        store = self.bridge.SessionStore()
+        args = self.parsed_args(self.document_argv(reviewer, "requirements"))
+        owner = self.bridge.resolve_lane(args, store).owner
+        return self.bridge.owner_lock(store, owner, resuming)
+
+    def session_of(self, argv):
+        return argv[argv.index("--resume-session") + 1]
+
+    def test_two_resumes_of_different_lineages_each_return_their_result(self):
+        for reviewer in self.LANES:
+            with self.subTest(reviewer=reviewer):
+                calls = self.first_round(reviewer)
+
+                codes, printed = self.run_together(*calls)
+
+                self.assertEqual(codes, [0, 0])
+                self.assertEqual(
+                    {
+                        axis: result["finalMessage"]
+                        for output in printed
+                        for axis, result in output["axes"].items()
+                    },
+                    {
+                        "requirements": "requirements round two findings",
+                        "design": "design round two findings",
+                    },
+                )
+
+    def test_two_concurrent_resumes_each_open_and_close_a_pane_of_their_own(self):
+        calls = self.first_round("codex")
+        already_launched = len(self.codex.launched_panes)
+
+        codes, _printed = self.run_together(*calls)
+
+        self.assertEqual(codes, [0, 0])
+        opened = self.codex.launched_panes[already_launched:]
+        self.assertEqual(len(set(opened)), 2)
+        self.assertEqual(
+            {target for _axis, target, _split in self.codex.launches[already_launched:]},
+            {self.ORIGIN_PANE},
+        )
+        self.assertEqual(self.codex.panes, [])
+
+    def test_a_second_resume_of_one_lineage_is_refused_naming_that_session(self):
+        """The lineage is left exactly as the live resume will leave it.
+
+        The live resume is stood in for by its locks rather than by a second
+        driver: the only window in which two resumes of one lineage both pass
+        the round cap closes inside the lock, before the Lane is reached, so
+        there is no point at which two real calls can be held together.
+        """
+        for reviewer in self.LANES:
+            with self.subTest(reviewer=reviewer):
+                argv = self.first_round(reviewer)[0]
+                session = self.session_of(argv)
+                records = len(list(self.state_dir.glob("*.json")))
+
+                with self.live_call(reviewer, resuming=session):
+                    code, stdout, stderr = self.run_main(argv)
+
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    stderr,
+                    f"Review session {session} is already being resumed\n",
+                )
+                self.assertEqual(
+                    len(list(self.state_dir.glob("*.json"))), records
+                )
+                # The round the collision did not spend, spent by the resume
+                # that was let in: one grant, and a report of its own.
+                granted, output = self.run_bridge(self.parsed_args(argv))
+                self.assertEqual(granted, 0, output)
+                self.assertEqual(
+                    output["axes"]["requirements"]["finalMessage"],
+                    "requirements round two findings",
+                )
+                self.assertEqual(
+                    self.bridge.SessionStore().read(session)["rounds"], 2
+                )
+
+    def test_a_fresh_review_is_refused_while_a_resume_of_this_owner_is_live(self):
+        for reviewer in self.LANES:
+            with self.subTest(reviewer=reviewer):
+                session = self.session_of(self.first_round(reviewer)[0])
+                named = "this tmux pane" if reviewer == "codex" else "this worktree"
+
+                with self.live_call(reviewer, resuming=session):
+                    code, stdout, stderr = self.run_main(
+                        self.document_argv(reviewer, "requirements")
+                    )
+
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    stderr,
+                    "Another review bridge call is already running for "
+                    f"{named}\n",
+                )
+
+    def test_a_recovery_is_refused_while_a_resume_of_this_owner_is_live(self):
+        session = self.session_of(self.first_round("codex")[0])
+
+        with self.live_call("codex", resuming=session):
+            code, stdout, stderr = self.run_main([
+                "--reviewer", "codex",
+                "--cwd", str(self.worktree),
+                "--recover-session",
+            ])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            stderr,
+            "Another review bridge call is already running for this tmux pane\n",
         )
 
 
