@@ -418,9 +418,10 @@ def printable_git_command(arguments):
     return " ".join(("git", *arguments))
 
 
-def run_git(cwd, *arguments):
+def run_git(cwd, *arguments, stdin=None):
     return subprocess.run(
         ["git", "-C", cwd, *arguments],
+        input=stdin,
         text=True,
         capture_output=True,
         check=False,
@@ -1198,6 +1199,16 @@ STANDARDS_ROOT_FILES = (
     "CLAUDE.md",
 )
 STANDARDS_CONVENTION_DIRECTORY = "docs/agents"
+#: `git check-ignore -v -z` writes one record per queried path, as the four
+#: NUL-separated fields source, line number, pattern and pathname. A path no
+#: rule matches fills the first three with empty strings, so the record is
+#: read by its width rather than by dropping empty fields.
+RULE_RECORD_FIELDS = 4
+#: The last rule to match a path decides it, and a `!` rule decides that the
+#: path is *not* ignored. `check-ignore` reports that rule as the matching one
+#: exactly as it reports an ignoring one, so the pattern is what tells them
+#: apart: a path a `.gitignore` un-ignores is an ordinary untracked file.
+NEGATED_RULE_PREFIX = "!"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1285,6 +1296,104 @@ def tracked_standards_files(root):
     return frozenset(name for name in listing.stdout.split("\0") if name)
 
 
+def ignore_query_path(root, path):
+    """The path to ask git about, which is not always the path itself.
+
+    `git check-ignore` refuses a pathspec that lies beyond a symbolic link,
+    and one refused pathspec aborts the whole batch, so a path reached
+    through a link is asked about as the outermost link on its way: a
+    worktree that reaches `docs/agents` through a link into the main
+    checkout asks about the same rule either way (#51).
+    """
+    parts = pathlib.PurePosixPath(path).parts
+    walked = root
+    for depth, part in enumerate(parts, start=1):
+        walked = walked / part
+        if walked.is_symlink():
+            return "/".join(parts[:depth])
+    return path
+
+
+def ignore_rule_sources(root, paths):
+    """Which rule file ignores each of `paths`, as git names it.
+
+    One `check-ignore` answers for every path. A path git cannot answer for
+    is simply absent from the mapping, which leaves it where it already was:
+    a classification this cannot make must never turn a review that runs
+    today into a refusal.
+    """
+    queried = {}
+    for path in paths:
+        queried.setdefault(ignore_query_path(root, path), []).append(path)
+    if not queried:
+        return {}
+    reported = run_git(
+        str(root),
+        "check-ignore",
+        "-v",
+        "-z",
+        "--non-matching",
+        "--stdin",
+        stdin="".join(f"{query}\0" for query in queried),
+    )
+    if reported.returncode not in (0, 1):
+        return {}
+    fields = iter(reported.stdout.split("\0"))
+    sources = {}
+    for source, _line, pattern, asked in zip(*[fields] * RULE_RECORD_FIELDS):
+        if not source or pattern.startswith(NEGATED_RULE_PREFIX):
+            continue
+        for path in queried.get(asked, ()):
+            sources[path] = source
+    return sources
+
+
+def tracked_rule_files(root, rule_files):
+    """Which of those rule files this checkout tracks, so every clone reads them."""
+    if not rule_files:
+        return frozenset()
+    listing = run_git(str(root), "ls-files", "-z", "--", *rule_files)
+    if listing.returncode != 0:
+        return frozenset()
+    return frozenset(name for name in listing.stdout.split("\0") if name)
+
+
+def is_declaring_rule_file(source):
+    """A `.gitignore` inside this checkout, which is the only rule file that declares.
+
+    A global excludes file is reported by its own absolute path and
+    `.git/info/exclude` by a name git never tracks, so neither can be asked
+    of the index at all.
+    """
+    if not source or os.path.isabs(source):
+        return False
+    parts = pathlib.PurePosixPath(source).parts
+    return parts[-1] == ".gitignore" and ".." not in parts
+
+
+def declared_local_standards(root, candidates):
+    """Which untracked candidates a tracked `.gitignore` declares local.
+
+    #40 protects the property that every checkout of a commit is reviewed
+    against the same standards, and read tracked-ness as the test for it. A
+    repository that keeps its standards out of its published tree names them
+    in a `.gitignore` it tracks, and that rule file is the declaration every
+    checkout of the commit reads, where `.git/info/exclude`, a global
+    excludes file and an untracked `.gitignore` are one machine's private
+    state — the case #40 was about (ADR-0013, #51).
+    """
+    sources = ignore_rule_sources(root, candidates)
+    declaring = {
+        path: source
+        for path, source in sources.items()
+        if is_declaring_rule_file(source)
+    }
+    tracked = tracked_rule_files(root, sorted(set(declaring.values())))
+    return frozenset(
+        path for path, source in declaring.items() if source in tracked
+    )
+
+
 def convention_documents(tracked):
     """The convention directory's own documents, as the disk glob would list them."""
     prefix = f"{STANDARDS_CONVENTION_DIRECTORY}/"
@@ -1304,18 +1413,23 @@ def read_standards_sources(repo_root):
     convention document installed as ignored exists in the main worktree and
     in no linked one, so the same commit was reviewed against different
     standards and nothing said so (#40). git's record is the same in every
-    checkout of a commit, so the list is too.
+    checkout of a commit, so the list is too. A document a tracked
+    `.gitignore` declares local is part of that record: the declaration is
+    committed even where the document is not (ADR-0013, #51).
     """
     root = pathlib.Path(repo_root)
     on_disk = standards_files_on_disk(root)
     tracked = tracked_standards_files(root)
     if tracked is None:
         return StandardsSources(files=on_disk, untracked=None)
-    files = [path for path in STANDARDS_ROOT_FILES if path in tracked]
-    files.extend(convention_documents(tracked))
+    named = tracked | declared_local_standards(
+        root, tuple(path for path in on_disk if path not in tracked)
+    )
+    files = [path for path in STANDARDS_ROOT_FILES if path in named]
+    files.extend(convention_documents(named))
     return StandardsSources(
         files=tuple(files),
-        untracked=tuple(path for path in on_disk if path not in tracked),
+        untracked=tuple(path for path in on_disk if path not in named),
     )
 
 
