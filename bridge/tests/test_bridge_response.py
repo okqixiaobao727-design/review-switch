@@ -38,10 +38,6 @@ LANES = ("codex", "claude")
 class CallerResponseTestCase(FakePaneTestCase):
     """A spec lineage driven to its re-review, on either Lane."""
 
-    def lane(self, reviewer):
-        """The stub standing in for this Lane's reviewer."""
-        return self.claude if reviewer == "claude" else self.codex
-
     def delivered_briefs(self, reviewer):
         """Every turn this Lane's reviewer received, its marker line stripped.
 
@@ -164,6 +160,69 @@ class ReReviewTurnTests(CallerResponseTestCase):
             f"{self.delivered_briefs('codex')[0]}\n\n"
             f"{HEADING}\n{written}\n\n{INSTRUCTION}",
         )
+
+
+class DocumentReviewResponseTests(CallerResponseTestCase):
+    """A Document Review re-review through its public Next Call."""
+
+    def test_design_re_review_requires_and_delivers_a_response_on_both_lanes(self):
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                first_args = self.parsed_args([
+                    "--reviewer", reviewer,
+                    "--cwd", str(self.worktree),
+                    "--document", "docs/ticket.md",
+                    "--axis", "design",
+                    "--no-network",
+                ])
+                self.lane(reviewer).finish("one design finding", axis="design")
+                first_code, first_output = self.run_bridge(first_args)
+                self.assertEqual(first_code, 0, first_output)
+                first_brief = self.delivered_briefs(reviewer)[-1]
+                next_call = first_output["axes"]["design"]["nextCall"]
+                argv_without_response = next_call["argv"][1:-2]
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaisesRegex(SystemExit, "2"):
+                        self.bridge.parse_args(argv_without_response)
+
+                self.assertIn(
+                    "--resume-session requires --response",
+                    stderr.getvalue(),
+                )
+
+                pathlib.Path(next_call["responseFile"]).write_text(
+                    RESPONSE_TEXT,
+                    encoding="utf-8",
+                )
+                resumed_args = self.parsed_args(next_call["argv"][1:])
+                self.lane(reviewer).finish(
+                    "the design response closes it",
+                    axis="design",
+                )
+                resumed_code, resumed_output = self.run_bridge(resumed_args)
+
+                self.assertEqual(resumed_code, 0, resumed_output)
+                resumed_brief = self.delivered_briefs(reviewer)[-1]
+                self.assertEqual(
+                    resumed_brief,
+                    f"{first_brief}\n\n{HEADING}\n{RESPONSE_TEXT}\n{INSTRUCTION}",
+                )
+                self.assertEqual(
+                    resumed_output["preparation"],
+                    {
+                        **first_output["preparation"],
+                        "responseFile": next_call["responseFile"],
+                    },
+                )
+                resumed_result = resumed_output["axes"]["design"]
+                self.assertEqual(resumed_result["next"], "escalate")
+                self.assertIsNone(resumed_result["nextCall"])
 
 
 class ResponseReceiptTests(CallerResponseTestCase):
