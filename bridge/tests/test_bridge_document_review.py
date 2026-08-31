@@ -9,7 +9,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from bridge_harness import FakePaneTestCase
+from bridge_harness import FakePaneTestCase, assert_first_round_turns
 
 
 REQUIREMENTS_BRIEF_WITHOUT_PARENT = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
@@ -68,19 +68,15 @@ def briefs_with_parent(parent_line, document_lines):
 
 class DocumentReviewCommandTests(FakePaneTestCase):
     def assert_delivered_briefs(self, templates):
-        """Each Axis Brief byte for byte, then the first round's verdict request.
-
-        Asserted as prefix and suffix rather than as one rewritten literal, so
-        the templates stay pinned on their own.
-        """
-        block = f"\n\n{self.bridge.FIRST_ROUND_VERDICT.request}"
-        delivered = [
-            turn["input"][0]["text"].split("\n", 1)[1]
-            for turn in self.codex.started_turns
-        ]
-        for text, template in zip(delivered, templates, strict=True):
-            self.assertEqual(text[: len(template)], template)
-            self.assertEqual(text[len(template):], block)
+        """Every turn this call delivered, against the Axis Briefs it filled."""
+        assert_first_round_turns(
+            self,
+            [
+                turn["input"][0]["text"].split("\n", 1)[1]
+                for turn in self.codex.started_turns
+            ],
+            templates,
+        )
 
     def test_documents_without_a_parent_deliver_both_briefs_and_the_receipt(self):
         documents = ("docs/spec.md", "docs/ticket.md")

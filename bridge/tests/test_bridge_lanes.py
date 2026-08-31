@@ -12,18 +12,9 @@ from bridge_harness import (
     DriverKilled,
     FakePaneTestCase,
     MARKER_PATTERN,
+    assert_first_round_turns,
     graph_navigation_result,
 )
-
-
-def first_round_turn(bridge, preparation, axis):
-    """One axis's whole first-round turn: its brief, then the Bridge's request.
-
-    The Verdict Line request is the Bridge's, appended after the prepared brief
-    and delivered by both Lanes alike, so a turn is still what preparation
-    filled plus what the Bridge asked for and nothing a Lane added.
-    """
-    return f"{preparation.brief_text(axis)}\n\n{bridge.FIRST_ROUND_VERDICT.request}"
 
 
 def delivered_brief(prompt):
@@ -112,11 +103,14 @@ class ClaudeDeliveryTests(FakePaneTestCase):
         code, _output = self.run_bridge(args)
 
         self.assertEqual(code, 0)
-        self.assertEqual(
+        # The Verdict Line request is the Bridge's own and both Lanes deliver
+        # it, so a turn is still the prepared brief and nothing a Lane added.
+        assert_first_round_turns(
+            self,
             self.claude.prompts,
             [
-                first_round_turn(self.bridge, args.preparation, "standards"),
-                first_round_turn(self.bridge, args.preparation, "spec"),
+                args.preparation.brief_text("standards"),
+                args.preparation.brief_text("spec"),
             ],
         )
         for prompt in self.claude.prompts:
@@ -341,19 +335,18 @@ class SharedBriefTests(FakePaneTestCase):
         ]
 
         self.assertEqual(codex_briefs, claude_briefs)
-        self.assertEqual(
+        assert_first_round_turns(
+            self,
             codex_briefs,
-            [
-                first_round_turn(self.bridge, preparation, "standards"),
-                first_round_turn(self.bridge, preparation, "spec"),
-            ],
+            [preparation.brief_text(axis) for axis in ("standards", "spec")],
         )
-        self.assertEqual(
-            [
-                first_round_turn(self.bridge, second_preparation, "standards"),
-                first_round_turn(self.bridge, second_preparation, "spec"),
-            ],
+        assert_first_round_turns(
+            self,
             claude_briefs,
+            [
+                second_preparation.brief_text(axis)
+                for axis in ("standards", "spec")
+            ],
         )
 
     def test_both_lanes_report_the_same_result_shape(self):

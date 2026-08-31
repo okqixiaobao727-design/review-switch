@@ -59,6 +59,19 @@ class StaticPreparation:
         }
 
 
+def assert_first_round_turns(test, delivered, templates):
+    """Each delivered turn is its Axis Brief, then the first round's request.
+
+    Asserted as prefix and suffix rather than as one rewritten literal: an Axis
+    Brief template that drifts by a character still fails, which is the whole
+    point of pinning the turn text at all.
+    """
+    block = f"\n\n{test.bridge.FIRST_ROUND_VERDICT.request}"
+    for text, template in zip(delivered, templates, strict=True):
+        test.assertEqual(text[: len(template)], template)
+        test.assertEqual(text[len(template):], block)
+
+
 def base_args(**overrides):
     values = {
         "reviewer": "codex",
