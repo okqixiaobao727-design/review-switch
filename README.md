@@ -87,9 +87,9 @@ a `.gitignore` it **tracks** — at the root or in any subdirectory. That rule f
 even where the documents are not, so every checkout of the commit reads the same declaration,
 and a document it ignores is briefed exactly as a tracked one is. `.git/info/exclude`, a global
 excludes file (`core.excludesFile`) and an untracked `.gitignore` are one machine's private
-state and declare nothing. Write a directory pattern without a trailing slash (`docs/agents`, not
-`docs/agents/`), so that a linked worktree reaching the directory through a symlink resolves the
-same rule the main checkout does.
+state and declare nothing. A directory pattern declares its directory written either way
+(`docs/agents` or `docs/agents/`), and a linked worktree that reaches the directory through a
+symlink resolves the same rule the main checkout does.
 
 `preparation.standardsCondition` states how this checkout carries them:
 
