@@ -1657,11 +1657,20 @@ Template baseline (the rules these documents were written under; every item is a
 
 Report: (a) a Module the design adds that an existing one already owns; (b) a Seam or Interface the design adds where the checkout already has one; (c) a decision that contradicts an ADR or the glossary. Name the code or ADR beside the quoted line for each finding. Under 400 words."""
 
+UNFETCHED_PARENT_TEMPLATE = (
+    "{source}. Failure: {detail}. Hold the documents to each other."
+)
+
 
 def document_parent_slot(parent):
     """The Parent line shared by both Document Review Axis Briefs."""
     if parent.text is None:
         return "not provided; hold the documents to each other."
+    if parent.failure is not None:
+        return UNFETCHED_PARENT_TEMPLATE.format(
+            source=parent.source,
+            detail=parent.failure,
+        )
     return build_document_reference(parent.file, parent.summary)
 
 
@@ -1742,12 +1751,19 @@ def prepare_document_review(args, store):
     """Everything both Document Review axes need before any Lane opens."""
     repo_root = canonical_worktree_root(args.cwd)
     ensure_store_is_outside_the_checkout(repo_root, store)
+    parent = read_document(repo_root, args.parent, store)
+    documents = []
+    for reference in args.document:
+        document = read_document(repo_root, reference, store)
+        if document.failure is not None:
+            raise RuntimeError(
+                f"Document could not be fetched: {reference}. "
+                f"Failure: {document.failure}"
+            )
+        documents.append(document)
     preparation = DocumentReviewPreparation(
-        parent=read_document(repo_root, args.parent, store),
-        documents=tuple(
-            read_document(repo_root, reference, store)
-            for reference in args.document
-        ),
+        parent=parent,
+        documents=tuple(documents),
         standards=read_standards_sources(repo_root),
     )
     for axis in requested_axes(args):
