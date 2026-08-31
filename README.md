@@ -57,6 +57,21 @@ option.
 The Bridge reads no configuration file of its own, so a review resolves the same way on every
 machine it is invoked from.
 
+## Document Review
+
+A Document Review holds documents to their Parent and to the checkout, using `requirements` and
+`design` as separate axes. Name each document once; `--parent` is optional:
+
+```bash
+review-bridge --reviewer codex --parent '#43' --document '#48' --axis both
+```
+
+Its `preparation` receipt carries `parentSource`, `parentFile`, `parentFailure`, `documents` (one
+`source` and `file` pair per document), `standardsFiles`, `standardsCondition`, `codeGraphUsed`
+(`false`), and `responseFile`. An unfetched Parent is recorded and the review continues; an
+unfetched document stops preparation before a Lane opens. The result keeps the same per-axis
+report, Next Call, Response, rounds, and recovery contract described above.
+
 ## Standards sources
 
 The Standards axis is held to the documents the checkout **tracks**: `CODING_STANDARDS.md`,

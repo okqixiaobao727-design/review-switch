@@ -1,7 +1,7 @@
 ---
 name: review-switch
-description: Dispatch a code review to the reviewer lane this machine is configured for. Use when a review is asked for without naming a lane, or when a review-skill invocation was refused and pointed here.
-allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh:*), Bash(review-bridge:*)
+description: Dispatch a review to the reviewer lane this machine is configured for. Use when a review is asked for without naming a lane, or when a review-skill invocation was refused and pointed here.
+allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(gh api:*), Bash(bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh:*), Bash(review-bridge:*)
 ---
 
 !`bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh`
@@ -15,6 +15,10 @@ and this caller configured, and report back what it returns.
 The lines above are this machine's configuration, and this skill is the only place they are
 read. Use the Lane named there unless the caller named one, and append the hook options exactly
 as printed unless they read `none configured`.
+
+When the caller asks to review documents — a spec, a ticket set, an issue's sub-issues, or a
+`crewtask/<n>/` run — rather than a change, read `references/document-review.md` and use it to
+complete the call. The Result section and everything after it apply unchanged.
 
 ## Completing the call
 
