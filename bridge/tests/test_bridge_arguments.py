@@ -244,6 +244,21 @@ class RecoveryParserTests(unittest.TestCase):
         self.assertIn("it carries no nextCall", described)
         self.assertIn('findings, the counts the reviewer ended', described)
 
+    def test_help_says_the_per_axis_next_calls_may_run_together(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                self.bridge.parse_args(["--help"])
+
+        described = " ".join(stdout.getvalue().split())
+
+        self.assertIn(
+            "The per-axis nextCall of one result may be run together: two "
+            "re-reviews of one result are two lineages, and neither excludes "
+            "the other. A call a lock refuses spends no round.",
+            described,
+        )
+
     def test_help_says_only_exit_three_permits_a_fresh_review(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

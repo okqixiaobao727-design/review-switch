@@ -326,6 +326,36 @@ class LifecycleHookTests(HookRecordingTestCase):
         self.assertIn("axis 'standards'", stderr.getvalue())
         self.assertEqual(self.events(), ["review-end"])
 
+    def test_a_call_refused_by_a_lock_fires_neither_end_of_the_review(self):
+        """A call the lock turned away never started, so it never ended either."""
+        self.codex.finish("round one findings", axis="spec")
+        self.main(*self.review_argv(axis="spec"))
+        session = self.stored_session()["reviewSessionId"]
+        self.firings.unlink()
+        store = self.bridge.SessionStore()
+        owner = self.bridge.resolve_lane(
+            self.parsed_args([
+                "--reviewer", self.REVIEWER,
+                "--cwd", str(self.worktree),
+                *self.review_argv(axis="spec"),
+            ]),
+            store,
+        ).owner
+        stderr = io.StringIO()
+
+        with self.bridge.owner_lock(store, owner, session):
+            with contextlib.redirect_stderr(stderr):
+                code = self.main(
+                    *self.review_argv("--resume-session", session, axis="spec")
+                )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stderr.getvalue(),
+            f"Review session {session} is already being resumed\n",
+        )
+        self.assertEqual(self.events(), [])
+
     def test_a_caller_variable_of_its_own_reaches_the_hook_untouched(self):
         self.enter(mock.patch.dict(os.environ, {"REVIEW_COORDINATOR": "caller-42"}))
         self.codex.finish("no findings")

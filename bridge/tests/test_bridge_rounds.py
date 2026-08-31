@@ -546,6 +546,32 @@ class RoundCapTests(RoundsContractTestCase):
 
                 self.assert_refused(code, output, "spec", session)
 
+    def test_a_resume_refused_by_a_lock_spends_no_round(self):
+        """A collision is not a round: the cap sits where it would have sat."""
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                first = self.review(reviewer, "spec", "one spec finding")
+                session = first["reviewSessionId"]
+                store = self.bridge.SessionStore()
+                owner = self.bridge.resolve_lane(
+                    self.args(reviewer=reviewer, axis="spec"), store
+                ).owner
+
+                with self.bridge.owner_lock(store, owner, session):
+                    with self.assertRaises(self.bridge.LockRefusedError):
+                        self.resume(reviewer, "spec", session, "collides")
+
+                granted, _output = self.resume(
+                    reviewer, "spec", session, "fix closes it"
+                )
+                code, output = self.resume(
+                    reviewer, "spec", session, "round three"
+                )
+
+                self.assertEqual(granted, 0)
+                self.assertEqual(store.read(session)["rounds"], 2)
+                self.assert_refused(code, output, "spec", session)
+
     def test_a_handle_read_before_a_sibling_round_cannot_take_that_round_again(self):
         """The copy a caller arrived with is not what the cap is decided on."""
         for reviewer in LANES:

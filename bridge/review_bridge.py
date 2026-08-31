@@ -720,22 +720,57 @@ class SessionStore:
         return found
 
 
+class LockRefusedError(RuntimeError):
+    """A call turned away by a lock, which is a call that never started.
+
+    Its own type, because it is the one refusal that must not be announced to
+    the Lifecycle Hooks: to a hook consumer a review that started and failed and
+    a call that was never let in would otherwise look the same. Still a
+    `RuntimeError`, so every caller that handles a refusal already handles this.
+    """
+
+
 @contextmanager
-def owner_lock(store, owner):
-    lock_path = store.lock_path(owner.key)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+def flock_held(path, mode, refusal):
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError(
-                "Another review bridge call is already running for "
-                + ("this tmux pane" if owner.origin_pane else "this worktree")
-            ) from error
+            raise LockRefusedError(refusal) from error
         yield
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+@contextmanager
+def owner_lock(store, owner, resuming=None):
+    """The locks one call holds for its length; `resuming` names its lineage.
+
+    What the owner lock protects is a recovery sweep, which adopts every record
+    of the owner, and a fresh call, which has no session id to be keyed on yet:
+    both take it exclusively and are refused while any call of this owner is
+    live. A resume protects only its own lineage's read-modify-write, so it
+    takes the owner shared and its lineage exclusive — the two per-axis
+    re-reviews one result hands back are two lineages, and run together.
+
+    Nothing waits: a lock that is not free refuses, naming what holds it.
+    """
+    owner_mode = fcntl.LOCK_SH if resuming else fcntl.LOCK_EX
+    owner_refusal = "Another review bridge call is already running for " + (
+        "this tmux pane" if owner.origin_pane else "this worktree"
+    )
+    with flock_held(store.lock_path(owner.key), owner_mode, owner_refusal):
+        if not resuming:
+            yield
+            return
+        with flock_held(
+            store.lock_path(f"session:{resuming}"),
+            fcntl.LOCK_EX,
+            f"Review session {resuming} is already being resumed",
+        ):
+            yield
 
 
 class AppServerClient:
@@ -4244,15 +4279,18 @@ async def run_bridge(args):
         args.preparation = review_kind_for(args).preparation(args, store)
     elif probe:
         args.preparation = None
-    # Preparation has succeeded and no Lane has opened yet, which is what this
-    # point promises: a review that failed before here never started.
-    hook_review_start(args, review_start_model(args, args.resume_state))
-    # The lock stays process-scoped: it serialises concurrent calls from one
-    # pane, and a driver that dies releases it. Duplicate prevention across a
+    # The locks stay process-scoped: they serialise concurrent calls of one
+    # owner, and a driver that dies releases them. Duplicate prevention across a
     # driver's death is the recovery path's job, not a longer-lived lock's — a
     # lock that outlived its holder would also have to be reaped, and would
-    # block the very recovery call that clears the duplicate.
-    with owner_lock(store, lane.owner):
+    # block the very recovery call that clears the duplicate. They are taken
+    # before the review-start point below, so a call a lock refused is never
+    # announced as a review at all.
+    with owner_lock(store, lane.owner, args.resume_session):
+        # Preparation has succeeded, the locks are held, and no Lane has opened
+        # yet, which is what this point promises: a review that failed before
+        # here never started.
+        hook_review_start(args, review_start_model(args, args.resume_state))
         if args.recover_session:
             runs = await lane.recover()
         elif args.resume_session:
@@ -4323,7 +4361,10 @@ def build_parser():
             "and it carries no nextCall. Every axis also names findings, the "
             "counts the reviewer ended its report with: {\"reported\": n} on a "
             "first round, {\"retained\": n, \"new\": m} on a re-review, or null "
-            "where the report carried no such line."
+            "where the report carried no such line. The per-axis nextCall of "
+            "one result may be run together: two re-reviews of one result are "
+            "two lineages, and neither excludes the other. A call a lock "
+            "refuses spends no round."
         ),
     )
     parser.add_argument(
@@ -4608,7 +4649,10 @@ def main():
     args.resume_state = None
     # The end point straddles the whole call, so it fires on every exit path this
     # bridge controls — a review that failed, timed out, or raised included,
-    # including one that failed before any Lane opened.
+    # including one that failed before any Lane opened. The one exit it does not
+    # fire on is a call a lock refused: that call was never let in, and a
+    # consumer told it ended would have been told it began.
+    refused_by_a_lock = False
     try:
         try:
             args.resume_state = resume_state_for_review(args)
@@ -4620,11 +4664,16 @@ def main():
         except NoLiveSessionError as error:
             print(str(error), file=sys.stderr)
             return NO_LIVE_SESSION_EXIT
+        except LockRefusedError as error:
+            refused_by_a_lock = True
+            print(str(error), file=sys.stderr)
+            return 1
         except (AppServerError, OSError, RuntimeError) as error:
             print(str(error), file=sys.stderr)
             return 1
     finally:
-        hook_review_end(args, args.status)
+        if not refused_by_a_lock:
+            hook_review_end(args, args.status)
 
 
 if __name__ == "__main__":

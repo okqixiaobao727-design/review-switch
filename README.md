@@ -123,6 +123,9 @@ the last line of the report, reports them as `findings`, and names `done` as the
 no `nextCall`. A completed re-review is `escalate` only where a finding was retained or a fix
 brought a new one in. No extra round is granted either way.
 
+Re-reviews of different axes may run concurrently: each axis is its own lineage, so the two
+per-axis `nextCall`s one result hands back can be run together from one caller.
+
 ## Lifecycle Hooks
 
 A caller that wants a review observed hands in the commands to run: `--on-child-launch`,
