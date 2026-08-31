@@ -118,21 +118,33 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             },
         )
 
-    def test_a_bad_axis_keeps_the_exact_command_refusal(self):
+    def test_a_documents_axis_without_document_names_the_mix(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             with self.assertRaisesRegex(SystemExit, "2"):
                 self.bridge.parse_args(self.review_argv(axis="requirements"))
 
+        self.assertEqual(
+            stderr.getvalue().splitlines()[-1].partition(": error: ")[2],
+            "--axis requirements is a documents axis and requires --document",
+        )
+        self.assertEqual(self.codex.launched_panes, [])
+
+    def test_a_genuinely_unknown_axis_keeps_the_exact_command_refusal(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(SystemExit, "2"):
+                self.bridge.parse_args(self.review_argv(axis="security"))
+
         choices = (
-            "standards, spec, both"
+            "standards, spec, requirements, design, both"
             if sys.version_info >= (3, 14)
-            else "'standards', 'spec', 'both'"
+            else "'standards', 'spec', 'requirements', 'design', 'both'"
         )
         self.assertEqual(
             stderr.getvalue().splitlines()[-1].partition(": error: ")[2],
             "argument --axis: invalid choice: "
-            f"'requirements' (choose from {choices})",
+            f"'security' (choose from {choices})",
         )
         self.assertEqual(self.codex.launched_panes, [])
 
