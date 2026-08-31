@@ -1244,6 +1244,13 @@ RULE_RECORD_FIELDS = 4
 #: exactly as it reports an ignoring one, so the pattern is what tells them
 #: apart: a path a `.gitignore` un-ignores is an ordinary untracked file.
 NEGATED_RULE_PREFIX = "!"
+#: The one rule file name that declares anything.
+IGNORE_FILE_NAME = ".gitignore"
+#: `ls-files -s` writes an entry's mode first, and only a regular file's blob
+#: is the rule text git would read. A symlinked rule file's blob is the path
+#: it points at, and git declines to read rules through it at all, so the
+#: mode is what tells a rule file from something merely named like one.
+REGULAR_FILE_MODES = ("100644", "100755")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1403,7 +1410,162 @@ def is_declaring_rule_file(source):
     if not source or os.path.isabs(source):
         return False
     parts = pathlib.PurePosixPath(source).parts
-    return parts[-1] == ".gitignore" and ".." not in parts
+    return parts[-1] == IGNORE_FILE_NAME and ".." not in parts
+
+
+def directory_link_path(root, path):
+    """The path to ask about when a link to a directory is what carries it.
+
+    Only a link to a directory stands in for one. The main checkout resolves
+    a directory-only rule against a real directory, so reading that same rule
+    through a link to a *file* would invert the divergence rather than close
+    it: the checkout that has the file would declare nothing and the one that
+    has the link would declare it (#52).
+    """
+    queried = ignore_query_path(root, path)
+    walked = root / queried
+    if walked.is_symlink() and walked.is_dir():
+        return queried
+    return None
+
+
+def ancestor_rule_files(path):
+    """Every `.gitignore` git consults for `path`, outermost first.
+
+    git reads one rule file per directory on the way down, and a rule file
+    inside the directory being asked about decides nothing about that
+    directory itself.
+    """
+    directories = [""]
+    for part in pathlib.PurePosixPath(path).parts[:-1]:
+        parent = directories[-1]
+        directories.append(f"{parent}/{part}" if parent else part)
+    return [
+        f"{directory}/{IGNORE_FILE_NAME}" if directory else IGNORE_FILE_NAME
+        for directory in directories
+    ]
+
+
+def tracked_rule_blobs(root):
+    """Each tracked `.gitignore` and the blob holding its rules, by path.
+
+    The rules are read out of the index rather than off the disk, because
+    the index is what every checkout of the commit carries. A rule file
+    lying in one checkout untracked, and one tracked as a symlink to rules
+    kept outside the repository, both reach no other checkout — and git
+    reads neither as rules where it finds them (#52).
+    """
+    listing = run_git(
+        str(root), "ls-files", "-s", "-z", "--", f"*{IGNORE_FILE_NAME}"
+    )
+    if listing.returncode != 0:
+        return {}
+    blobs = {}
+    for entry in listing.stdout.split("\0"):
+        if not entry or "\t" not in entry:
+            continue
+        described, path = entry.split("\t", 1)
+        fields = described.split()
+        if len(fields) < 2 or fields[0] not in REGULAR_FILE_MODES:
+            continue
+        if is_declaring_rule_file(path):
+            blobs[path] = fields[1]
+    return blobs
+
+
+def mirror_ignore_sources(root, paths, mirror):
+    """A tree carrying this checkout's rules, where `paths` are real directories.
+
+    git decides a directory-only rule against the entry it finds on the
+    disk, so what a link makes unanswerable is asked of a tree that has the
+    directory instead. Every rule file git consults is copied to the path it
+    lives at, from the index that carries it to every checkout, and the
+    private state that outranks it is copied beside it: which rule wins is
+    git's own precedence to apply here, exactly as it applies it in the
+    checkout that has the directory. Which of them may *declare* stays the
+    separate question the reported source answers (ADR-0013, #52).
+    """
+    if run_git(str(mirror), "init", "--quiet").returncode != 0:
+        return False
+    blobs = tracked_rule_blobs(root)
+    for path in paths:
+        (mirror / path).mkdir(parents=True, exist_ok=True)
+        for rule_file in ancestor_rule_files(path):
+            blob = blobs.get(rule_file)
+            if blob is None:
+                continue
+            rules = run_git(str(root), "cat-file", "blob", blob)
+            if rules.returncode != 0:
+                continue
+            destination = mirror / rule_file
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(rules.stdout, encoding="utf-8")
+    common = run_git(str(root), "rev-parse", "--git-common-dir")
+    if common.returncode == 0 and common.stdout.strip():
+        private = pathlib.Path(common.stdout.strip())
+        if not private.is_absolute():
+            private = root / private
+        private = private / "info" / "exclude"
+        if private.is_file():
+            destination = mirror / ".git" / "info" / "exclude"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(private.read_bytes())
+    configured = run_git(str(root), "config", "--get", "core.excludesFile")
+    if configured.returncode == 0 and configured.stdout.strip():
+        run_git(
+            str(mirror), "config", "core.excludesFile", configured.stdout.strip()
+        )
+    return True
+
+
+def directory_rule_sources(root, paths):
+    """Which rule file names each of `paths`, asked of it as a directory.
+
+    The second look a path carried by a directory link gets. The rules are
+    this checkout's own and git does the matching, so the answer stays the
+    one every checkout of the commit reads rather than whatever another
+    checkout happens to sit on (#52).
+    """
+    queried = {}
+    for path in paths:
+        link = directory_link_path(root, path)
+        if link is not None:
+            queried.setdefault(link, []).append(path)
+    if not queried:
+        return {}
+    with tempfile.TemporaryDirectory() as scratch:
+        mirror = pathlib.Path(scratch) / "as-directories"
+        mirror.mkdir()
+        if not mirror_ignore_sources(root, tuple(queried), mirror):
+            return {}
+        reported = run_git(
+            str(mirror),
+            "check-ignore",
+            "-v",
+            "-z",
+            "--non-matching",
+            "--stdin",
+            stdin="".join(f"{query}\0" for query in queried),
+        )
+    if reported.returncode not in (0, 1):
+        return {}
+    fields = iter(reported.stdout.split("\0"))
+    sources = {}
+    for source, _line, pattern, asked in zip(*[fields] * RULE_RECORD_FIELDS):
+        if not source or pattern.startswith(NEGATED_RULE_PREFIX):
+            continue
+        for path in queried.get(asked, ()):
+            sources[path] = source
+    return sources
+
+
+def declaring_rule_sources(sources):
+    """Those of `sources` whose rule file is one that can declare at all."""
+    return {
+        path: source
+        for path, source in sources.items()
+        if is_declaring_rule_file(source)
+    }
 
 
 def declared_local_standards(root, candidates):
@@ -1416,13 +1578,22 @@ def declared_local_standards(root, candidates):
     checkout of the commit reads, where `.git/info/exclude`, a global
     excludes file and an untracked `.gitignore` are one machine's private
     state — the case #40 was about (ADR-0013, #51).
+
+    A rule written with a trailing slash names a directory and nothing else,
+    and git reads an entry's type off the working tree, so a worktree
+    reaching one through a link resolves it as no declaration at all. Such a
+    path gets a second look, asked of a tree that has the directory (#52).
     """
-    sources = ignore_rule_sources(root, candidates)
-    declaring = {
-        path: source
-        for path, source in sources.items()
-        if is_declaring_rule_file(source)
-    }
+    declaring = declaring_rule_sources(ignore_rule_sources(root, candidates))
+    linked = tuple(
+        path
+        for path in candidates
+        if path not in declaring and directory_link_path(root, path)
+    )
+    if linked:
+        declaring.update(
+            declaring_rule_sources(directory_rule_sources(root, linked))
+        )
     tracked = tracked_rule_files(root, sorted(set(declaring.values())))
     return frozenset(
         path for path, source in declaring.items() if source in tracked

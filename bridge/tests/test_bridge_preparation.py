@@ -318,6 +318,18 @@ def write_convention(root, relative=CONVENTION_DOCUMENT):
     return path
 
 
+def exclude_convention_locally(root):
+    """Keep the convention out of the index without declaring anything.
+
+    `.git/info/exclude` is one machine's private state, so a fixture that
+    needs an untracked convention directory can use it to hold the index
+    still while the rule under test is the only declaration in play.
+    """
+    info = root / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "exclude").write_text("/docs/agents\n", encoding="utf-8")
+
+
 def exclude_convention_directory(root):
     """Ignore it the way the reported repository ignored it: locally (#40)."""
     info = root / ".git" / "info"
@@ -369,6 +381,11 @@ class StandardsSourcesTests(unittest.TestCase):
     def commit_all(self):
         self.git("add", "-A")
         self.git("commit", "--quiet", "-m", "the convention as it ships")
+
+    def commit_rules(self):
+        """Commit the rule files alone, leaving what they do not ignore untracked."""
+        self.git("add", "-A", "--", "*.gitignore")
+        self.git("commit", "--quiet", "-m", "the rules as they ship")
 
     def linked_worktree(self):
         """A second checkout of the same commit, as `git worktree add` makes one."""
@@ -602,6 +619,231 @@ class StandardsSourcesTests(unittest.TestCase):
         )
         self.assertEqual(worktree.untracked, ())
         self.assertEqual(worktree.condition, "all tracked")
+
+    def link_into_worktree(self, *relative):
+        """A linked worktree reaching each of those paths through a link.
+
+        How a declared document reaches a second worktree in life: the
+        consumer repository's own `post-checkout` hook links it in (#51).
+        """
+        linked = self.linked_worktree()
+        for path in relative:
+            target = self.root / path
+            link = linked / path
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target, target_is_directory=target.is_dir())
+        return linked
+
+    def test_a_directory_only_rule_declares_through_a_worktree_link(self):
+        """The defect (#52): one commit, two checkouts, two standards lists.
+
+        A rule written with a trailing slash matches only a directory, and
+        git reads the entry's type off the working tree, so the worktree
+        that reaches the convention directory through a link resolved the
+        declaration the main checkout resolves as no declaration at all.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("docs/agents/",))
+        self.commit_all()
+
+        main = self.sources()
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, main.files)
+        self.assertEqual(worktree.files, ("AGENTS.md", self.CONVENTION))
+        self.assertEqual(worktree.untracked, ())
+        self.assertEqual(worktree.condition, "all tracked")
+
+    def test_a_directory_only_rule_beside_what_it_ignores_declares_it(self):
+        """A rule lives relative to its own rule file, trailing slash or not."""
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("agents/",), directory="docs")
+        self.commit_all()
+
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, ("AGENTS.md", self.CONVENTION))
+        self.assertEqual(worktree.condition, "all tracked")
+
+    def test_a_directory_only_rule_declares_nothing_outside_its_own_directory(self):
+        """The rule names `agents` under `other/`, which is not the convention.
+
+        Reading the rule without the directory it was written in is what
+        makes it reach one: the same name under any parent would answer for
+        a rule that names none of them.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("agents/",), directory="other")
+        exclude_convention_locally(self.root)
+        self.commit_all()
+
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, ("AGENTS.md",))
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+        self.assertEqual(
+            worktree.condition, f"present but untracked: {self.CONVENTION}"
+        )
+
+    def test_a_rule_that_un_ignores_the_link_declares_nothing(self):
+        """The last rule to match decides, and a `!` rule decides against.
+
+        Both rules name a directory here, so a reading that dropped the
+        negation would leave the positive rule declaring the link while the
+        main checkout declares nothing — the divergence inverted rather
+        than closed.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("docs/agents/", "!docs/agents/"))
+        self.commit_rules()
+
+        main = self.sources()
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, main.files)
+        self.assertEqual(worktree.files, ("AGENTS.md",))
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+
+    def test_a_root_anchored_rule_declares_nothing_deeper_in_the_tree(self):
+        """`/agents/` names one directory, not every directory of that name.
+
+        A leading slash anchors a rule to its own rule file's directory. A
+        reading that dropped the anchor would let this rule declare a
+        convention directory it names nowhere.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("/agents/",))
+        self.commit_rules()
+
+        main = self.sources()
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, main.files)
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+
+    def test_private_ignore_state_leaves_the_link_the_answer_it_had(self):
+        """One machine's private state cannot decide what a link resolves.
+
+        A tracked rule outranks `.git/info/exclude`, so the checkout that
+        has the directory declares it. Asking the link's question anywhere
+        that state could outrank the tracked rule would answer the same
+        commit two ways.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("docs/agents/",))
+        self.commit_all()
+        info = self.root / ".git" / "info"
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "exclude").write_text("!docs/agents\n", encoding="utf-8")
+
+        main = self.sources()
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(main.condition, "all tracked")
+        self.assertEqual(worktree.condition, main.condition)
+        self.assertEqual(worktree.files, main.files)
+
+    def test_an_untracked_directory_only_rule_declares_nothing_through_a_link(self):
+        """A rule file no other checkout carries is no declaration (ADR-0013)."""
+        write_convention(self.root)
+        write_ignore_rules(self.root, (".gitignore", "docs/agents/"))
+
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, ("AGENTS.md",))
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+
+    def test_a_local_exclude_declares_nothing_through_a_link(self):
+        """`.git/info/exclude` stays one machine's private state (#40)."""
+        write_convention(self.root)
+        exclude_convention_directory(self.root)
+
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, ("AGENTS.md",))
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+
+    def test_a_global_excludes_file_declares_nothing_through_a_link(self):
+        """Reading the tracked rules again must not read this one with them.
+
+        A file outside the repository reaches no clone of it, so its rules
+        declare nothing whatever shape they are written in (#40).
+        """
+        write_convention(self.root)
+        excludes = pathlib.Path(self.work.name) / "global-excludes"
+        excludes.write_text("docs/agents/\n", encoding="utf-8")
+        self.git("config", "core.excludesFile", str(excludes))
+
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(worktree.files, ("AGENTS.md",))
+        self.assertEqual(worktree.untracked, (self.CONVENTION,))
+
+    def test_an_untracked_rule_file_leaves_the_link_the_answer_it_had(self):
+        """A rule file lying in one checkout alone decides nothing there.
+
+        The rules are read out of the index for exactly this reason: a
+        `.gitignore` this worktree carries untracked reaches no other
+        checkout, so letting it un-ignore the link would answer the same
+        commit two ways (ADR-0013).
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("docs/agents/",))
+        self.commit_all()
+        linked = self.link_into_worktree("docs/agents")
+        write_ignore_rules(linked, ("!agents",), directory="docs")
+
+        main = self.sources()
+        worktree = self.sources(linked)
+
+        self.assertEqual(main.condition, "all tracked")
+        self.assertEqual(worktree.condition, main.condition)
+        self.assertEqual(worktree.files, main.files)
+
+    def test_a_rule_file_tracked_as_a_link_declares_nothing(self):
+        """git reads no rules through a linked rule file, and neither may this.
+
+        Its blob is the path it points at rather than rule text, and what it
+        points at is kept outside the repository — so the main checkout
+        resolves no rule from it, and a reading that followed the link would
+        turn one machine's file into every checkout's declaration.
+        """
+        write_convention(self.root)
+        outside = pathlib.Path(self.work.name) / "rules-kept-outside"
+        outside.write_text("docs/agents/\n", encoding="utf-8")
+        (self.root / ".gitignore").symlink_to(outside)
+        self.git("add", "-f", ".gitignore")
+        self.git("commit", "--quiet", "-m", "the rules as they ship")
+
+        main = self.sources()
+        worktree = self.sources(self.link_into_worktree("docs/agents"))
+
+        self.assertEqual(main.untracked, (self.CONVENTION,))
+        self.assertEqual(worktree.condition, main.condition)
+        self.assertEqual(worktree.files, main.files)
+
+    def test_a_directory_only_rule_declares_no_link_to_a_file(self):
+        """Parity with the main checkout, which resolves no such rule either.
+
+        `AGENTS.md/` names a directory, and the main checkout carries a
+        regular file, so the rule declares nothing there. Reading the same
+        rule through a link to that file would have inverted the divergence
+        rather than closed it.
+        """
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("AGENTS.md/", "docs/agents/"))
+        self.commit_all()
+        self.untrack("AGENTS.md")
+        self.git("commit", "--quiet", "-m", "stop publishing the root standard")
+
+        main = self.sources()
+        worktree = self.sources(
+            self.link_into_worktree("AGENTS.md", "docs/agents")
+        )
+
+        self.assertEqual(main.files, (self.CONVENTION,))
+        self.assertEqual(worktree.files, main.files)
+        self.assertEqual(worktree.untracked, ("AGENTS.md",))
 
     def test_a_tree_that_is_no_checkout_keeps_reading_the_disk(self):
         """An export has no index to ask, so the walk stays its answer (085dbed)."""
