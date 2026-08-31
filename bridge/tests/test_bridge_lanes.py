@@ -16,6 +16,16 @@ from bridge_harness import (
 )
 
 
+def first_round_turn(bridge, preparation, axis):
+    """One axis's whole first-round turn: its brief, then the Bridge's request.
+
+    The Verdict Line request is the Bridge's, appended after the prepared brief
+    and delivered by both Lanes alike, so a turn is still what preparation
+    filled plus what the Bridge asked for and nothing a Lane added.
+    """
+    return f"{preparation.brief_text(axis)}\n\n{bridge.FIRST_ROUND_VERDICT.request}"
+
+
 def delivered_brief(prompt):
     """The Axis Brief inside a prompt, whichever Lane's prompt it is.
 
@@ -94,7 +104,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
             )
 
     def test_the_prompt_is_the_axis_brief_and_nothing_else(self):
-        """No prompt of the Lane's own: no scope block, no round rule, no verdict."""
+        """No prompt of the Lane's own: no scope block, no round rule, no format."""
         self.claude.finish("standards clear", axis="standards")
         self.claude.finish("spec clear", axis="spec")
         args = self.claude_args(axis="both")
@@ -104,8 +114,10 @@ class ClaudeDeliveryTests(FakePaneTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             self.claude.prompts,
-            [args.preparation.brief_text("standards"),
-             args.preparation.brief_text("spec")],
+            [
+                first_round_turn(self.bridge, args.preparation, "standards"),
+                first_round_turn(self.bridge, args.preparation, "spec"),
+            ],
         )
         for prompt in self.claude.prompts:
             for absent in (
@@ -331,12 +343,15 @@ class SharedBriefTests(FakePaneTestCase):
         self.assertEqual(codex_briefs, claude_briefs)
         self.assertEqual(
             codex_briefs,
-            [preparation.brief_text("standards"), preparation.brief_text("spec")],
+            [
+                first_round_turn(self.bridge, preparation, "standards"),
+                first_round_turn(self.bridge, preparation, "spec"),
+            ],
         )
         self.assertEqual(
             [
-                second_preparation.brief_text("standards"),
-                second_preparation.brief_text("spec"),
+                first_round_turn(self.bridge, second_preparation, "standards"),
+                first_round_turn(self.bridge, second_preparation, "spec"),
             ],
             claude_briefs,
         )

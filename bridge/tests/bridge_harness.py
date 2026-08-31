@@ -39,11 +39,12 @@ class StaticBrief:
 
 
 class StaticPreparation:
+    # A first round, so its turn gains the Verdict Line request the Bridge
+    # appends; a fake that carried a Response would be answering a round.
+    response = None
+
     def brief(self, axis):
         return StaticBrief(axis)
-
-    def briefs(self, axes):
-        return tuple(self.brief(axis) for axis in axes)
 
     def report(self):
         return {

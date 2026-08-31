@@ -73,8 +73,13 @@ Read the single JSON result through `axes`:
 - A hard error or malformed result ends this review. Report it exactly.
 
 Then do what the axis's `next` field names, and nothing else: the Bridge holds the round cap
-and every result says what this lineage is permitted after it. When that action is a Bridge call,
-run `nextCall.argv` exactly; the result already carries the fresh or resumed single-axis call.
+and every result says what this lineage is permitted after it. The five actions are `done`,
+`fix and stop`, `fix then one re-review`, `run again`, and `escalate`. When that action is a
+Bridge call, run `nextCall.argv` exactly; the result already carries the fresh or resumed
+single-axis call.
+Where `next` is `done`, the reviewer counted no finding on that round: end the review for that
+axis and report it as complete, naming `axes.<axis>.reportFile`. Nothing is in dispute, so none
+of the escalation wording below belongs to it.
 Follow `run again` at most once per axis per invocation. If that same axis returns `run again`
 again, make no further Bridge call; report that axis as incomplete with its `reason`, and leave
 the next decision to the user.
@@ -83,8 +88,10 @@ safe follow-up call is available and stop rather than reconstructing one from pr
 Where `next` is `escalate`, the act is this skill's to choose, and here it is to end the review as
 a disagreement and put both positions to whoever asked for it — naming
 `axes.<axis>.reportFile` and `preparation.responseFile`, so the reader opens each side where it was
-written. A `refused` result carries no `preparation` or Next Call;
-name the Response file you passed to the round that was granted.
+written. A completed re-review escalates only over a finding it retained or one a fix brought in;
+`axes.<axis>.findings` says which, as `{"retained": n, "new": m}` — or `{"reported": n}` on a
+first round, and `null` where the report carried no such line. A `refused` result carries no
+`preparation` or Next Call; name the Response file you passed to the round that was granted.
 
 Treat `preparation` as the Bridge's receipt. If the result explicitly names a gap or a required
 action, act on it exactly as named before declaring the review complete.
@@ -94,7 +101,9 @@ action, act on it exactly as named before declaring the review complete.
 Where `next` is `fix then one re-review`, the Bridge grants that round only against a
 **Response**: one line saying what you did with each finding of the round just delivered. A
 finding you decided not to fix and never said so about looks to the reviewer exactly like one you
-ignored, so it is retained and the lineage escalates over a message that never arrived.
+ignored, so it is retained and the lineage escalates over a message that never arrived. A finding
+not worth fixing is `declined` with its reason, so the re-review can close it: never fixed only to
+make the round come back clean, and never left out.
 
 Write one line per finding, in report order and in the shape `nextCall.responseFormat` shows, to
 `nextCall.responseFile`. A `fixed` line names where in one clause, so the reviewer checks it

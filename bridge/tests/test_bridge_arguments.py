@@ -228,6 +228,22 @@ class RecoveryParserTests(unittest.TestCase):
                 ["--reviewer", "codex", "--recover-session", "HEAD"]
             )
 
+    def test_help_names_done_and_findings_in_the_result_contract(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaises(SystemExit):
+                self.bridge.parse_args(["--help"])
+
+        described = " ".join(stdout.getvalue().split())
+
+        self.assertIn(
+            "done, fix and stop, fix then one re-review, run again, or "
+            "escalate",
+            described,
+        )
+        self.assertIn("it carries no nextCall", described)
+        self.assertIn('findings, the counts the reviewer ended', described)
+
     def test_help_says_only_exit_three_permits_a_fresh_review(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

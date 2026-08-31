@@ -97,7 +97,15 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             turn["input"][0]["text"].split("\n", 1)[1]
             for turn in self.codex.started_turns
         ]
-        self.assertEqual(delivered_briefs, list(self.expected_briefs()))
+        # The Axis Brief templates arrive byte for byte, and the Verdict Line
+        # request follows them: asserted as prefix and suffix rather than as one
+        # rewritten literal, so the templates stay pinned on their own.
+        block = f"\n\n{self.bridge.FIRST_ROUND_VERDICT.request}"
+        for delivered, template in zip(
+            delivered_briefs, self.expected_briefs(), strict=True
+        ):
+            self.assertEqual(delivered[: len(template)], template)
+            self.assertEqual(delivered[len(template):], block)
         self.assertEqual(
             output["preparation"],
             {
