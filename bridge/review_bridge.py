@@ -39,7 +39,9 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from types import MappingProxyType
 
 try:
     import aiohttp
@@ -1242,6 +1244,24 @@ def read_standards_sources(repo_root):
 
 
 @dataclasses.dataclass(frozen=True)
+class ReviewKind:
+    """One review kind's preparation and ordered Axis Brief contract."""
+
+    axes: tuple[str, ...]
+    rounds_per_axis: Mapping[str, int]
+    preparation: Callable[[object, object], object]
+    brief_dispatch: Mapping[str, Callable[[object], str]]
+
+    def rounds_for(self, axis):
+        """How many rounds one lineage of this review kind's axis earns."""
+        return self.rounds_per_axis[axis]
+
+    def brief_text(self, preparation, axis):
+        """Fill one of this review kind's Axis Briefs."""
+        return self.brief_dispatch[axis](preparation)
+
+
+@dataclasses.dataclass(frozen=True)
 class ReviewPreparation:
     scope: ReviewScope
     commit_list: str
@@ -1269,27 +1289,11 @@ class ReviewPreparation:
         """
         return append_caller_response(
             append_navigation_block(
-                self.axis_brief_text(axis), self.navigation_block
+                review_kind_for_axis(axis).brief_text(self, axis),
+                self.navigation_block,
             ),
             self.response,
         )
-
-    def axis_brief_text(self, axis):
-        """The Axis Brief itself, or the failure that this axis has none."""
-        if axis == "standards":
-            return build_standards_brief(
-                self.scope, self.commit_list, self.standards.files
-            )
-        if axis == "spec":
-            if self.spec.text is None:
-                raise RuntimeError(
-                    "spec source was not provided; run with --axis standards "
-                    "when no spec exists"
-                )
-            return build_spec_brief(
-                self.scope, self.commit_list, self.spec.text
-            )
-        raise RuntimeError("axis 'both' requires the two-pane fan-out")
 
     def report(self):
         return {
@@ -1304,6 +1308,29 @@ class ReviewPreparation:
                 self.response.file if self.response is not None else None
             ),
         }
+
+
+def build_code_standards_axis_brief(preparation):
+    """Fill Code Review's Standards Axis Brief."""
+    return build_standards_brief(
+        preparation.scope,
+        preparation.commit_list,
+        preparation.standards.files,
+    )
+
+
+def build_code_spec_axis_brief(preparation):
+    """Fill Code Review's Spec Axis Brief, or report that it has no Spec."""
+    if preparation.spec.text is None:
+        raise RuntimeError(
+            "spec source was not provided; run with --axis standards "
+            "when no spec exists"
+        )
+    return build_spec_brief(
+        preparation.scope,
+        preparation.commit_list,
+        preparation.spec.text,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1548,12 +1575,16 @@ def ensure_store_is_outside_the_checkout(repo_root, store):
 def prepare_review(args, store):
     """Everything every requested axis needs, or the failure that there is not.
 
+    Code Review resolves and verifies its Review Scope here, behind the review
+    kind's preparation callable, so the main flow knows no kind-specific setup.
     Each requested axis's brief is built here rather than where its Lane opens,
     so an axis that cannot be briefed fails preparation — before this review is
     reported started, and before any pane exists to tear down. The store comes
     in because a fetched issue is written out here, where the brief that names
     it is filled, rather than at the delivery that reads the brief.
     """
+    args.scope = resolve_review_scope(args.cwd, args.base)
+    ensure_scope_holds_work(args.cwd, args.scope)
     repo_root = canonical_worktree_root(args.cwd)
     ensure_store_is_outside_the_checkout(repo_root, store)
     spec = read_spec(repo_root, args.spec, store)
@@ -1683,7 +1714,10 @@ def resolve_axis_choice(args, axis, choice):
 # What escalation *is* stays the caller's: nothing here names the act, only the
 # moment.
 # ---------------------------------------------------------------------------
-#: The one axis whose findings earn a re-review.
+#: Code Review, the only review kind this table holds until Document Review.
+CODE_REVIEW_KIND = "code"
+STANDARDS_AXIS = "standards"
+#: The one Code Review axis whose findings earn a re-review.
 SPEC_AXIS = "spec"
 #: How many rounds the spec axis earns: the first, and the one re-review.
 SPEC_AXIS_ROUNDS = 2
@@ -1700,9 +1734,58 @@ NEXT_CALL_RESPONSE_FORMAT = (
 )
 
 
+#: The one table that owns every review kind's axes, rounds, preparation, and
+#: per-axis Axis Brief dispatch. Mapping proxies keep both the row's mappings
+#: and the table itself immutable; the frozen row keeps its remaining fields so.
+REVIEW_KINDS = MappingProxyType({
+    CODE_REVIEW_KIND: ReviewKind(
+        axes=(STANDARDS_AXIS, SPEC_AXIS),
+        rounds_per_axis=MappingProxyType({
+            STANDARDS_AXIS: SINGLE_ROUND,
+            SPEC_AXIS: SPEC_AXIS_ROUNDS,
+        }),
+        preparation=prepare_review,
+        brief_dispatch=MappingProxyType({
+            STANDARDS_AXIS: build_code_standards_axis_brief,
+            SPEC_AXIS: build_code_spec_axis_brief,
+        }),
+    ),
+})
+
+
+def review_kind_for(args):
+    """The review kind this call's axis names, including the sole-row fan-out."""
+    if args.axis != "both":
+        return review_kind_for_axis(args.axis)
+    review_kinds = tuple(REVIEW_KINDS.values())
+    if len(review_kinds) != 1:
+        raise RuntimeError("axis 'both' requires one review kind")
+    return review_kinds[0]
+
+
+def review_kind_for_axis(axis):
+    """The review kind that owns an axis, or the existing fan-out failure."""
+    for review_kind in REVIEW_KINDS.values():
+        if axis in review_kind.axes:
+            return review_kind
+    if axis == "both":
+        raise RuntimeError("axis 'both' requires the two-pane fan-out")
+    raise RuntimeError(f"unknown review axis: {axis}")
+
+
+def accepted_axis_names():
+    """Every review kind's axes, in table order, followed by the fan-out selector."""
+    axes = tuple(
+        axis
+        for review_kind in REVIEW_KINDS.values()
+        for axis in review_kind.axes
+    )
+    return (*axes, "both")
+
+
 def rounds_per_lineage(axis):
     """How many rounds one lineage of this axis earns."""
-    return SPEC_AXIS_ROUNDS if axis == SPEC_AXIS else SINGLE_ROUND
+    return review_kind_for_axis(axis).rounds_for(axis)
 
 
 def rounds_had(state):
@@ -1735,6 +1818,10 @@ def result_next_action(axis, result, state):
         or not has_report(result["finalMessage"])
     ):
         return NEXT_RUN_AGAIN
+    if axis == "both":
+        # A health probe has no review axis and delivers the selector itself as
+        # one result. It remains a single pass; review axes ask their kind row.
+        return NEXT_FIX_AND_STOP
     return next_action(axis, rounds_had(state))
 
 
@@ -1877,7 +1964,8 @@ def resume_state_for_review(args):
 
 def requested_axes(args):
     """The axes this call asked for, in the order a review runs them."""
-    return ("standards", "spec") if args.axis == "both" else (args.axis,)
+    review_kind = review_kind_for(args)
+    return review_kind.axes if args.axis == "both" else (args.axis,)
 
 
 def axis_brief(args, axis):
@@ -3750,9 +3838,7 @@ async def run_bridge(args):
         return report_refusal(args, refusal)
     probe = args.probe or args.browser_probe
     if not args.recover_session and not probe:
-        args.scope = resolve_review_scope(args.cwd, args.base)
-        ensure_scope_holds_work(args.cwd, args.scope)
-        args.preparation = prepare_review(args, store)
+        args.preparation = review_kind_for(args).preparation(args, store)
     elif probe:
         args.preparation = None
     # Preparation has succeeded and no Lane has opened yet, which is what this
@@ -3835,7 +3921,7 @@ def build_parser():
     parser.add_argument("--spec", help="issue reference or file path for the spec")
     parser.add_argument(
         "--axis",
-        choices=("standards", "spec", "both"),
+        choices=accepted_axis_names(),
         default="both",
         help="review axis to run (default: both)",
     )
