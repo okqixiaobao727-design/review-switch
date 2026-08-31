@@ -7,7 +7,7 @@ import subprocess
 import sys
 import unittest
 
-from bridge_harness import FakePaneTestCase
+from bridge_harness import FakePaneTestCase, assert_first_round_turns
 
 
 class CodeReviewCharacterizationTests(FakePaneTestCase):
@@ -97,7 +97,9 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
             turn["input"][0]["text"].split("\n", 1)[1]
             for turn in self.codex.started_turns
         ]
-        self.assertEqual(delivered_briefs, list(self.expected_briefs()))
+        assert_first_round_turns(
+            self, delivered_briefs, self.expected_briefs()
+        )
         self.assertEqual(
             output["preparation"],
             {

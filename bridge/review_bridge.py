@@ -1006,6 +1006,67 @@ class CallerResponse:
     file: str
 
 
+@dataclasses.dataclass(frozen=True)
+class VerdictShape:
+    """One round's Verdict Line: how it is asked for, and how it is read back.
+
+    The Verdict Line is the whole of what the Bridge reads out of a report, and
+    the request and the pattern that accepts its answer live in one object so
+    that neither can be changed without the other being looked at. `shape` is
+    the fixed English the Bridge owns and both Lanes deliver; `counts` names
+    what the pattern's groups mean in the result (ADR-0011).
+    """
+
+    shape: str
+    pattern: re.Pattern
+    counts: tuple[str, ...]
+
+    @property
+    def request(self):
+        """What a turn asks the reviewer for, in one sentence it can follow."""
+        return (
+            "End your report with one last line and nothing after it, in "
+            f"this exact shape: {self.shape}"
+        )
+
+    def read(self, final_message):
+        """The counts a report ended with, or `None` where it ended with none.
+
+        The Verdict Line ends the report, which is what the turn asked for, so
+        the last non-blank line is the only candidate there is: a count with
+        prose after it is not a report ended on its verdict, a reviewer that
+        wrote the line twice is answered by its last word, and a last line that
+        does not parse leaves the Bridge with no verdict rather than with an
+        older one. Nothing else in the report is inspected (ADR-0011).
+        """
+        lines = [
+            line for line in (final_message or "").splitlines() if line.strip()
+        ]
+        if not lines:
+            return None
+        match = self.pattern.match(lines[-1].strip())
+        if match is None:
+            return None
+        return dict(zip(self.counts, map(int, match.groups()), strict=True))
+
+
+#: What a first round is asked for: how many findings it reported.
+FIRST_ROUND_VERDICT = VerdictShape(
+    shape="Findings: <count>",
+    pattern=re.compile(r"^findings:\s*(\d+)$", re.IGNORECASE),
+    counts=("reported",),
+)
+#: What a re-review is asked for: what its Response left standing, beside what
+#: the fixes brought in. The separator is the `;` the request shows or the `,` a
+#: reviewer writes instead.
+RE_REVIEW_VERDICT = VerdictShape(
+    shape="Retained: <count>; New: <count>",
+    pattern=re.compile(
+        r"^retained:\s*(\d+)\s*[;,]\s*new:\s*(\d+)$", re.IGNORECASE
+    ),
+    counts=("retained", "new"),
+)
+
 #: The line that separates the caller's dispositions from the brief above them.
 CALLER_RESPONSE_HEADING = "Caller's response to the previous round:"
 #: What the re-review is asked to do with them. Fixed text, owned by the Bridge:
@@ -1019,7 +1080,8 @@ CALLER_RESPONSE_HEADING = "Caller's response to the previous round:"
 #: re-review as a third round.
 CALLER_RESPONSE_INSTRUCTION = (
     "For each numbered finding, close it, or retain it against the stated "
-    "reason. Report anything new only where a fix introduced it."
+    "reason. Report anything new only where a fix introduced it.\n"
+    f"{RE_REVIEW_VERDICT.request}"
 )
 
 
@@ -1288,10 +1350,6 @@ class ReviewPreparation:
     def brief(self, axis):
         """This axis's Axis Brief, ready for whichever Lane delivers it."""
         return AxisBrief(axis=axis, text=self.brief_text(axis))
-
-    def briefs(self, axes):
-        """One Axis Brief per axis, in the order a review runs them."""
-        return tuple(self.brief(axis) for axis in axes)
 
     def brief_text(self, axis):
         """The whole turn one axis is delivered: its brief, and what follows it.
@@ -1691,10 +1749,6 @@ class DocumentReviewPreparation:
         """This axis's Axis Brief, ready for whichever Lane delivers it."""
         return AxisBrief(axis=axis, text=self.brief_text(axis))
 
-    def briefs(self, axes):
-        """One Axis Brief per axis, in the order a review runs them."""
-        return tuple(self.brief(axis) for axis in axes)
-
     def brief_text(self, axis):
         """The prepared Document Review brief and any caller Response."""
         return append_caller_response(
@@ -1896,6 +1950,7 @@ SINGLE_ROUND = 1
 NEXT_FIX_AND_STOP = "fix and stop"
 NEXT_FIX_THEN_ONE_RE_REVIEW = "fix then one re-review"
 NEXT_ESCALATE = "escalate"
+NEXT_DONE = "done"
 NEXT_RUN_AGAIN = "run again"
 NEXT_CALL_ARGUMENTS_FIELD = "nextCallArguments"
 NEXT_CALL_RESPONSE_FORMAT = (
@@ -1978,8 +2033,35 @@ def rounds_had(state):
     return state.get("rounds", SINGLE_ROUND) if state else SINGLE_ROUND
 
 
-def next_action(axis, rounds):
+def verdict_for(rounds):
+    """The Verdict Line a lineage on this round was asked for."""
+    return FIRST_ROUND_VERDICT if rounds <= SINGLE_ROUND else RE_REVIEW_VERDICT
+
+
+def settled_findings(result, rounds):
+    """The counts this settled result carries, or `None` where it carries none.
+
+    Only a completed axis has a verdict to be read. A failed one may still have
+    printed something — a headless reviewer that refuses prints its refusal as
+    its result — and what a review never finished saying is not its answer.
+    """
+    if result["status"] != "completed" or not has_report(result["finalMessage"]):
+        return None
+    return verdict_for(rounds).read(result["finalMessage"])
+
+
+def counted_nothing(findings):
+    """Whether the reviewer's own counts came to nothing at all."""
+    return findings is not None and not any(findings.values())
+
+
+def next_action(axis, rounds, findings=None):
     """The one action a caller is permitted next on this lineage."""
+    if counted_nothing(findings):
+        # The reviewer counted nothing, so there is nothing to fix, nothing to
+        # re-review, and nothing to put to a human: the lineage is finished
+        # whichever round it finished on.
+        return NEXT_DONE
     if rounds < rounds_per_lineage(axis):
         return NEXT_FIX_THEN_ONE_RE_REVIEW
     if rounds > SINGLE_ROUND:
@@ -1989,7 +2071,7 @@ def next_action(axis, rounds):
     return NEXT_FIX_AND_STOP
 
 
-def result_next_action(axis, result, state):
+def result_next_action(axis, result, state, findings=None):
     """The next action after the settled result, including an incomplete axis."""
     legacy_record = (
         state is not None and NEXT_CALL_ARGUMENTS_FIELD not in state
@@ -2003,7 +2085,7 @@ def result_next_action(axis, result, state):
         # A health probe has no review axis and delivers the selector itself as
         # one result. It remains a single pass; review axes ask their kind row.
         return NEXT_FIX_AND_STOP
-    return next_action(axis, rounds_had(state))
+    return next_action(axis, rounds_had(state), findings)
 
 
 def next_call(action, axis, state, args, store):
@@ -2149,24 +2231,46 @@ def requested_axes(args):
     return review_kind.axes if args.axis == "both" else (args.axis,)
 
 
+def append_first_round_verdict_request(brief):
+    """A first round's turn: its whole brief, then the Verdict Line asked for.
+
+    Last of the appended blocks and after the navigation one, so it moves no
+    line of the brief or of anything already appended to it. A re-review asks
+    for its own counts inside the Response block instead, so only a turn that
+    answers nothing gets this one.
+    """
+    return AxisBrief(
+        axis=brief.axis,
+        text=f"{brief.text}\n\n{FIRST_ROUND_VERDICT.request}",
+    )
+
+
 def axis_brief(args, axis):
-    """One axis's Brief: what preparation filled, or a probe's fixed text.
+    """One axis's whole turn: what preparation filled, or a probe's fixed text.
 
     A health probe is prepared for nothing and carries no axis of its own, so it
-    brings its own text and delivers whatever `--axis` says as a single Lane.
+    brings its own text and delivers whatever `--axis` says as a single Lane;
+    it answers no review and is asked for no verdict.
     """
     if args.browser_probe:
         return AxisBrief(axis=axis, text=BROWSER_PROBE_BRIEF)
     if args.probe:
         return AxisBrief(axis=axis, text=PROBE_BRIEF)
-    return args.preparation.brief(axis)
+    brief = args.preparation.brief(axis)
+    if args.preparation.response is not None:
+        return brief
+    return append_first_round_verdict_request(brief)
 
 
 def axis_briefs(args):
-    """Every Brief this call delivers, in the order a review runs them."""
+    """Every turn this call delivers, in the order a review runs them.
+
+    Routed through `axis_brief` rather than preparation's own `briefs`, so that
+    a fresh review and a resume are handed the same text by the same code.
+    """
     if args.probe or args.browser_probe:
         return (axis_brief(args, args.axis),)
-    return args.preparation.briefs(requested_axes(args))
+    return tuple(axis_brief(args, axis) for axis in requested_axes(args))
 
 
 def review_start_model(args, resume_state=None):
@@ -4053,8 +4157,13 @@ async def run_bridge(args):
             result = lane.settle(run)
             # Named here rather than in either Lane: what a caller may do next
             # is the review's answer, and both Lanes give the same one.
+            # The Verdict Line is read once, here, where every Lane's settled
+            # result — delivered, failed, or recovered — has converged.
+            result["findings"] = settled_findings(
+                result, rounds_had(run.state)
+            )
             result["next"] = result_next_action(
-                axis, result, run.state
+                axis, result, run.state, result["findings"]
             )
             result["nextCall"] = next_call(
                 result["next"], axis, run.state, args, store
@@ -4092,7 +4201,16 @@ async def run_bridge(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Launch or resume a review on the Lane --reviewer names."
+        description="Launch or resume a review on the Lane --reviewer names.",
+        epilog=(
+            "Every axis of the result names next, the one action permitted "
+            "after it: done, fix and stop, fix then one re-review, run again, "
+            "or escalate. done is a lineage the reviewer counted nothing on, "
+            "and it carries no nextCall. Every axis also names findings, the "
+            "counts the reviewer ended its report with: {\"reported\": n} on a "
+            "first round, {\"retained\": n, \"new\": m} on a re-review, or null "
+            "where the report carried no such line."
+        ),
     )
     parser.add_argument(
         "--reviewer",

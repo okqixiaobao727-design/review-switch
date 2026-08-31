@@ -12,6 +12,7 @@ from bridge_harness import (
     DriverKilled,
     FakePaneTestCase,
     MARKER_PATTERN,
+    assert_first_round_turns,
     graph_navigation_result,
 )
 
@@ -94,7 +95,7 @@ class ClaudeDeliveryTests(FakePaneTestCase):
             )
 
     def test_the_prompt_is_the_axis_brief_and_nothing_else(self):
-        """No prompt of the Lane's own: no scope block, no round rule, no verdict."""
+        """No prompt of the Lane's own: no scope block, no round rule, no format."""
         self.claude.finish("standards clear", axis="standards")
         self.claude.finish("spec clear", axis="spec")
         args = self.claude_args(axis="both")
@@ -102,10 +103,15 @@ class ClaudeDeliveryTests(FakePaneTestCase):
         code, _output = self.run_bridge(args)
 
         self.assertEqual(code, 0)
-        self.assertEqual(
+        # The Verdict Line request is the Bridge's own and both Lanes deliver
+        # it, so a turn is still the prepared brief and nothing a Lane added.
+        assert_first_round_turns(
+            self,
             self.claude.prompts,
-            [args.preparation.brief_text("standards"),
-             args.preparation.brief_text("spec")],
+            [
+                args.preparation.brief_text("standards"),
+                args.preparation.brief_text("spec"),
+            ],
         )
         for prompt in self.claude.prompts:
             for absent in (
@@ -329,16 +335,18 @@ class SharedBriefTests(FakePaneTestCase):
         ]
 
         self.assertEqual(codex_briefs, claude_briefs)
-        self.assertEqual(
+        assert_first_round_turns(
+            self,
             codex_briefs,
-            [preparation.brief_text("standards"), preparation.brief_text("spec")],
+            [preparation.brief_text(axis) for axis in ("standards", "spec")],
         )
-        self.assertEqual(
-            [
-                second_preparation.brief_text("standards"),
-                second_preparation.brief_text("spec"),
-            ],
+        assert_first_round_turns(
+            self,
             claude_briefs,
+            [
+                second_preparation.brief_text(axis)
+                for axis in ("standards", "spec")
+            ],
         )
 
     def test_both_lanes_report_the_same_result_shape(self):

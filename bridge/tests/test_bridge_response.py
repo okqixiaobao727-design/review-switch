@@ -23,7 +23,9 @@ from bridge_harness import DriverKilled, FakePaneTestCase
 HEADING = "Caller's response to the previous round:"
 INSTRUCTION = (
     "For each numbered finding, close it, or retain it against the stated "
-    "reason. Report anything new only where a fix introduced it."
+    "reason. Report anything new only where a fix introduced it.\n"
+    "End your report with one last line and nothing after it, in this exact "
+    "shape: Retained: <count>; New: <count>"
 )
 # One Response as a Dispatcher writes one: a line per finding, the finding
 # named by its place in the report and a short quote, the decision after it.
@@ -37,6 +39,17 @@ LANES = ("codex", "claude")
 
 class CallerResponseTestCase(FakePaneTestCase):
     """A spec lineage driven to its re-review, on either Lane."""
+
+    def prepared_brief(self, delivered_first_round):
+        """One first round's turn with the Verdict Line request it ends with cut.
+
+        A re-review's turn is round one's prepared brief and the Response
+        block, and nothing else: the first round's own request stays behind,
+        or the turn would ask for two different Verdict Lines.
+        """
+        block = f"\n\n{self.bridge.FIRST_ROUND_VERDICT.request}"
+        self.assertTrue(delivered_first_round.endswith(block))
+        return delivered_first_round[: -len(block)]
 
     def delivered_briefs(self, reviewer):
         """Every turn this Lane's reviewer received, its marker line stripped.
@@ -100,7 +113,8 @@ class ReReviewTurnTests(CallerResponseTestCase):
                 briefs = self.delivered_briefs(reviewer)
                 self.assertEqual(
                     briefs[-1],
-                    f"{briefs[0]}\n\n{HEADING}\n{RESPONSE_TEXT}\n{INSTRUCTION}",
+                    f"{self.prepared_brief(briefs[0])}\n\n"
+                    f"{HEADING}\n{RESPONSE_TEXT}\n{INSTRUCTION}",
                 )
 
     def test_a_first_review_carries_no_response_block(self):
@@ -131,6 +145,32 @@ class ReReviewTurnTests(CallerResponseTestCase):
             self.delivered_briefs("codex")[-1],
         )
 
+    def test_each_round_asks_for_its_own_verdict_line(self):
+        """The counts a caller reads are asked for in the turn, not inferred.
+
+        Spelled out here rather than read off the Bridge's constants: changing
+        either request has to fail a test.
+        """
+        session = self.first_round("codex")
+        first_turn = self.delivered_briefs("codex")[-1]
+
+        code, output = self.resume("codex", session, self.response_file())
+
+        self.assertEqual(code, 0, output)
+        self.assertTrue(
+            first_turn.endswith(
+                "End your report with one last line and nothing after it, in "
+                "this exact shape: Findings: <count>"
+            ),
+            first_turn,
+        )
+        self.assertTrue(
+            self.delivered_briefs("codex")[-1].endswith(
+                "End your report with one last line and nothing after it, in "
+                "this exact shape: Retained: <count>; New: <count>"
+            )
+        )
+
     def test_a_response_written_with_crlf_arrives_unchanged(self):
         """Verbatim is bytes, not lines: text mode would fold CRLF to LF."""
         crlf = '1. "the guard" — fixed here\r\n2. "the receipt" — declined\r\n'
@@ -157,7 +197,7 @@ class ReReviewTurnTests(CallerResponseTestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(
             self.delivered_briefs("codex")[-1],
-            f"{self.delivered_briefs('codex')[0]}\n\n"
+            f"{self.prepared_brief(self.delivered_briefs('codex')[0])}\n\n"
             f"{HEADING}\n{written}\n\n{INSTRUCTION}",
         )
 
@@ -211,7 +251,8 @@ class DocumentReviewResponseTests(CallerResponseTestCase):
                 resumed_brief = self.delivered_briefs(reviewer)[-1]
                 self.assertEqual(
                     resumed_brief,
-                    f"{first_brief}\n\n{HEADING}\n{RESPONSE_TEXT}\n{INSTRUCTION}",
+                    f"{self.prepared_brief(first_brief)}\n\n"
+                    f"{HEADING}\n{RESPONSE_TEXT}\n{INSTRUCTION}",
                 )
                 self.assertEqual(
                     resumed_output["preparation"],

@@ -703,6 +703,52 @@ class RecoveryTests(FakePaneTestCase):
     def test_recovering_a_stored_claude_re_review_spends_no_round(self):
         self.assert_recovering_a_stored_re_review_spends_no_round("claude")
 
+    def assert_recovering_a_clean_re_review_returns_done(self, reviewer):
+        """A verdict is rebuilt from the stored report, not from the delivery."""
+        lane = self.claude if reviewer == "claude" else self.codex
+        lane_class = (
+            self.bridge.ClaudeLane
+            if reviewer == "claude"
+            else self.bridge.CodexLane
+        )
+        lane.finish("round one findings", axis="spec")
+        first_code, first_output = self.run_bridge(
+            self.args(reviewer=reviewer, axis="spec")
+        )
+        self.assertEqual(first_code, 0)
+        session = first_output["axes"]["spec"]["reviewSessionId"]
+        lane.finish("all closed\n\nRetained: 0; New: 0", axis="spec")
+        killed_driver = self.enter(mock.patch.object(
+            lane_class, "end_axis", side_effect=DriverKilled
+        ))
+
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.args(
+                reviewer=reviewer,
+                axis="spec",
+                resume_session=session,
+            ))
+        self.stop_patcher(killed_driver)
+
+        code, output = self.run_bridge(self.args(
+            reviewer=reviewer,
+            axis="spec",
+            recover_session=True,
+        ))
+
+        self.assertEqual(code, 0)
+        result = output["axes"]["spec"]
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["next"], "done")
+        self.assertIsNone(result["nextCall"])
+        self.assertEqual(result["findings"], {"retained": 0, "new": 0})
+
+    def test_recovering_a_clean_codex_re_review_returns_done(self):
+        self.assert_recovering_a_clean_re_review_returns_done("codex")
+
+    def test_recovering_a_clean_claude_re_review_returns_done(self):
+        self.assert_recovering_a_clean_re_review_returns_done("claude")
+
     def test_a_driver_killed_after_print_may_deliver_the_report_twice(self):
         self.codex.finish("the report printed before acknowledgement")
         killed_driver = self.enter(mock.patch.object(

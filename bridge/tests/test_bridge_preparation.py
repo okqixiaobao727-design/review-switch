@@ -11,6 +11,7 @@ from unittest import mock
 
 from bridge_harness import (
     FakePaneTestCase,
+    assert_first_round_turns,
     base_args,
     initialize_review_repo,
     graph_navigation_result,
@@ -283,7 +284,8 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
         briefs = self.bridge.axis_briefs(args)
 
         self.assertEqual([brief.axis for brief in briefs], ["standards", "spec"])
-        self.assertEqual(
+        assert_first_round_turns(
+            self,
             [brief.text for brief in briefs],
             ["Read-only standards review", "Read-only spec review"],
         )

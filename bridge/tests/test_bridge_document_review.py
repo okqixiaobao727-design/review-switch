@@ -9,7 +9,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from bridge_harness import FakePaneTestCase
+from bridge_harness import FakePaneTestCase, assert_first_round_turns
 
 
 REQUIREMENTS_BRIEF_WITHOUT_PARENT = """Read-only review: report findings; leave the working tree untouched. Review it yourself in this session.
@@ -67,6 +67,17 @@ def briefs_with_parent(parent_line, document_lines):
 
 
 class DocumentReviewCommandTests(FakePaneTestCase):
+    def assert_delivered_briefs(self, templates):
+        """Every turn this call delivered, against the Axis Briefs it filled."""
+        assert_first_round_turns(
+            self,
+            [
+                turn["input"][0]["text"].split("\n", 1)[1]
+                for turn in self.codex.started_turns
+            ],
+            templates,
+        )
+
     def test_documents_without_a_parent_deliver_both_briefs_and_the_receipt(self):
         documents = ("docs/spec.md", "docs/ticket.md")
         for document in documents:
@@ -92,13 +103,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             [output["axes"][axis]["next"] for axis in output["axes"]],
             ["fix then one re-review", "fix then one re-review"],
         )
-        delivered_briefs = [
-            turn["input"][0]["text"].split("\n", 1)[1]
-            for turn in self.codex.started_turns
-        ]
-        self.assertEqual(
-            delivered_briefs,
-            [REQUIREMENTS_BRIEF_WITHOUT_PARENT, DESIGN_BRIEF_WITHOUT_PARENT],
+        self.assert_delivered_briefs(
+            [REQUIREMENTS_BRIEF_WITHOUT_PARENT, DESIGN_BRIEF_WITHOUT_PARENT]
         )
         self.assertEqual(
             output["preparation"],
@@ -153,18 +159,13 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             self.state_dir / f"{uuid.UUID(int=2)}-spec.md"
         )
         issue_summary = "#43 Parent, body and 1 comment"
-        delivered_briefs = [
-            turn["input"][0]["text"].split("\n", 1)[1]
-            for turn in self.codex.started_turns
-        ]
         self.assertEqual(code, 0, output)
-        self.assertEqual(
-            delivered_briefs,
+        self.assert_delivered_briefs(
             briefs_with_parent(
                 f"Parent: {parent_file} — {issue_summary}. "
                 "Read it before reviewing.",
                 [f"{document_file} — {issue_summary}"],
-            ),
+            )
         )
         self.assertEqual(
             output["preparation"],
@@ -205,14 +206,9 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             "gh issue view failed: issue lookup failed. "
             "Hold the documents to each other."
         )
-        delivered_briefs = [
-            turn["input"][0]["text"].split("\n", 1)[1]
-            for turn in self.codex.started_turns
-        ]
         self.assertEqual(code, 0, output)
-        self.assertEqual(
-            delivered_briefs,
-            briefs_with_parent(parent_line, ["docs/ticket.md"]),
+        self.assert_delivered_briefs(
+            briefs_with_parent(parent_line, ["docs/ticket.md"])
         )
         self.assertEqual(
             output["preparation"],
@@ -253,14 +249,9 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             "Parent: not fetched: docs/missing-parent.md. "
             "Failure: spec file not found. Hold the documents to each other."
         )
-        delivered_briefs = [
-            turn["input"][0]["text"].split("\n", 1)[1]
-            for turn in self.codex.started_turns
-        ]
         self.assertEqual(code, 0, output)
-        self.assertEqual(
-            delivered_briefs,
-            briefs_with_parent(parent_line, ["docs/ticket.md"]),
+        self.assert_delivered_briefs(
+            briefs_with_parent(parent_line, ["docs/ticket.md"])
         )
         self.assertEqual(
             output["preparation"],
@@ -306,11 +297,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             "Standards sources: AGENTS.md",
             "Standards sources: none documented; baseline only",
         )
-        delivered_brief = self.codex.started_turns[0]["input"][0]["text"].split(
-            "\n", 1
-        )[1]
         self.assertEqual(code, 0, output)
-        self.assertEqual(delivered_brief, expected_brief)
+        self.assert_delivered_briefs([expected_brief])
         self.assertEqual(output["preparation"]["standardsFiles"], [])
         self.assertEqual(output["preparation"]["standardsCondition"], "absent")
 

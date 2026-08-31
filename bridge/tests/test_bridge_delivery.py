@@ -613,6 +613,8 @@ class ReviewDeliveryTests(FakePaneTestCase):
         self.assertEqual(self.codex.panes, [])
         self.assertEqual(self.codex.launched_panes, ["%90"])
         self.assertIn("This is a bridge health probe", prompt)
+        # A probe reviews nothing, so it is asked for no verdict of its own.
+        self.assertNotIn(self.bridge.FIRST_ROUND_VERDICT.request, prompt)
 
 
 class PerAxisModelAndEffortTests(FakePaneTestCase):

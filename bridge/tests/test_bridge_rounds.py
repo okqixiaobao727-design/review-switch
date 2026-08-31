@@ -15,6 +15,7 @@ from bridge_harness import FakePaneTestCase
 FIX_AND_STOP = "fix and stop"
 FIX_THEN_ONE_RE_REVIEW = "fix then one re-review"
 ESCALATE = "escalate"
+DONE = "done"
 RUN_AGAIN = "run again"
 REFUSED = "refused"
 RESPONSE_FORMAT = (
@@ -318,18 +319,24 @@ class NextActionTests(RoundsContractTestCase):
             [response_file.resolve()],
         )
 
-    def test_the_spec_re_review_result_says_escalate(self):
+    def test_a_spec_re_review_that_counted_nothing_says_done(self):
+        """The rounds are spent and the reviewer counted nothing: no escalation."""
         for reviewer in LANES:
             with self.subTest(reviewer=reviewer):
                 first = self.review(reviewer, "spec", "one spec finding")
 
                 code, output = self.resume(
-                    reviewer, "spec", first["reviewSessionId"], "fix closes it"
+                    reviewer,
+                    "spec",
+                    first["reviewSessionId"],
+                    "fix closes it\n\nRetained: 0; New: 0",
                 )
 
                 self.assertEqual(code, 0, output)
-                self.assertEqual(output["axes"]["spec"]["next"], ESCALATE)
-                self.assertIsNone(output["axes"]["spec"]["nextCall"])
+                result = output["axes"]["spec"]
+                self.assertEqual(result["next"], DONE)
+                self.assertIsNone(result["nextCall"])
+                self.assertEqual(result["findings"], {"retained": 0, "new": 0})
 
     def test_a_two_axis_review_names_each_axis_its_own_action(self):
         for reviewer in LANES:
@@ -585,6 +592,260 @@ class RoundCapTests(RoundsContractTestCase):
         if reviewer == "claude":
             return self.claude.launched
         return self.codex.started_turns
+
+
+class VerdictLineTests(RoundsContractTestCase):
+    """The counts the reviewer ends its report with, and what they settle."""
+
+    def test_a_re_review_with_a_new_finding_escalates(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                first = self.review(reviewer, "spec", "one spec finding")
+
+                code, output = self.resume(
+                    reviewer,
+                    "spec",
+                    first["reviewSessionId"],
+                    "the fix broke something\n\nRetained: 0, New: 1",
+                )
+
+                self.assertEqual(code, 0, output)
+                result = output["axes"]["spec"]
+                self.assertEqual(result["next"], ESCALATE)
+                self.assertIsNone(result["nextCall"])
+                self.assertEqual(result["findings"], {"retained": 0, "new": 1})
+
+    def test_a_re_review_with_a_retained_finding_escalates(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                first = self.review(reviewer, "spec", "two spec findings")
+
+                code, output = self.resume(
+                    reviewer,
+                    "spec",
+                    first["reviewSessionId"],
+                    "both stand\n\nRetained: 2; New: 0",
+                )
+
+                self.assertEqual(code, 0, output)
+                result = output["axes"]["spec"]
+                self.assertEqual(result["next"], ESCALATE)
+                self.assertEqual(result["findings"], {"retained": 2, "new": 0})
+
+    def test_a_first_spec_round_that_counted_nothing_says_done(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                result = self.review(
+                    reviewer, "spec", "nothing to report\n\nFindings: 0"
+                )
+
+                self.assertEqual(result["next"], DONE)
+                self.assertIsNone(result["nextCall"])
+                self.assertEqual(result["findings"], {"reported": 0})
+
+    def test_a_first_spec_round_that_counted_findings_keeps_its_re_review(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                result = self.review(
+                    reviewer, "spec", "three problems\n\nFindings: 3"
+                )
+
+                self.assertEqual(result["next"], FIX_THEN_ONE_RE_REVIEW)
+                self.assertEqual(result["findings"], {"reported": 3})
+                session = result["reviewSessionId"]
+                response_file = str(
+                    self.state_dir / f"{session}-response.md"
+                )
+                self.assertEqual(
+                    result["nextCall"]["argv"][-4:],
+                    [
+                        "--resume-session", session,
+                        "--response", response_file,
+                    ],
+                )
+                self.assertEqual(
+                    result["nextCall"]["responseFile"], response_file
+                )
+                self.assertEqual(
+                    result["nextCall"]["responseFormat"], RESPONSE_FORMAT
+                )
+
+    def test_a_standards_round_that_counted_nothing_says_done(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                result = self.review(
+                    reviewer, "standards", "clean\n\nFindings: 0"
+                )
+
+                self.assertEqual(result["next"], DONE)
+                self.assertIsNone(result["nextCall"])
+                self.assertEqual(result["findings"], {"reported": 0})
+
+    def test_a_standards_round_that_counted_one_still_says_fix_and_stop(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                result = self.review(
+                    reviewer, "standards", "one naming finding\n\nFindings: 1"
+                )
+
+                self.assertEqual(result["next"], FIX_AND_STOP)
+                self.assertEqual(result["findings"], {"reported": 1})
+
+    def test_a_report_without_a_verdict_line_carries_no_findings(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                result = self.review(reviewer, "spec", "one spec finding")
+
+                self.assertIsNone(result["findings"])
+                self.assertEqual(result["next"], FIX_THEN_ONE_RE_REVIEW)
+
+    def test_only_the_last_verdict_line_is_read(self):
+        result = self.review(
+            "codex",
+            "spec",
+            "Findings: 3 was the first pass\nthen I closed them\nFindings: 0",
+        )
+
+        self.assertEqual(result["findings"], {"reported": 0})
+        self.assertEqual(result["next"], DONE)
+
+    def test_a_verdict_line_with_prose_after_it_is_not_the_last_line(self):
+        """The turn asks for a line with nothing after it, and means it."""
+        result = self.review(
+            "codex", "spec", "Findings: 0\n\nOne more thought, though."
+        )
+
+        self.assertIsNone(result["findings"])
+        self.assertEqual(result["next"], FIX_THEN_ONE_RE_REVIEW)
+
+    def test_a_failed_axis_that_still_printed_a_count_carries_no_findings(self):
+        """What a review never finished saying is not the review's answer."""
+        self.claude.answer_with(
+            {
+                "session_id": "claude-spec",
+                "result": "I cannot run this review.\n\nFindings: 0",
+                "is_error": True,
+                "subtype": "error_during_execution",
+                "permission_denials": [],
+            },
+            axis="spec",
+        )
+
+        code, output = self.run_bridge(
+            self.args(reviewer="claude", axis="spec")
+        )
+
+        self.assertEqual(code, 1, output)
+        result = output["axes"]["spec"]
+        self.assertEqual(result["status"], "failed")
+        self.assertIsNone(result["findings"])
+        self.assertEqual(result["next"], RUN_AGAIN)
+
+    def test_a_malformed_last_verdict_line_yields_no_findings(self):
+        result = self.review(
+            "codex", "spec", "Findings: 2\n\nFindings: none of them"
+        )
+
+        self.assertIsNone(result["findings"])
+        self.assertEqual(result["next"], FIX_THEN_ONE_RE_REVIEW)
+
+    def test_a_re_review_is_not_read_by_the_first_round_token(self):
+        first = self.review("codex", "spec", "one spec finding")
+
+        code, output = self.resume(
+            "codex", "spec", first["reviewSessionId"], "all clear\n\nFindings: 0"
+        )
+
+        self.assertEqual(code, 0, output)
+        result = output["axes"]["spec"]
+        self.assertIsNone(result["findings"])
+        self.assertEqual(result["next"], ESCALATE)
+
+    def test_the_verdict_line_is_read_whatever_its_case_and_spacing(self):
+        first = self.review("codex", "spec", "one spec finding")
+
+        code, output = self.resume(
+            "codex",
+            "spec",
+            first["reviewSessionId"],
+            "closed\n\n  RETAINED:  0 ,  new:0  ",
+        )
+
+        self.assertEqual(code, 0, output)
+        self.assertEqual(
+            output["axes"]["spec"]["findings"], {"retained": 0, "new": 0}
+        )
+        self.assertEqual(output["axes"]["spec"]["next"], DONE)
+
+    def test_a_failed_axis_carries_no_findings(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                self.lane(reviewer).error("spec", "the reviewer went away")
+
+                code, output = self.run_bridge(
+                    self.args(reviewer=reviewer, axis="spec")
+                )
+
+                self.assertEqual(code, 1, output)
+                result = output["axes"]["spec"]
+                self.assertIsNone(result["findings"])
+                self.assertEqual(result["next"], RUN_AGAIN)
+
+    def test_every_axis_of_a_completed_review_carries_findings(self):
+        for reviewer in LANES:
+            with self.subTest(reviewer=reviewer):
+                lane = self.lane(reviewer)
+                lane.finish("naming findings\n\nFindings: 1", axis="standards")
+                lane.finish("one spec finding", axis="spec")
+
+                code, output = self.run_bridge(
+                    self.args(reviewer=reviewer, axis="both")
+                )
+
+                self.assertEqual(code, 0, output)
+                self.assertEqual(
+                    {
+                        axis: result["findings"]
+                        for axis, result in output["axes"].items()
+                    },
+                    {"standards": {"reported": 1}, "spec": None},
+                )
+
+
+class DocumentReviewVerdictLineTests(FakePaneTestCase):
+    """Both document axes answer their own counts through the command entry."""
+
+    def document_argv(self, axis):
+        return [
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--parent", "docs/parent.md",
+            "--document", "docs/first.md",
+            "--axis", axis,
+            "--no-network",
+        ]
+
+    def write_documents(self):
+        for name in ("parent.md", "first.md"):
+            path = self.worktree / "docs" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{name}\n", encoding="utf-8")
+
+    def test_a_document_first_round_that_counted_nothing_says_done(self):
+        self.write_documents()
+        for axis in ("requirements", "design"):
+            with self.subTest(axis=axis):
+                self.codex.finish(f"{axis} is clean\n\nFindings: 0", axis=axis)
+
+                code, output = self.run_bridge(
+                    self.parsed_args(self.document_argv(axis))
+                )
+
+                self.assertEqual(code, 0, output)
+                result = output["axes"][axis]
+                self.assertEqual(result["next"], DONE)
+                self.assertIsNone(result["nextCall"])
+                self.assertEqual(result["findings"], {"reported": 0})
 
 
 if __name__ == "__main__":
