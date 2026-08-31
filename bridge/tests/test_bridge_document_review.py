@@ -278,6 +278,46 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             },
         )
 
+    def test_design_brief_names_a_root_standard_declared_local(self):
+        """A repository publishing a lean tree is briefed with its own rules (#51)."""
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "rm", "--cached", "AGENTS.md"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (self.worktree / ".gitignore").write_text(
+            "AGENTS.md\n", encoding="utf-8"
+        )
+        for arguments in (
+            ("add", "-A"),
+            ("commit", "--quiet", "-m", "declare the standards local"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(self.worktree), *arguments], check=True
+            )
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True, exist_ok=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+        args = self.parsed_args([
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--document", "docs/ticket.md",
+            "--axis", "design",
+            "--no-network",
+        ])
+        self.codex.finish("design report", axis="design")
+
+        code, output = self.run_bridge(args)
+
+        delivered_brief = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0, output)
+        self.assertIn("Standards sources: AGENTS.md\n", delivered_brief)
+        self.assertEqual(output["preparation"]["standardsFiles"], ["AGENTS.md"])
+        self.assertEqual(
+            output["preparation"]["standardsCondition"], "absent"
+        )
+
     def test_design_brief_keeps_none_documented_when_no_standards_are_tracked(self):
         subprocess.run(
             ["git", "-C", str(self.worktree), "rm", "AGENTS.md"],

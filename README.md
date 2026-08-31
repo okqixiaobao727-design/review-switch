@@ -80,14 +80,24 @@ The Standards axis is held to the documents the checkout **tracks**: `CODING_STA
 the disk, and one commit resolves the same list reviewed from a main worktree and from a linked
 one.
 
+A repository that keeps its standards out of its published tree declares them by naming them in
+a `.gitignore` it **tracks** — at the root or in any subdirectory. That rule file is committed
+even where the documents are not, so every checkout of the commit reads the same declaration,
+and a document it ignores is briefed exactly as a tracked one is. `.git/info/exclude`, a global
+excludes file (`core.excludesFile`) and an untracked `.gitignore` are one machine's private
+state and declare nothing. Write a directory pattern without a trailing slash (`docs/agents`, not
+`docs/agents/`), so that a linked worktree reaching the directory through a symlink resolves the
+same rule the main checkout does.
+
 `preparation.standardsCondition` states how this checkout carries them:
 
 - `all tracked` — `docs/agents/` states a convention and every standards document found is
-  tracked, so every checkout of the commit has the same list.
-- `present but untracked: <paths>` — those documents lie in this checkout and git does not track
-  them. They reach no other checkout, so they are not briefed. Commit them to put them back in
-  the review; the `setup-matt-pocock-skills` skill is what installs `docs/agents/`, and committing
-  them is its business, not the Bridge's.
+  tracked, or declared local by a tracked `.gitignore`, so every checkout of the commit has the
+  same list.
+- `present but untracked: <paths>` — those documents lie in this checkout, git does not track
+  them, and no tracked `.gitignore` declares them. They reach no other checkout, so they are not
+  briefed. Commit them to put them back in the review; the `setup-matt-pocock-skills` skill is
+  what installs `docs/agents/`, and committing them is its business, not the Bridge's.
 - `absent` — no convention document is in this checkout at all, tracked or not, so the repository
   states no tracker convention and none may be inferred. Whatever root standards documents it
   tracks are still briefed.

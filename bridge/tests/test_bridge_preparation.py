@@ -323,6 +323,21 @@ def exclude_convention_directory(root):
     (info / "exclude").write_text("/docs/agents/\n", encoding="utf-8")
 
 
+def write_ignore_rules(root, patterns, directory=""):
+    """Ignore standards the way a repository publishing a lean tree does.
+
+    The rule goes in a `.gitignore`, which the caller then tracks or leaves
+    untracked: a tracked one is the declaration every checkout of the commit
+    reads, and an untracked one is one machine's private state (ADR-0013).
+    """
+    path = root / directory / ".gitignore" if directory else root / ".gitignore"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(f"{pattern}\n" for pattern in patterns), encoding="utf-8"
+    )
+    return path
+
+
 class StandardsSourcesTests(unittest.TestCase):
     """Which documents a review is held to, and how the checkout carries them.
 
@@ -431,6 +446,160 @@ class StandardsSourcesTests(unittest.TestCase):
         self.assertEqual(linked.files, ("AGENTS.md", tracked))
         self.assertEqual(main.untracked, (self.CONVENTION,))
         self.assertEqual(linked.untracked, ())
+
+    def untrack(self, *paths):
+        """Take a path out of the index while leaving it on the disk."""
+        self.git("rm", "--cached", "--quiet", *paths)
+
+    def write_root_standards(self):
+        """The root documents the reported repository keeps out of its tree."""
+        (self.root / "CLAUDE.md").write_text("house rules\n", encoding="utf-8")
+        write_convention(self.root)
+
+    def test_a_tracked_gitignore_declares_its_standards_local(self):
+        """The reported repository's shape: ignored by a rule every clone reads."""
+        self.write_root_standards()
+        write_ignore_rules(self.root, ("CLAUDE.md", "AGENTS.md", "docs/agents"))
+        self.untrack("AGENTS.md")
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(
+            sources.files, ("AGENTS.md", "CLAUDE.md", self.CONVENTION)
+        )
+        self.assertEqual(sources.untracked, ())
+        self.assertEqual(sources.condition, "all tracked")
+
+    def test_a_local_exclude_declares_nothing(self):
+        """`.git/info/exclude` is one machine's private state, as #40 found it."""
+        self.write_root_standards()
+        exclude_convention_directory(self.root)
+        (self.root / ".git" / "info" / "exclude").write_text(
+            "/docs/agents/\nCLAUDE.md\nAGENTS.md\n", encoding="utf-8"
+        )
+        self.untrack("AGENTS.md")
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ())
+        self.assertEqual(
+            sources.untracked, ("AGENTS.md", "CLAUDE.md", self.CONVENTION)
+        )
+        self.assertEqual(
+            sources.condition,
+            "present but untracked: AGENTS.md, CLAUDE.md, " + self.CONVENTION,
+        )
+
+    def test_a_global_excludes_file_declares_nothing(self):
+        """A file outside the repository reaches no clone of it."""
+        self.write_root_standards()
+        excludes = pathlib.Path(self.work.name) / "global-excludes"
+        excludes.write_text(
+            "CLAUDE.md\nAGENTS.md\ndocs/agents\n", encoding="utf-8"
+        )
+        self.git("config", "core.excludesFile", str(excludes))
+        self.untrack("AGENTS.md")
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ())
+        self.assertEqual(
+            sources.untracked, ("AGENTS.md", "CLAUDE.md", self.CONVENTION)
+        )
+
+    def test_an_untracked_gitignore_declares_nothing(self):
+        """A rule file no other checkout carries is no declaration."""
+        self.write_root_standards()
+        write_ignore_rules(
+            self.root, (".gitignore", "CLAUDE.md", "AGENTS.md", "docs/agents")
+        )
+        self.untrack("AGENTS.md")
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ())
+        self.assertEqual(
+            sources.untracked, ("AGENTS.md", "CLAUDE.md", self.CONVENTION)
+        )
+
+    def test_a_rule_that_un_ignores_a_document_declares_nothing(self):
+        """`check-ignore` reports a `!` rule as the match; it ignores nothing."""
+        self.write_root_standards()
+        write_ignore_rules(
+            self.root, ("CLAUDE.md", "AGENTS.md", "!AGENTS.md", "docs/agents")
+        )
+        self.commit_all()
+        self.untrack("AGENTS.md")
+        self.git("commit", "--quiet", "-m", "stop publishing the root standard")
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("CLAUDE.md", self.CONVENTION))
+        self.assertEqual(sources.untracked, ("AGENTS.md",))
+        self.assertEqual(
+            sources.condition, "present but untracked: AGENTS.md"
+        )
+
+    def test_a_tracked_subdirectory_gitignore_declares_its_directory_local(self):
+        """The rule may live beside what it ignores, as git lets it."""
+        write_convention(self.root)
+        write_ignore_rules(self.root, ("agents",), directory="docs")
+        self.commit_all()
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md", self.CONVENTION))
+        self.assertEqual(sources.untracked, ())
+        self.assertEqual(sources.condition, "all tracked")
+
+    def test_declared_local_joins_the_tracked_list_and_leaves_the_rest_named(self):
+        """One tracked, one declared local, one merely lying there."""
+        (self.root / "CLAUDE.md").write_text("house rules\n", encoding="utf-8")
+        write_ignore_rules(self.root, ("CLAUDE.md",))
+        self.commit_all()
+        write_convention(self.root)
+
+        sources = self.sources()
+
+        self.assertEqual(sources.files, ("AGENTS.md", "CLAUDE.md"))
+        self.assertEqual(sources.untracked, (self.CONVENTION,))
+        self.assertEqual(
+            sources.condition, f"present but untracked: {self.CONVENTION}"
+        )
+
+    def test_a_linked_worktree_reads_declared_local_documents_through_links(self):
+        """How the declared files reach a worktree: the consumer's own hook.
+
+        `git check-ignore` refuses a pathspec beyond a symbolic link, so the
+        directory link is asked about as itself while the file link is asked
+        about as the path it already is (#51).
+        """
+        self.write_root_standards()
+        write_ignore_rules(self.root, ("CLAUDE.md", "AGENTS.md", "docs/agents"))
+        self.untrack("AGENTS.md")
+        self.commit_all()
+        linked = self.linked_worktree()
+        (linked / "CLAUDE.md").symlink_to(self.root / "CLAUDE.md")
+        (linked / "AGENTS.md").symlink_to(self.root / "AGENTS.md")
+        (linked / "docs").mkdir(exist_ok=True)
+        (linked / "docs" / "agents").symlink_to(
+            self.root / "docs" / "agents", target_is_directory=True
+        )
+        (linked / "CONTRIBUTING.md").symlink_to(self.root / "CONTRIBUTING.md")
+
+        main = self.sources()
+        worktree = self.sources(linked)
+
+        self.assertEqual(worktree.files, main.files)
+        self.assertEqual(
+            worktree.files, ("AGENTS.md", "CLAUDE.md", self.CONVENTION)
+        )
+        self.assertEqual(worktree.untracked, ())
+        self.assertEqual(worktree.condition, "all tracked")
 
     def test_a_tree_that_is_no_checkout_keeps_reading_the_disk(self):
         """An export has no index to ask, so the walk stays its answer (085dbed)."""
@@ -1309,6 +1478,35 @@ class PreparationTests(FakePaneTestCase):
             "present but untracked: docs/agents/issue-tracker.md",
         )
         self.assertIn("Standards sources: AGENTS.md\n", prompt)
+
+    def test_the_standards_brief_names_a_convention_declared_local(self):
+        """The widened list reaches the Axis Brief through the same slot (#51)."""
+        write_convention(self.worktree)
+        write_ignore_rules(self.worktree, ("docs/agents",))
+        for arguments in (
+            ("add", "-A"),
+            ("commit", "--quiet", "-m", "declare the convention local"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(self.worktree), *arguments], check=True
+            )
+        self.codex.finish("no findings")
+
+        code, output = self.run_bridge(self.args(axis="standards"))
+
+        prompt = self.codex.started_turns[0]["input"][0]["text"]
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output["preparation"]["standardsFiles"],
+            ["AGENTS.md", "docs/agents/issue-tracker.md"],
+        )
+        self.assertEqual(
+            output["preparation"]["standardsCondition"], "all tracked"
+        )
+        self.assertIn(
+            "Standards sources: AGENTS.md, docs/agents/issue-tracker.md\n",
+            prompt,
+        )
 
 
 class ReviewScopeTests(FakePaneTestCase):
