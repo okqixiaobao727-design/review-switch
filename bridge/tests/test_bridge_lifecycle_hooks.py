@@ -240,6 +240,40 @@ class LifecycleHookTests(HookRecordingTestCase):
         self.assertEqual(self.events(), ["review-end"])
         self.assertEqual(self.firings_at("review-end")[0]["REVIEW_STATUS"], "failed")
 
+    def test_first_unfetched_document_fails_before_a_lane_opens(self):
+        document = self.worktree / "docs/available.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Available.\n", encoding="utf-8")
+        self.codex.finish("unexpected report", axis="requirements")
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = self.main(
+                "--document", "docs/available.md",
+                "--document", "docs/first-missing.md",
+                "--document", "docs/second-missing.md",
+                "--axis", "requirements",
+                "--timeout", "5",
+                "--startup-timeout", "5",
+                *self.hooks(),
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            stderr.getvalue().splitlines()[-1],
+            "Document could not be fetched: docs/first-missing.md. "
+            "Failure: spec file not found",
+        )
+        self.assertNotIn("second-missing", stderr.getvalue())
+        self.assertEqual(self.codex.launched_panes, [])
+        self.assertFalse(list(self.state_dir.glob("*.json")))
+        self.assertEqual(self.events(), ["review-end"])
+        review_end = self.firings_at("review-end")[0]
+        self.assertEqual(review_end["REVIEW_STATUS"], "failed")
+        self.assertEqual(
+            pathlib.Path(review_end["cwd"]).resolve(), self.worktree.resolve()
+        )
+
     def test_an_axis_that_cannot_be_briefed_fails_before_the_review_starts(self):
         """Preparation has not succeeded until every requested axis has a brief."""
         code = self.main(

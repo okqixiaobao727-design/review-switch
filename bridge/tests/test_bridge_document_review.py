@@ -4,6 +4,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import unittest
 import uuid
 from unittest import mock
@@ -44,6 +45,25 @@ Template baseline (the rules these documents were written under; every item is a
 - No file paths or code snippets, except a prototype's snippet that carries a decision. → cut it.
 
 Report: (a) a Module the design adds that an existing one already owns; (b) a Seam or Interface the design adds where the checkout already has one; (c) a decision that contradicts an ADR or the glossary. Name the code or ADR beside the quoted line for each finding. Under 400 words."""
+
+
+def briefs_with_parent(parent_line, document_lines):
+    without_parent = (
+        "Parent: not provided; hold the documents to each other.\n"
+        "Documents:\n"
+        "- docs/spec.md\n"
+        "- docs/ticket.md"
+    )
+    with_parent = (
+        f"{parent_line}\nDocuments:\n"
+        + "\n".join(f"- {line}" for line in document_lines)
+    )
+    return [
+        REQUIREMENTS_BRIEF_WITHOUT_PARENT.replace(
+            without_parent, with_parent
+        ),
+        DESIGN_BRIEF_WITHOUT_PARENT.replace(without_parent, with_parent),
+    ]
 
 
 class DocumentReviewCommandTests(FakePaneTestCase):
@@ -139,17 +159,6 @@ class DocumentReviewCommandTests(FakePaneTestCase):
             self.state_dir / f"{uuid.UUID(int=2)}-spec.md"
         )
         issue_summary = "#43 Parent, body and 1 comment"
-        without_parent = (
-            "Parent: not provided; hold the documents to each other.\n"
-            "Documents:\n"
-            "- docs/spec.md\n"
-            "- docs/ticket.md"
-        )
-        with_parent = (
-            f"Parent: {parent_file} — {issue_summary}. Read it before reviewing.\n"
-            "Documents:\n"
-            f"- {document_file} — {issue_summary}"
-        )
         delivered_briefs = [
             turn["input"][0]["text"].split("\n", 1)[1]
             for turn in self.codex.started_turns
@@ -157,14 +166,11 @@ class DocumentReviewCommandTests(FakePaneTestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(
             delivered_briefs,
-            [
-                REQUIREMENTS_BRIEF_WITHOUT_PARENT.replace(
-                    without_parent, with_parent
-                ),
-                DESIGN_BRIEF_WITHOUT_PARENT.replace(
-                    without_parent, with_parent
-                ),
-            ],
+            briefs_with_parent(
+                f"Parent: {parent_file} — {issue_summary}. "
+                "Read it before reviewing.",
+                [f"{document_file} — {issue_summary}"],
+            ),
         )
         self.assertEqual(
             output["preparation"],
@@ -181,6 +187,138 @@ class DocumentReviewCommandTests(FakePaneTestCase):
                 "responseFile": None,
             },
         )
+
+    def test_unfetched_issue_parent_is_carried_by_both_briefs_and_receipt(self):
+        self.fake_gh(returncode=1, stderr="issue lookup failed")
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+        args = self.parsed_args([
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--parent", "#404",
+            "--document", "docs/ticket.md",
+            "--axis", "both",
+            "--no-network",
+        ])
+        self.codex.finish("requirements report", axis="requirements")
+        self.codex.finish("design report", axis="design")
+
+        code, output = self.run_bridge(args)
+
+        parent_line = (
+            "Parent: not fetched: #404. Failure: "
+            "gh issue view failed: issue lookup failed. "
+            "Hold the documents to each other."
+        )
+        delivered_briefs = [
+            turn["input"][0]["text"].split("\n", 1)[1]
+            for turn in self.codex.started_turns
+        ]
+        self.assertEqual(code, 0, output)
+        self.assertEqual(
+            delivered_briefs,
+            briefs_with_parent(parent_line, ["docs/ticket.md"]),
+        )
+        self.assertEqual(
+            output["preparation"],
+            {
+                "parentSource": "not fetched: #404",
+                "parentFile": None,
+                "parentFailure": (
+                    "gh issue view failed: issue lookup failed"
+                ),
+                "documents": [
+                    {"source": "docs/ticket.md", "file": "docs/ticket.md"},
+                ],
+                "standardsFiles": ["AGENTS.md"],
+                "standardsCondition": "absent",
+                "codeGraphUsed": False,
+                "responseFile": None,
+            },
+        )
+
+    def test_unfetched_path_parent_is_carried_by_both_briefs_and_receipt(self):
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+        args = self.parsed_args([
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--parent", "docs/missing-parent.md",
+            "--document", "docs/ticket.md",
+            "--axis", "both",
+            "--no-network",
+        ])
+        self.codex.finish("requirements report", axis="requirements")
+        self.codex.finish("design report", axis="design")
+
+        code, output = self.run_bridge(args)
+
+        parent_line = (
+            "Parent: not fetched: docs/missing-parent.md. "
+            "Failure: spec file not found. Hold the documents to each other."
+        )
+        delivered_briefs = [
+            turn["input"][0]["text"].split("\n", 1)[1]
+            for turn in self.codex.started_turns
+        ]
+        self.assertEqual(code, 0, output)
+        self.assertEqual(
+            delivered_briefs,
+            briefs_with_parent(parent_line, ["docs/ticket.md"]),
+        )
+        self.assertEqual(
+            output["preparation"],
+            {
+                "parentSource": "not fetched: docs/missing-parent.md",
+                "parentFile": None,
+                "parentFailure": "spec file not found",
+                "documents": [
+                    {"source": "docs/ticket.md", "file": "docs/ticket.md"},
+                ],
+                "standardsFiles": ["AGENTS.md"],
+                "standardsCondition": "absent",
+                "codeGraphUsed": False,
+                "responseFile": None,
+            },
+        )
+
+    def test_design_brief_keeps_none_documented_when_no_standards_are_tracked(self):
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "rm", "AGENTS.md"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        document = self.worktree / "docs/ticket.md"
+        document.parent.mkdir(parents=True)
+        document.write_text("Ticket.\n", encoding="utf-8")
+        args = self.parsed_args([
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--document", "docs/ticket.md",
+            "--axis", "design",
+            "--no-network",
+        ])
+        self.codex.finish("design report", axis="design")
+
+        code, output = self.run_bridge(args)
+
+        expected_brief = DESIGN_BRIEF_WITHOUT_PARENT.replace(
+            "- docs/spec.md\n- docs/ticket.md",
+            "- docs/ticket.md",
+        ).replace(
+            "Standards sources: AGENTS.md",
+            "Standards sources: none documented; baseline only",
+        )
+        delivered_brief = self.codex.started_turns[0]["input"][0]["text"].split(
+            "\n", 1
+        )[1]
+        self.assertEqual(code, 0, output)
+        self.assertEqual(delivered_brief, expected_brief)
+        self.assertEqual(output["preparation"]["standardsFiles"], [])
+        self.assertEqual(output["preparation"]["standardsCondition"], "absent")
 
     def test_document_with_a_code_review_reference_names_the_mix(self):
         for option, value in (
