@@ -51,6 +51,98 @@ class RoundsContractTestCase(FakePaneTestCase):
         )
 
 
+class CodeReviewRoundCharacterizationTests(FakePaneTestCase):
+    """Code Review's rounds and Next Call through the command entry."""
+
+    def parsed_args(self, argv):
+        args = self.bridge.parse_args(argv)
+        args.status = "failed"
+        args.resume_state = self.bridge.resume_state_for_review(args)
+        return args
+
+    def review_argv(self, axis="both"):
+        return [
+            "--reviewer", "codex",
+            "--cwd", str(self.worktree),
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", axis,
+            "--no-network",
+        ]
+
+    def response_path(self, session):
+        path = self.state_dir / f"{session}-response.md"
+        path.write_text(
+            '1. "the characterization finding" — fixed in feature.py\n',
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_code_review_rounds_are_pinned_through_the_command_entry(self):
+        self.use_graphless_path()
+        args = self.parsed_args(self.review_argv())
+        self.codex.finish("standards characterization", axis="standards")
+        self.codex.finish("spec characterization", axis="spec")
+
+        code, output = self.run_bridge(args)
+
+        self.assertEqual(code, 0, output)
+        standards = output["axes"]["standards"]
+        self.assertEqual(standards["next"], FIX_AND_STOP)
+        self.assertIsNone(standards["nextCall"])
+        spec = output["axes"]["spec"]
+        self.assertEqual(spec["next"], FIX_THEN_ONE_RE_REVIEW)
+        response_file = str(
+            self.state_dir / f"{spec['reviewSessionId']}-response.md"
+        )
+        self.assertEqual(
+            spec["nextCall"],
+            {
+                "argv": [
+                    "review-bridge",
+                    *args.caller_arguments,
+                    "--axis", "spec",
+                    "--resume-session", spec["reviewSessionId"],
+                    "--response", response_file,
+                ],
+                "responseFile": response_file,
+                "responseFormat": RESPONSE_FORMAT,
+            },
+        )
+
+        standards_response = self.response_path(standards["reviewSessionId"])
+        standards_resume = self.parsed_args([
+            *self.review_argv(axis="standards"),
+            "--resume-session", standards["reviewSessionId"],
+            "--response", standards_response,
+        ])
+        refused_code, refused = self.run_bridge(standards_resume)
+        self.assertEqual(refused_code, 1, refused)
+        self.assertEqual(
+            refused["axes"]["standards"]["reason"],
+            "a standards axis earns 1 round(s) per review lineage, and this one has had 1",
+        )
+
+        pathlib.Path(response_file).write_text(
+            '1. "spec characterization" — fixed in feature.py\n',
+            encoding="utf-8",
+        )
+        spec_resume = self.parsed_args(spec["nextCall"]["argv"][1:])
+        self.codex.finish("spec re-review characterization", axis="spec")
+        resumed_code, resumed = self.run_bridge(spec_resume)
+        self.assertEqual(resumed_code, 0, resumed)
+        self.assertEqual(resumed["axes"]["spec"]["next"], ESCALATE)
+        self.assertIsNone(resumed["axes"]["spec"]["nextCall"])
+
+        spent_resume = self.parsed_args(spec["nextCall"]["argv"][1:])
+        spent_code, spent = self.run_bridge(spent_resume)
+        self.assertEqual(spent_code, 1, spent)
+        self.assertEqual(
+            spent["axes"]["spec"]["reason"],
+            "a spec axis earns 2 round(s) per review lineage, and this one has had 2",
+        )
+
+
 class NextActionTests(RoundsContractTestCase):
     """Every result names the one action its caller is permitted next."""
 
