@@ -113,6 +113,10 @@ class RecoveryTests(FakePaneTestCase):
                 "reviewSessionId": state["reviewSessionId"],
                 "reportFile": str(report_file),
                 "resolvedModel": resolved_model,
+                # Nothing pinned this lineage, so the vendor answered for both.
+                "resolvedModelSource": "vendor",
+                "resolvedEffort": None,
+                "resolvedEffortSource": "vendor",
                 "costCounters": ROUND_ONE_COUNTERS,
                 "costDetail": None,
                 "delivered": False,

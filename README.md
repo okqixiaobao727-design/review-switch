@@ -56,8 +56,8 @@ time. Omit them and the vendor's own configuration applies. `--recover-session` 
 review whose driver died, and exits `3` when no live review belongs here. `--help` lists every
 option.
 
-The Bridge reads no configuration file of its own, so a review resolves the same way on every
-machine it is invoked from.
+Where you name none of them, this machine's own configuration answers, and where it is silent
+too the reviewing vendor's is what applies. See [Configuring this machine](#configuring-this-machine).
 
 ## Document Review
 
@@ -134,19 +134,53 @@ once in the reviewed working directory, with that point's facts in its environme
 variables. Pass none and nothing extra runs; a command that fails, hangs, or is missing leaves
 the review's result untouched.
 
+## Configuring this machine
+
+`review-bridge config` is the one writer of this machine's configuration — its Lane, that
+Lane's model and effort, and its Lifecycle Hook commands all live in one file. With no
+arguments it prints where things stand; with positions it sets them:
+
+```bash
+review-bridge config                          # print the Lane, model and effort in force
+review-bridge config codex gpt-5.6-sol max    # select a Lane, and pin its model and effort
+review-bridge config codex -                  # clear that Lane's model
+review-bridge config claude                   # switch Lane; that Lane's own values stand
+```
+
+A position left out is left as it was, and `-` clears a value. Model and effort are kept
+per Lane, so switching Lane carries switching to that Lane's own values.
+
+A model or an effort is proved before it is written: the Bridge runs its health probe on
+that Lane with the values the file is about to carry, and writes only once the Lane
+answers. A Lane that refuses prints the vendor's own error, changes nothing, and exits
+non-zero. There is no flag to skip it, and this repository keeps no list of model IDs —
+which models you may use is the vendor's answer, not one that could go stale here.
+Selecting only a Lane, or clearing a value, proves nothing and needs no network.
+
+The switcher is the short way to type all of that. It is a shell function this repository
+ships; sourcing it is yours to do:
+
+```bash
+. "$PWD/shell/review-switcher.sh"    # add this line to your shell's startup file
+```
+
+`review` prints the configuration; `review [cc|codex] [model|-] [effort|-]` sets it; `rcc`
+and `rcodex` switch Lane. `cc` is the word you type for the claude Lane. Every case
+forwards to `review-bridge config`, so the file has exactly one writer.
+
 ## Asking from inside a Claude session
 
-`/review-switch` is the Dispatcher, and the only skill this project installs. It resolves the
-Lane this machine is configured for, completes the fixed point and the spec reference, and calls
-`review-bridge` — the same command a terminal runs.
+`/review-switch` is the Dispatcher, and the only skill this project installs. It completes the
+fixed point and the spec reference, and calls `review-bridge` — the same command a terminal runs.
 
-Two files configure it, and the Dispatcher is the only thing that reads either:
+It reads no configuration of its own: it passes on what you asked for and nothing else, so the
+Lane, its model and effort, and the Lifecycle Hook commands all come from the Machine Config the
+`review` switcher writes, exactly as they do for a terminal call. A Lane you name when you ask is
+an argument like any other, and beats the file.
 
-- `~/.claude/code-reviewer` — the exact value `codex` selects the codex Lane; any other value or
-  a missing file selects the claude Lane. A Lane you name when you ask overrides it.
-- `~/.claude/review-hooks/` — one file per lifecycle point, named `child-launch`,
-  `review-start`, `axis-end`, or `review-end`, each holding one command. A missing directory,
-  missing file, or blank file leaves that point unset.
+Every review it reports back names what that review ran as, read from the Bridge's own result:
+the Lane on the preparation line, the model and effort on each axis's line, and beside each one
+whether you pinned it, this machine did, or the vendor answered.
 
 ## Dependencies
 

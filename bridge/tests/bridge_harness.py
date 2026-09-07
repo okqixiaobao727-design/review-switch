@@ -72,6 +72,26 @@ def assert_first_round_turns(test, delivered, templates):
         test.assertEqual(text[len(template):], block)
 
 
+def redirect_machine_config(test, text=None):
+    """Point the Bridge's Machine Config at this test's own file, and name it.
+
+    Every suite that crosses the Bridge's command line redirects the file, so
+    that no test resolves anything from the machine it happens to run on. A test
+    given no text starts from an absent file, which is what a fresh machine has.
+    """
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    path = pathlib.Path(directory.name) / "config.toml"
+    if text is not None:
+        path.write_text(text, encoding="utf-8")
+    patcher = mock.patch.dict(
+        os.environ, {"REVIEW_SWITCH_CONFIG": str(path)}
+    )
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return path
+
+
 def base_args(**overrides):
     values = {
         "reviewer": "codex",
@@ -92,6 +112,12 @@ def base_args(**overrides):
         "recover_session": False,
         "model": None,
         "effort": None,
+        # A Namespace built here never crossed the command line, so it carries
+        # the resolution a caller who named its Lane and nothing else would get.
+        "lane_source": "caller",
+        "model_source": "vendor",
+        "effort_source": "vendor",
+        "resolved_arguments": [],
         "standards_model": None,
         "standards_effort": None,
         "spec_model": None,
@@ -691,7 +717,17 @@ class FakePaneTestCase(unittest.TestCase):
             # A stub Lane launches no real reviewer, but the binary is resolved
             # before one is launched, so it has to name a file that exists.
             "CODE_REVIEW_CLAUDE_BINARY": sys.executable,
+            # Redirected before anything is parsed: a suite that read the
+            # machine's own Machine Config would pass or fail by whose machine
+            # it ran on.
+            "REVIEW_SWITCH_CONFIG": str(
+                self.root / "machine-config" / "config.toml"
+            ),
         }
+        self.machine_config = pathlib.Path(
+            self.environment["REVIEW_SWITCH_CONFIG"]
+        )
+        self.machine_config.parent.mkdir()
         self.worktree_root = str(self.worktree)
         self.enter(mock.patch.dict(os.environ, self.environment, clear=False))
         self.enter(mock.patch.object(
@@ -773,6 +809,11 @@ class FakePaneTestCase(unittest.TestCase):
         if values.get("resume_session") and "response" not in overrides:
             values["response"] = self.default_response_file()
         return base_args(**values)
+
+    def write_machine_config(self, text):
+        """Put this machine's answers in place, or replace the ones there."""
+        self.machine_config.write_text(text, encoding="utf-8")
+        return self.machine_config
 
     def parsed_args(self, argv):
         """Public command arguments ready to cross the Bridge command seam."""

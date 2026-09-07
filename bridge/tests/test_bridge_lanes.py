@@ -59,6 +59,8 @@ class ClaudeDeliveryTests(FakePaneTestCase):
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "claude",
+                "laneSource": "caller",
             },
         )
         state = self.stored_session()
@@ -360,9 +362,22 @@ class SharedBriefTests(FakePaneTestCase):
                 set(codex_output["axes"][axis]),
                 set(claude_output["axes"][axis]),
             )
+        # One preparation, two Lanes: everything prepared reads the same, and
+        # the one field that differs is the Lane itself, which each names.
         self.assertEqual(
-            codex_output["preparation"], claude_output["preparation"]
+            {
+                key: value
+                for key, value in codex_output["preparation"].items()
+                if key != "lane"
+            },
+            {
+                key: value
+                for key, value in claude_output["preparation"].items()
+                if key != "lane"
+            },
         )
+        self.assertEqual(codex_output["preparation"]["lane"], "codex")
+        self.assertEqual(claude_output["preparation"]["lane"], "claude")
 
 
 class ClaudePerAxisChoiceTests(FakePaneTestCase):
@@ -689,6 +704,134 @@ class ClaudeAccountTests(FakePaneTestCase):
         )
         self.assertEqual(call["argv"][0], "-p")
         self.assertIn("--output-format", call["argv"])
+
+
+class ResolvedValueDisclosureTests(FakePaneTestCase):
+    """What a review says it ran on, and which of the three layers chose it.
+
+    Disclosure follows the values' existing owners: the Lane is one per review
+    and is settled before any Lane opens, so preparation carries it; model and
+    effort are per axis, so each axis result carries its own.
+    """
+
+    def review_argv(self, *arguments, axis="standards"):
+        return [
+            "--cwd", str(self.worktree),
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", axis,
+            "--no-network",
+            *arguments,
+        ]
+
+    def review(self, *arguments, axis="standards"):
+        """One review driven across the command line, so the file is read."""
+        args = self.parsed_args(self.review_argv(*arguments, axis=axis))
+        for name in ("standards", "spec") if axis == "both" else (axis,):
+            self.lane(args.reviewer).finish(f"{name} clear", axis=name)
+        code, output = self.run_bridge(args)
+        self.assertEqual(code, 0, output)
+        return output
+
+    def test_preparation_names_the_lane_the_caller_chose(self):
+        output = self.review("--reviewer", "claude")
+
+        self.assertEqual(output["preparation"]["lane"], "claude")
+        self.assertEqual(output["preparation"]["laneSource"], "caller")
+
+    def test_preparation_names_the_lane_this_machine_chose(self):
+        self.write_machine_config('lane = "claude"\n')
+
+        output = self.review()
+
+        self.assertEqual(output["preparation"]["lane"], "claude")
+        self.assertEqual(output["preparation"]["laneSource"], "config")
+
+    def test_preparation_carries_no_model_or_effort_of_its_own(self):
+        """Nothing singular here that a Lane already owns per axis."""
+        output = self.review("--reviewer", "claude", "--model", "asked-for")
+
+        for key in output["preparation"]:
+            self.assertNotIn("odel", key)
+            self.assertNotIn("ffort", key)
+
+    def test_an_axis_names_the_model_and_effort_its_caller_chose(self):
+        output = self.review(
+            "--reviewer", "claude", "--model", "asked-for", "--effort", "max"
+        )
+
+        result = output["axes"]["standards"]
+        self.assertEqual(result["resolvedModelSource"], "caller")
+        self.assertEqual(result["resolvedEffort"], "max")
+        self.assertEqual(result["resolvedEffortSource"], "caller")
+
+    def test_an_axis_names_the_model_and_effort_this_machine_chose(self):
+        self.write_machine_config(
+            'lane = "claude"\n\n'
+            '[claude]\nmodel = "configured-model"\neffort = "medium"\n'
+        )
+
+        output = self.review()
+
+        result = output["axes"]["standards"]
+        self.assertEqual(result["resolvedModelSource"], "config")
+        self.assertEqual(result["resolvedEffort"], "medium")
+        self.assertEqual(result["resolvedEffortSource"], "config")
+
+    def test_an_axis_the_vendor_answered_for_says_so(self):
+        output = self.review("--reviewer", "claude")
+
+        result = output["axes"]["standards"]
+        self.assertIn("resolvedModel", result)
+        self.assertEqual(result["resolvedModelSource"], "vendor")
+        self.assertIsNone(result["resolvedEffort"])
+        self.assertEqual(result["resolvedEffortSource"], "vendor")
+
+    def test_each_axis_names_the_layer_that_chose_its_own_model(self):
+        self.write_machine_config(
+            '[claude]\nmodel = "configured-model"\neffort = "medium"\n'
+        )
+
+        output = self.review(
+            "--reviewer", "claude", "--spec-model", "spec-only", axis="both"
+        )
+
+        self.assertEqual(
+            output["axes"]["standards"]["resolvedModelSource"], "config"
+        )
+        self.assertEqual(output["axes"]["spec"]["resolvedModelSource"], "caller")
+        self.assertEqual(output["axes"]["spec"]["resolvedEffort"], "medium")
+        self.assertEqual(
+            output["axes"]["spec"]["resolvedEffortSource"], "config"
+        )
+
+    def test_a_recovered_delivery_names_what_its_first_delivery_resolved(self):
+        self.write_machine_config(
+            'lane = "codex"\n\n'
+            '[codex]\nmodel = "configured-model"\neffort = "medium"\n'
+        )
+        # The report is reached and stored; the driver dies holding it.
+        self.codex.finish("the report the driver died holding")
+        killed = self.enter(mock.patch.object(
+            self.bridge.CodexLane, "end_axis", side_effect=DriverKilled
+        ))
+        with self.assertRaises(DriverKilled):
+            self.run_bridge(self.parsed_args(self.review_argv()))
+        self.stop_patcher(killed)
+        # This machine changes its mind while a report waits to be read.
+        self.write_machine_config(
+            'lane = "codex"\n\n'
+            '[codex]\nmodel = "second-thoughts"\neffort = "max"\n'
+        )
+
+        code, output = self.run_bridge(
+            self.args(reviewer="codex", recover_session=True)
+        )
+
+        self.assertEqual(code, 0, output)
+        result = output["axes"]["standards"]
+        self.assertEqual(result["resolvedEffort"], "medium")
+        self.assertEqual(result["resolvedEffortSource"], "config")
 
 
 if __name__ == "__main__":

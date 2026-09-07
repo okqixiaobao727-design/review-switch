@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import fcntl
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -38,9 +39,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from types import MappingProxyType
 
 try:
@@ -104,6 +106,12 @@ HOOK_POINTS = {
     REVIEW_END: "once per invocation, on every exit path",
 }
 HOOK_TIMEOUT_SECONDS = 30
+# Which of the three layers a resolved value came from: the caller's own
+# argument, this machine's Machine Config, or the reviewing vendor's own
+# configuration, which answers where the other two are silent.
+SOURCE_CALLER = "caller"
+SOURCE_CONFIG = "config"
+SOURCE_VENDOR = "vendor"
 EVENT_VAR = "REVIEW_EVENT"
 COST_DETAIL_VAR = "REVIEW_COST_DETAIL"
 # One environment variable per counter, spelled from the counter itself so the
@@ -2146,7 +2154,19 @@ def prepare_document_review(args, store):
 
 
 def preparation_report(args):
-    return args.preparation.report() if args.preparation is not None else None
+    """What this review prepared, and the Lane it settled on before any opened.
+
+    The Lane joins the report here rather than inside a preparation, because it
+    is the call's answer and not the preparation's: one Lane per review, settled
+    on the command line, where every other resolved value is settled too. Model
+    and effort are per axis and stay with the axes that own them.
+    """
+    if args.preparation is None:
+        return None
+    report = args.preparation.report()
+    report["lane"] = args.reviewer
+    report["laneSource"] = getattr(args, "lane_source", SOURCE_CALLER)
+    return report
 
 
 def build_prompt(brief, bridge_id):
@@ -2242,6 +2262,18 @@ def resolve_axis_choice(args, axis, choice):
     return getattr(args, choice, None)
 
 
+def resolve_axis_source(args, axis, choice):
+    """Which layer chose what this axis runs on.
+
+    An axis pinned by its own option was pinned by whoever passed it; an axis
+    that fell through to the whole-review value inherits that value's source,
+    which the command line settled once.
+    """
+    if getattr(args, f"{axis}_{choice}", None) is not None:
+        return SOURCE_CALLER
+    return getattr(args, f"{choice}_source", SOURCE_VENDOR)
+
+
 # ---------------------------------------------------------------------------
 # The Rounds Contract.
 #
@@ -2273,6 +2305,8 @@ NEXT_ESCALATE = "escalate"
 NEXT_DONE = "done"
 NEXT_RUN_AGAIN = "run again"
 NEXT_CALL_ARGUMENTS_FIELD = "nextCallArguments"
+#: What this lineage resolved that its caller did not name, frozen with it.
+NEXT_CALL_RESOLVED_FIELD = "nextCallResolvedArguments"
 NEXT_CALL_RESPONSE_FORMAT = (
     "N. <short quote from the finding> — fixed <where> | declined <why> | "
     "deferred <ticket>"
@@ -2419,20 +2453,31 @@ def next_call(action, axis, state, args, store):
         caller_arguments = getattr(args, "caller_arguments", None)
     if caller_arguments is None:
         return None
-    argv = ["review-bridge", *caller_arguments, "--axis", axis]
     if action == NEXT_RUN_AGAIN:
+        # A fresh lineage, so omitted stays omitted and this machine's file is
+        # read again — the retry is entitled to whatever it now says.
         return {
-            "argv": argv,
+            "argv": ["review-bridge", *caller_arguments, "--axis", axis],
             "responseFile": None,
             "responseFormat": None,
         }
     if state is None:
         return None
+    # A resume belongs to a session already open on one Lane, so it names what
+    # this lineage resolved rather than leaving it to be resolved again: a
+    # Machine Config edited between two rounds must not hand a codex session id
+    # to the claude Lane (ADR-0009, amended).
+    resolved = state.get(NEXT_CALL_RESOLVED_FIELD)
+    if resolved is None and not args.recover_session:
+        resolved = getattr(args, "resolved_arguments", None)
     session_id = state["reviewSessionId"]
     response_file = str(store.response_path(session_id))
     return {
         "argv": [
-            *argv,
+            "review-bridge",
+            *caller_arguments,
+            *(resolved or ()),
+            "--axis", axis,
             "--resume-session", session_id,
             "--response", response_file,
         ],
@@ -3199,7 +3244,8 @@ def write_runtime_prompt(runtime_dir, prompt):
 
 def session_state(
     session_id, owner, runtime_dir, pane_id, thread_id, target, model, effort,
-    marker, axis, caller_arguments,
+    marker, axis, caller_arguments, resolved_arguments=(),
+    model_source=SOURCE_VENDOR, effort_source=SOURCE_VENDOR,
 ):
     now = time.time()
     return {
@@ -3207,6 +3253,7 @@ def session_state(
         "reviewSessionId": session_id,
         "axis": axis,
         NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
+        NEXT_CALL_RESOLVED_FIELD: list(resolved_arguments),
         # Rounds this lineage has had, which the Rounds Contract caps.
         "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
@@ -3217,6 +3264,8 @@ def session_state(
         "target": target,
         "model": model,
         "effort": effort,
+        "modelSource": model_source,
+        "effortSource": effort_source,
         # The marker of the turn now in flight: the handle a recovering caller
         # needs to find that turn again in the thread.
         "marker": marker,
@@ -3231,13 +3280,22 @@ def apply_session_model_choice(args, state):
     The resumed record decides the axis. For each choice, that axis's flag
     overrides the generic flag; with neither, the follow-up inherits whatever
     its first review pinned. A lineage that was never pinned stays unpinned.
+
+    A value and the source that chose it move together, here as everywhere: a
+    round whose model arrived as an argument says `caller` even where round one
+    read the same model from this machine's file.
     """
     axis = state["axis"]
     for choice in ("model", "effort"):
+        source = f"{choice}Source"
         selected = resolve_axis_choice(args, axis, choice)
         if selected is not None:
             state[choice] = selected
+            state[source] = resolve_axis_source(args, axis, choice)
         setattr(args, choice, state.get(choice))
+        setattr(
+            args, f"{choice}_source", state.get(source, SOURCE_VENDOR)
+        )
 
 
 def update_session_after_turn(state, turn, target):
@@ -3317,6 +3375,11 @@ def axis_arguments(args, axis):
     axis_args.axis = axis
     for choice in ("model", "effort"):
         setattr(axis_args, choice, resolve_axis_choice(args, axis, choice))
+        setattr(
+            axis_args,
+            f"{choice}_source",
+            resolve_axis_source(args, axis, choice),
+        )
     return axis_args
 
 
@@ -3374,6 +3437,9 @@ async def drive_new_review(launch, owner, store):
             launch.marker,
             args.axis,
             getattr(args, "caller_arguments", ()),
+            getattr(args, "resolved_arguments", ()),
+            getattr(args, "model_source", SOURCE_VENDOR),
+            getattr(args, "effort_source", SOURCE_VENDOR),
         )
         state["preparation"] = preparation_report(args)
         # The TUI is already attached to an idle thread. The record goes down
@@ -3413,6 +3479,22 @@ def undelivered_report(state):
     return None
 
 
+def resolved_choices(state, model):
+    """One axis's model and effort as they resolved, each beside its source.
+
+    The model is the one the reviewer itself reports, so a `vendor` source
+    still names what ran. Effort has no such read-back on either Lane: where
+    neither the caller nor this machine pinned one, there is nothing to name
+    and the value is `None` against a `vendor` source.
+    """
+    return {
+        "resolvedModel": model,
+        "resolvedModelSource": state.get("modelSource", SOURCE_VENDOR),
+        "resolvedEffort": state.get("effort"),
+        "resolvedEffortSource": state.get("effortSource", SOURCE_VENDOR),
+    }
+
+
 def result_from_report(report):
     result = {
         name: report[name]
@@ -3420,6 +3502,16 @@ def result_from_report(report):
     }
     # A record stored before reports had files of their own names no file.
     result["reportFile"] = report.get("reportFile")
+    # A record stored before an axis disclosed its sources names none of them,
+    # which is the same thing as nobody here having pinned one.
+    result["resolvedModel"] = report.get("resolvedModel")
+    result["resolvedModelSource"] = report.get(
+        "resolvedModelSource", SOURCE_VENDOR
+    )
+    result["resolvedEffort"] = report.get("resolvedEffort")
+    result["resolvedEffortSource"] = report.get(
+        "resolvedEffortSource", SOURCE_VENDOR
+    )
     if "reason" in report:
         result["reason"] = report["reason"]
     return result
@@ -3661,10 +3753,11 @@ class Lane:
         report_file = self.store.write_report(
             run.state["reviewSessionId"], result["finalMessage"]
         )
+        disclosure = resolved_choices(run.state, model)
         report = dict(result)
         report.update({
             "reportFile": report_file,
-            "resolvedModel": model,
+            **disclosure,
             "costCounters": {
                 name: counters.get(name) if counters is not None else None
                 for name in COUNTERS
@@ -3675,6 +3768,9 @@ class Lane:
         run.state["report"] = report
         run.state["updatedAt"] = time.time()
         self.store.write(run.state["reviewSessionId"], run.state)
+        # The caller is told the same values the record kept, so a first
+        # delivery and a recovered one disclose one answer, not two.
+        result.update(disclosure)
         return report_file
 
     def settle_result(self, run):
@@ -4094,7 +4190,8 @@ def claude_axis_result(state, parsed):
 
 def headless_session_state(
     session_id, owner, runtime_dir, pid, target, model, effort, axis,
-    caller_arguments,
+    caller_arguments, resolved_arguments=(),
+    model_source=SOURCE_VENDOR, effort_source=SOURCE_VENDOR,
 ):
     """The record one headless axis leaves: the reviewer, and where it prints."""
     now = time.time()
@@ -4103,6 +4200,7 @@ def headless_session_state(
         "reviewSessionId": session_id,
         "axis": axis,
         NEXT_CALL_ARGUMENTS_FIELD: list(caller_arguments),
+        NEXT_CALL_RESOLVED_FIELD: list(resolved_arguments),
         # Rounds this lineage has had, which the Rounds Contract caps.
         "rounds": SINGLE_ROUND,
         "owner": owner.to_dict(),
@@ -4115,6 +4213,8 @@ def headless_session_state(
         "target": target,
         "model": model,
         "effort": effort,
+        "modelSource": model_source,
+        "effortSource": effort_source,
         "createdAt": now,
         "updatedAt": now,
     }
@@ -4201,6 +4301,9 @@ class ClaudeLane(Lane):
             axis_args.effort,
             brief.axis,
             getattr(self.args, "caller_arguments", ()),
+            getattr(self.args, "resolved_arguments", ()),
+            axis_args.model_source,
+            axis_args.effort_source,
         )
         state["preparation"] = preparation_report(self.args)
         self.store.write(state["reviewSessionId"], state)
@@ -4522,6 +4625,559 @@ async def run_bridge(args):
         return 0 if succeeded else 1
 
 
+# ---------------------------------------------------------------------------
+# The Machine Config.
+#
+# One machine-level file holding everything this machine has to say about a
+# review: its Lane, that Lane's model and effort, and its Lifecycle Hook
+# commands. Every value it can carry resolves on a single rule — an argument
+# wins; the Machine Config speaks only where the argument is silent; the
+# reviewing vendor's own configuration answers where the Machine Config is
+# silent too — and every resolved value travels with the source that chose it,
+# so a review always says what it ran on and who chose it (ADR-0002, amended).
+#
+# Model and effort are keyed by Lane because a model ID belongs to one vendor:
+# keying them this way makes "switch Lane" carry "switch to that Lane's model"
+# with no rule to state.
+#
+# Silence is configuration and malformed is not. An absent file resolves nothing
+# and says nothing; an absent key falls to the next layer without a word. A file
+# that will not parse, or that carries a key or a Lane name this Bridge does not
+# know, stops the run in preflight naming what it found — because a misspelled
+# key that fell through silently would look exactly like a key nobody wrote.
+# ---------------------------------------------------------------------------
+#: An absolute path here replaces the whole file — the test and CI seam.
+CONFIG_PATH_ENV_VAR = "REVIEW_SWITCH_CONFIG"
+XDG_CONFIG_HOME_ENV_VAR = "XDG_CONFIG_HOME"
+CONFIG_DIRECTORY_NAME = "review-switch"
+CONFIG_FILE_NAME = "config.toml"
+CONFIG_HOME_FALLBACK = ".config"
+#: The file's own vocabulary. Model and effort are spelled as the options are.
+LANE_KEY = "lane"
+HOOKS_TABLE = "hooks"
+MODEL_KEY = "model"
+EFFORT_KEY = "effort"
+LANE_TABLE_KEYS = (MODEL_KEY, EFFORT_KEY)
+
+
+class MachineConfigError(ValueError):
+    """A Machine Config that cannot be acted on, named down to the detail."""
+
+
+def machine_config_path(environment=None):
+    """Where this machine's Machine Config lives, by the XDG convention.
+
+    The override replaces the file wholesale rather than adding a fourth layer:
+    a test or a CI runner points it at a file of its own and resolves nothing
+    from the machine it happens to run on. It is held to an absolute path,
+    because a relative one would name a different file for every directory a
+    review is run from, and the Bridge is run from the checkout it reviews.
+    """
+    environment = os.environ if environment is None else environment
+    override = environment.get(CONFIG_PATH_ENV_VAR)
+    if override:
+        path = pathlib.Path(override)
+        if not path.is_absolute():
+            raise MachineConfigError(
+                f"{CONFIG_PATH_ENV_VAR} must be an absolute path: {override}"
+            )
+        return path
+    configuration_home = environment.get(XDG_CONFIG_HOME_ENV_VAR)
+    if configuration_home:
+        root = pathlib.Path(configuration_home)
+    else:
+        home = environment.get("HOME")
+        root = (
+            pathlib.Path(home) if home else pathlib.Path.home()
+        ) / CONFIG_HOME_FALLBACK
+    return root / CONFIG_DIRECTORY_NAME / CONFIG_FILE_NAME
+
+
+@dataclasses.dataclass(frozen=True)
+class MachineConfig:
+    """What one machine says about a review, or the nothing it wrote."""
+
+    path: pathlib.Path
+    lane: str | None = None
+    lanes: dict = dataclasses.field(default_factory=dict)
+    hooks: dict = dataclasses.field(default_factory=dict)
+
+    def choice(self, lane, key):
+        """This Lane's model or effort, or nothing where the file names none."""
+        return self.lanes.get(lane, {}).get(key)
+
+
+def config_string(path, where, key, value):
+    """One configured value, held to being a string, or the failure that it is not."""
+    if not isinstance(value, str):
+        raise MachineConfigError(
+            f"the Machine Config gives {where}{key} a "
+            f"{type(value).__name__} where a string belongs: {path}"
+        )
+    return value
+
+
+def parse_machine_config(path, document):
+    """One parsed Machine Config, checked key by key against what this Bridge knows."""
+    known_lanes = ", ".join(sorted(LANES))
+    for key, value in document.items():
+        if key in (LANE_KEY, HOOKS_TABLE) or key in LANES:
+            continue
+        if isinstance(value, dict):
+            raise MachineConfigError(
+                f"the Machine Config has a table for a Lane this Bridge does "
+                f"not know: [{key}] in {path}; known Lanes: {known_lanes}"
+            )
+        raise MachineConfigError(
+            f"the Machine Config names a key this Bridge does not know: "
+            f"{key} in {path}"
+        )
+    lane = document.get(LANE_KEY)
+    if lane is not None:
+        lane = config_string(path, "", LANE_KEY, lane)
+        if lane not in LANES:
+            raise MachineConfigError(
+                f"the Machine Config names a Lane this Bridge does not know: "
+                f"{lane!r} in {path}; known Lanes: {known_lanes}"
+            )
+    lanes = {}
+    for name in LANES:
+        table = document.get(name)
+        if table is None:
+            continue
+        if not isinstance(table, dict):
+            raise MachineConfigError(
+                f"the Machine Config gives {name} a "
+                f"{type(table).__name__} where a table belongs: {path}"
+            )
+        for key, value in table.items():
+            if key not in LANE_TABLE_KEYS:
+                raise MachineConfigError(
+                    f"the Machine Config names a key this Bridge does not "
+                    f"know: {name}.{key} in {path}; a Lane table carries "
+                    f"{' and '.join(LANE_TABLE_KEYS)}"
+                )
+            config_string(path, f"{name}.", key, value)
+        lanes[name] = dict(table)
+    hooks = document.get(HOOKS_TABLE, {})
+    if not isinstance(hooks, dict):
+        raise MachineConfigError(
+            f"the Machine Config gives {HOOKS_TABLE} a "
+            f"{type(hooks).__name__} where a table belongs: {path}"
+        )
+    for key, value in hooks.items():
+        if key not in HOOK_POINTS:
+            raise MachineConfigError(
+                f"the Machine Config names a lifecycle point this Bridge does "
+                f"not know: {HOOKS_TABLE}.{key} in {path}; the points are "
+                f"{', '.join(HOOK_POINTS)}"
+            )
+        config_string(path, f"{HOOKS_TABLE}.", key, value)
+    return MachineConfig(
+        path=path, lane=lane, lanes=lanes, hooks=dict(hooks)
+    )
+
+
+def read_machine_config(environment=None):
+    """This machine's Machine Config, or the empty one a machine that wrote none has."""
+    path = machine_config_path(environment)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return MachineConfig(path=path)
+    except (OSError, UnicodeDecodeError) as error:
+        raise MachineConfigError(
+            f"the Machine Config could not be read: {path}: {error}"
+        ) from error
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise MachineConfigError(
+            f"the Machine Config is not valid TOML: {path}: {error}"
+        ) from error
+    return parse_machine_config(path, document)
+
+
+def resolve_against_config(argument, configured):
+    """One value and the layer that chose it, on the rule every value follows."""
+    if argument is not None:
+        return argument, SOURCE_CALLER
+    if configured is not None:
+        return configured, SOURCE_CONFIG
+    return None, SOURCE_VENDOR
+
+
+def frozen_arguments(args):
+    """The options a resume must name because this lineage, not its caller, resolved them.
+
+    A resume handle belongs to a session already open on one Lane, so a Machine
+    Config edited between two rounds must not re-resolve it and hand a codex
+    session id to the claude Lane: a lineage's values are frozen with its owner
+    (ADR-0009, amended; ADR-0012). A caller-named value is already in the
+    caller's own tokens and is not repeated here, and a value the vendor chose
+    has no token to freeze — naming one would invent a pin nobody asked for.
+    """
+    frozen = []
+    for option, value, source in (
+        ("--reviewer", args.reviewer, args.lane_source),
+        ("--model", args.model, args.model_source),
+        ("--effort", args.effort, args.effort_source),
+    ):
+        if source == SOURCE_CONFIG:
+            frozen.extend([option, value])
+    return frozen
+
+
+def resolve_machine_config(parser, args, environment=None):
+    """Reconcile this call's arguments with this machine's file, once, here.
+
+    Here because here is where the command line is already resolved: everything
+    downstream reads settled values and asks no second time. Each value resolves
+    on its own — model and effort follow the *resolved* Lane, however that Lane
+    was named — so no value's resolution depends on where another came from.
+    """
+    try:
+        config = read_machine_config(environment)
+    except MachineConfigError as error:
+        parser.error(str(error))
+    args.machine_config = config
+    args.reviewer, args.lane_source = resolve_against_config(
+        args.reviewer, config.lane
+    )
+    if args.reviewer is None:
+        parser.error(
+            "no Lane was named: pass --reviewer, or set "
+            f"{LANE_KEY} in {config.path}; known Lanes: "
+            f"{', '.join(sorted(LANES))}"
+        )
+    args.model, args.model_source = resolve_against_config(
+        args.model, config.choice(args.reviewer, MODEL_KEY)
+    )
+    args.effort, args.effort_source = resolve_against_config(
+        args.effort, config.choice(args.reviewer, EFFORT_KEY)
+    )
+    for point in HOOK_POINTS:
+        destination = hook_destination(point)
+        if getattr(args, destination, None) is None:
+            configured = config.hooks.get(point)
+            if configured is not None:
+                setattr(args, destination, configured)
+    args.resolved_arguments = frozen_arguments(args)
+    return args
+
+
+# ---------------------------------------------------------------------------
+# The `config` mode: the Machine Config's one writer.
+#
+# A public mode selected the way the private ones are — by the first token —
+# because it is a different command from a review and shares none of a review's
+# command line. It reads, edits and writes the file; nothing else writes it, so
+# the shipped switcher and every later writer hold one grammar between them and
+# no knowledge of the format at all.
+#
+# Setting a model or an effort is proved before it lands. The proof is the
+# Bridge's own health probe, run on the target Lane with the values the file is
+# about to carry, so "you may not use this model" is answered in the vendor's
+# own words and nothing here has to keep a list of model IDs that a vendor's
+# next release would make wrong. There is no flag to skip it: the mode takes
+# positions and nothing else. Setting only the Lane, and clearing a value, prove
+# nothing and reach no network — there is no new value to be refused.
+# ---------------------------------------------------------------------------
+CONFIG_MODE = "config"
+#: The position that says "carry no value here", rather than a value to prove.
+CLEAR_TOKEN = "-"
+#: What a line prints where neither this file nor an argument named a value.
+UNSET_VALUE = "none"
+#: The layer that chose a value where no layer could: this machine named no
+#: Lane, so nothing downstream of the Lane has been reached at all.
+SOURCE_UNSET = "unset"
+CONFIG_STATE_LABELS = (
+    ("Lane", LANE_KEY), ("Model", MODEL_KEY), ("Effort", EFFORT_KEY)
+)
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def toml_key(key):
+    """One table or value key, bare where TOML allows it and quoted where not."""
+    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
+
+
+#: The one character JSON leaves bare that a TOML basic string may not carry.
+#: TOML's unescaped set stops at %x7E and resumes at %x80, so DELETE has to be
+#: escaped by hand; every other control character JSON already escapes, and TOML
+#: admits the literal non-ASCII above it.
+TOML_FORBIDDEN_BARE = ((chr(0x7F), "\\u007f"),)
+
+
+def toml_string(value):
+    """One string as a TOML basic string, escaped so it reads back unchanged.
+
+    JSON's own escaping of a `str` is very nearly a TOML basic string — every
+    escape JSON emits is a TOML escape — so the escape table is JSON's and not a
+    hand-rolled one to keep correct. The one gap is closed above: a character
+    TOML excludes from its unescaped set that JSON hands back bare would produce
+    a file this Bridge's own reader then refuses.
+    """
+    written = json.dumps(value, ensure_ascii=False)
+    for character, escape in TOML_FORBIDDEN_BARE:
+        written = written.replace(character, escape)
+    return written
+
+
+def serialize_machine_config(config):
+    """One Machine Config as the text this repository writes for it.
+
+    Every value the file carries is preserved — the Lane, both Lane tables and
+    `[hooks]` — in this Bridge's own order. Comments and layout are not: the
+    file's meaning is its keys, and a writer that re-created a person's
+    formatting would be a second parser to keep correct.
+    """
+    blocks = []
+    if config.lane is not None:
+        blocks.append(f"{toml_key(LANE_KEY)} = {toml_string(config.lane)}\n")
+    for name in LANES:
+        table = config.lanes.get(name)
+        if not table:
+            continue
+        lines = [f"[{toml_key(name)}]\n"]
+        lines.extend(
+            f"{toml_key(key)} = {toml_string(table[key])}\n"
+            for key in LANE_TABLE_KEYS
+            if key in table
+        )
+        blocks.append("".join(lines))
+    if config.hooks:
+        lines = [f"[{toml_key(HOOKS_TABLE)}]\n"]
+        lines.extend(
+            f"{toml_key(point)} = {toml_string(config.hooks[point])}\n"
+            for point in HOOK_POINTS
+            if point in config.hooks
+        )
+        blocks.append("".join(lines))
+    return "\n".join(blocks)
+
+
+def write_machine_config(config):
+    """Put this Machine Config in place, or leave the one there untouched.
+
+    The text is read back through this Bridge's own reader before any of it
+    reaches the file, so a value that would not parse — or that this Bridge
+    would refuse to read — fails while the file on disk is still the old one.
+    The file then arrives whole, by a rename over a sibling temporary, because a
+    half-written configuration is one no review could run from.
+    """
+    text = serialize_machine_config(config)
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise MachineConfigError(
+            f"the Machine Config this write produced is not valid TOML: {error}"
+        ) from error
+    parse_machine_config(config.path, document)
+    config.path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=config.path.parent,
+        prefix=f".{config.path.name}.",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, config.path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+    return config.path
+
+
+def apply_config_edit(config, lane, model, effort):
+    """This Machine Config with one Lane's entries edited, and that Lane selected.
+
+    Naming a Lane always selects it, and says nothing about that Lane's model or
+    effort: switching Lane carries switching to that Lane's own values, which is
+    why they are keyed by Lane at all. A position left out is left alone, and
+    the clearing token removes the key rather than writing an empty value.
+    """
+    lanes = {name: dict(table) for name, table in config.lanes.items()}
+    table = lanes.setdefault(lane, {})
+    for key, value in ((MODEL_KEY, model), (EFFORT_KEY, effort)):
+        if value is None:
+            continue
+        if value == CLEAR_TOKEN:
+            table.pop(key, None)
+        else:
+            table[key] = value
+    if not table:
+        lanes.pop(lane)
+    return dataclasses.replace(config, lane=lane, lanes=lanes)
+
+
+def config_state_lines(config):
+    """What this machine now says, in the order a person reads it.
+
+    The Lane, and that Lane's model and effort, each with the layer that chose
+    it. `config` is this file; `vendor` is the reviewing vendor's own
+    configuration, which is what a value this file leaves out falls to. A
+    machine that has named no Lane falls to neither: no vendor was selected to
+    answer for the model or the effort, and no vendor names the Lane itself, so
+    a review from here stops until one is named. That state is `unset`, and
+    saying `vendor` for it would credit a layer that was never reached.
+    """
+    if config.lane is None:
+        return [
+            f"{label}: {UNSET_VALUE} ({SOURCE_UNSET})"
+            for label, _key in CONFIG_STATE_LABELS
+        ]
+    values = {
+        LANE_KEY: config.lane,
+        MODEL_KEY: config.choice(config.lane, MODEL_KEY),
+        EFFORT_KEY: config.choice(config.lane, EFFORT_KEY),
+    }
+    return [
+        f"{label}: {UNSET_VALUE if values[key] is None else values[key]} "
+        f"({SOURCE_VENDOR if values[key] is None else SOURCE_CONFIG})"
+        for label, key in CONFIG_STATE_LABELS
+    ]
+
+
+def probe_arguments(lane, model, effort):
+    """The health probe this candidate is proved by, in the shape a review runs.
+
+    Built on the review parser so the probe is the Bridge's existing one and not
+    a second path to the Lane. The Machine Config is deliberately not resolved
+    into it: the values proved are this write's candidates, and a hook this
+    machine configured belongs to a review, which a proof is not.
+    """
+    argv = ["--reviewer", lane, "--probe"]
+    for option, value in (("--model", model), ("--effort", effort)):
+        if value is not None:
+            argv.extend([option, value])
+    args = build_parser().parse_args(argv)
+    args.machine_config = None
+    args.lane_source = SOURCE_CALLER
+    args.model_source = SOURCE_CALLER if model is not None else SOURCE_VENDOR
+    args.effort_source = SOURCE_CALLER if effort is not None else SOURCE_VENDOR
+    args.resolved_arguments = []
+    args.caller_arguments = []
+    args.resume_state = None
+    args.status = FAILED_STATUS
+    return args
+
+
+def probe_failure(output):
+    """The vendor's own words for why the probe failed, from the probe's result.
+
+    Both halves of what the Lane said are carried: the Bridge's own reason names
+    the *kind* of failure, and the axis's final message is the text the vendor
+    itself produced — which is where a refused model is explained, and the whole
+    reason nothing here keeps a list of model IDs.
+    """
+    try:
+        result = json.loads(output)
+    except json.JSONDecodeError:
+        return output.strip()
+    said = [
+        line
+        for axis in result.get("axes", {}).values()
+        for line in (axis.get("reason"), axis.get("finalMessage"))
+        if line and line.strip()
+    ]
+    return "\n".join(said) if said else output.strip()
+
+
+def probe_lane(lane, model, effort):
+    """Prove these values against this Lane, or say why the Lane refused them.
+
+    The probe's own result is swallowed where it succeeded: a person setting a
+    model asked for the model to be set, not for a review's JSON.
+    """
+    args = probe_arguments(lane, model, effort)
+    printed = io.StringIO()
+    try:
+        with redirect_stdout(printed):
+            code = asyncio.run(run_bridge(args))
+    except (AppServerError, OSError, RuntimeError) as error:
+        return str(error)
+    return None if code == 0 else probe_failure(printed.getvalue())
+
+
+def build_config_parser():
+    """The `config` mode's whole grammar: three positions and no options.
+
+    Positions rather than options so the shipped switcher forwards what it was
+    given and holds no grammar of its own. No option is offered because the one
+    a caller would reach for is a way past the proof, and there is none.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"review-bridge {CONFIG_MODE}",
+        description=(
+            "Print this machine's review configuration, or set it. Naming a "
+            "Lane selects it; a model or an effort is proved against that Lane "
+            f"before it is written; {CLEAR_TOKEN!r} clears a value, and a "
+            "position left out is left as it was."
+        ),
+    )
+    parser.add_argument(
+        "lane",
+        nargs="?",
+        choices=tuple(LANES),
+        help="Lane to select (omit every position to print the configuration)",
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        help=f"model for that Lane, or {CLEAR_TOKEN!r} to clear it",
+    )
+    parser.add_argument(
+        "effort",
+        nargs="?",
+        help=f"reasoning effort for that Lane, or {CLEAR_TOKEN!r} to clear it",
+    )
+    return parser
+
+
+def names_a_value(position):
+    """Whether this position carries a value to prove, rather than none or a clearing."""
+    return position is not None and position != CLEAR_TOKEN
+
+
+def run_config(argv, environment=None):
+    """The `config` mode end to end: read, prove, write, and say where it stands."""
+    args = build_config_parser().parse_args(argv)
+    try:
+        config = read_machine_config(environment)
+    except MachineConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.lane is None:
+        print("\n".join(config_state_lines(config)))
+        return 0
+    edited = apply_config_edit(config, args.lane, args.model, args.effort)
+    if names_a_value(args.model) or names_a_value(args.effort):
+        refusal = probe_lane(
+            args.lane,
+            edited.choice(args.lane, MODEL_KEY),
+            edited.choice(args.lane, EFFORT_KEY),
+        )
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 1
+    try:
+        write_machine_config(edited)
+    except (MachineConfigError, OSError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print("\n".join(config_state_lines(edited)))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Launch or resume a review on the Lane --reviewer names.",
@@ -4540,9 +5196,9 @@ def build_parser():
     )
     parser.add_argument(
         "--reviewer",
-        required=True,
         choices=tuple(LANES),
-        help="reviewing vendor this review is delivered to",
+        help="reviewing vendor this review is delivered to (default: the "
+             "Machine Config's lane; absent from both, the run stops)",
     )
     parser.add_argument(
         "--base", help="fixed point the Review Scope runs from"
@@ -4571,12 +5227,14 @@ def build_parser():
     parser.add_argument("--approval", default="never")
     parser.add_argument(
         "--model",
-        help="model for this review lineage (default: the reviewer's own config)",
+        help="model for this review lineage (default: the Machine Config's "
+             "entry for the resolved Lane, then the reviewer's own config)",
     )
     parser.add_argument(
         "--effort",
-        help="reasoning effort for this review lineage (default: the reviewer's "
-             "own config)",
+        help="reasoning effort for this review lineage (default: the Machine "
+             "Config's entry for the resolved Lane, then the reviewer's own "
+             "config)",
     )
     parser.add_argument(
         "--standards-model",
@@ -4622,7 +5280,8 @@ def build_parser():
         parser.add_argument(
             f"--on-{point}",
             help=f"command to run {fires}, in the reviewed working directory "
-                 f"with this review's facts in its environment (default: "
+                 f"with this review's facts in its environment (default: the "
+                 f"Machine Config's [hooks] entry for this point, then "
                  f"nothing runs)",
         )
     parser.add_argument("--tmux-target", help=argparse.SUPPRESS)
@@ -4744,6 +5403,9 @@ def parse_args(argv=None):
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    # Before every other check, because the Lane a check may name is not settled
+    # until this has run.
+    resolve_machine_config(parser, args)
     document_axes = REVIEW_KINDS[DOCUMENT_REVIEW_KIND].axes
     if not args.document and args.axis in document_axes:
         parser.error(
@@ -4813,6 +5475,10 @@ def main():
         args = build_tui_proxy_parser().parse_args(sys.argv[2:])
         asyncio.run(run_tui_proxy(args))
         return 0
+    # The one public mode, selected the way the private ones are. It runs no
+    # review, so it fires no lifecycle point and takes none of what follows.
+    if len(sys.argv) > 1 and sys.argv[1] == CONFIG_MODE:
+        return run_config(sys.argv[2:])
     args = parse_args()
     # A review no result was ever reached for is a failed one, until the result
     # itself says otherwise.

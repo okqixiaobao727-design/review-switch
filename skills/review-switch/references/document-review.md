@@ -34,16 +34,16 @@ Use `requirements`, `design`, or `both` for the axis; use `both` when the caller
 Make one call from the repository being reviewed, with no fixed point, spec, or session handle:
 
 ```bash
-review-bridge --reviewer '<LANE>' \
+review-bridge [--reviewer '<LANE>'] \
   --parent '<PARENT>' \
   --document '<DOCUMENT>' --document '<DOCUMENT>' \
-  --axis '<AXIS>' \
-  <LIFECYCLE_HOOK_OPTIONS>
+  --axis '<AXIS>'
 ```
 
 Omit the `--parent` line when there is no Parent, and repeat `--document` once per assembled
 reference. Pass the caller's other Bridge options exactly as asked; an option they did not ask for
-stays omitted. The configured Lane and lifecycle hooks keep the rules in `SKILL.md`.
+stays omitted. `--reviewer` keeps the rule in `SKILL.md`: pass it only where the caller named
+a Lane, and leave the Bridge to resolve it otherwise.
 
 The call is complete when every assembled reference appears once, the axis matches the caller's
 ask, and no `--base` or `--spec` is present. Run it, then continue at Result in `SKILL.md`.
@@ -53,7 +53,7 @@ ask, and no `--base` or `--spec` is present. Run it, then continue at Result in 
 Replace the Code Review preparation line with:
 
 ```markdown
-Parent: <preparation.parentSource> · Documents: <n> · Standards: <preparation.standardsCondition>
+Parent: <preparation.parentSource> · Documents: <n> · Standards: <preparation.standardsCondition> · Lane: <preparation.lane> (<preparation.laneSource>)
 ```
 
 Then write one line per returned axis using the Result rules in `SKILL.md`. If the first line of a
