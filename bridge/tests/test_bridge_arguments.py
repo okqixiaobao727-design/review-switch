@@ -3,11 +3,14 @@
 
 import contextlib
 import io
+import json
 import pathlib
+import os
 import tempfile
 import unittest
+from unittest import mock
 
-from bridge_harness import load_bridge
+from bridge_harness import load_bridge, redirect_machine_config
 
 
 class ArgumentTests(unittest.TestCase):
@@ -15,6 +18,7 @@ class ArgumentTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
 
     def test_parser_accepts_the_review_preparation_inputs(self):
         args = self.bridge.parse_args(
@@ -198,6 +202,7 @@ class ArgumentTests(unittest.TestCase):
 class RecoveryParserTests(unittest.TestCase):
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
 
     def test_recovery_needs_no_preparation_inputs(self):
         args = self.bridge.parse_args(["--reviewer", "codex", "--recover-session"])
@@ -278,6 +283,7 @@ class ReviewerParserTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
 
     def parse_failure(self, argv):
         """The message a rejected command line leaves on stderr."""
@@ -317,6 +323,7 @@ class LifecycleHookParserTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
 
     def test_the_bridge_takes_no_argument_naming_a_caller_log_or_ticket(self):
         for argument in ("--machine-log", "--ticket"):
@@ -364,6 +371,7 @@ class CallerResponseParserTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
         self.root = pathlib.Path(self.work.name)
@@ -495,6 +503,7 @@ class LaneArgumentTests(unittest.TestCase):
 
     def setUp(self):
         self.bridge = load_bridge()
+        redirect_machine_config(self)
 
     def test_the_reviewer_argument_accepts_both_lanes(self):
         for reviewer in ("codex", "claude"):
@@ -511,6 +520,332 @@ class LaneArgumentTests(unittest.TestCase):
             ["--reviewer", "claude", "--base", "main", "--account", "/profiles/a"]
         )
         self.assertEqual(args.account, "/profiles/a")
+
+
+class MachineConfigPathTests(unittest.TestCase):
+    """Where the Bridge looks for the one file this machine configures it with."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.root = pathlib.Path(self.work.name)
+
+    def path_under(self, **environment):
+        return self.bridge.machine_config_path(environment)
+
+    def test_the_override_replaces_the_file_wholesale(self):
+        override = str(self.root / "elsewhere.toml")
+
+        resolved = self.path_under(
+            REVIEW_SWITCH_CONFIG=override,
+            XDG_CONFIG_HOME=str(self.root / "xdg"),
+            HOME=str(self.root / "home"),
+        )
+
+        self.assertEqual(resolved, pathlib.Path(override))
+
+    def test_without_the_override_the_xdg_directory_holds_it(self):
+        resolved = self.path_under(
+            XDG_CONFIG_HOME=str(self.root / "xdg"),
+            HOME=str(self.root / "home"),
+        )
+
+        self.assertEqual(
+            resolved, self.root / "xdg" / "review-switch" / "config.toml"
+        )
+
+    def test_without_xdg_either_the_home_fallback_holds_it(self):
+        resolved = self.path_under(HOME=str(self.root / "home"))
+
+        self.assertEqual(
+            resolved,
+            self.root / "home" / ".config" / "review-switch" / "config.toml",
+        )
+
+    def test_a_relative_override_names_no_file(self):
+        """A relative path would name one file per directory a review runs from."""
+        with self.assertRaises(self.bridge.MachineConfigError) as raised:
+            self.path_under(REVIEW_SWITCH_CONFIG="review-switch.toml")
+
+        self.assertIn("review-switch.toml", str(raised.exception))
+
+    def test_an_empty_override_is_no_override(self):
+        resolved = self.path_under(
+            REVIEW_SWITCH_CONFIG="",
+            XDG_CONFIG_HOME=str(self.root / "xdg"),
+            HOME=str(self.root / "home"),
+        )
+
+        self.assertEqual(
+            resolved, self.root / "xdg" / "review-switch" / "config.toml"
+        )
+
+
+class MachineConfigResolutionTests(unittest.TestCase):
+    """One rule for every value: argument, then Machine Config, then the vendor."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.config = redirect_machine_config(self)
+
+    def write(self, text):
+        self.config.write_text(text, encoding="utf-8")
+
+    def resolve(self, *arguments):
+        return self.bridge.parse_args(["--base", "main", *arguments])
+
+    def refuse(self, *arguments):
+        """The message a call the Machine Config stops comes back with."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                self.resolve(*arguments)
+        self.assertEqual(raised.exception.code, 2)
+        return stderr.getvalue()
+
+    # -- the Lane ---------------------------------------------------------
+
+    def test_an_argument_names_the_lane_and_says_so(self):
+        args = self.resolve("--reviewer", "claude")
+
+        self.assertEqual(args.reviewer, "claude")
+        self.assertEqual(args.lane_source, "caller")
+
+    def test_the_machine_config_names_the_lane_where_the_argument_is_silent(self):
+        self.write('lane = "claude"\n')
+
+        args = self.resolve()
+
+        self.assertEqual(args.reviewer, "claude")
+        self.assertEqual(args.lane_source, "config")
+
+    def test_an_argument_beats_a_file_that_names_another_lane(self):
+        self.write('lane = "claude"\n')
+
+        args = self.resolve("--reviewer", "codex")
+
+        self.assertEqual(args.reviewer, "codex")
+        self.assertEqual(args.lane_source, "caller")
+
+    def test_a_lane_named_by_neither_stops_the_run(self):
+        message = self.refuse()
+
+        self.assertIn("--reviewer", message)
+        self.assertIn(str(self.config), message)
+
+    # -- model and effort -------------------------------------------------
+
+    def test_an_argument_names_the_model_and_effort_and_says_so(self):
+        args = self.resolve(
+            "--reviewer", "codex", "--model", "chosen", "--effort", "max"
+        )
+
+        self.assertEqual((args.model, args.model_source), ("chosen", "caller"))
+        self.assertEqual((args.effort, args.effort_source), ("max", "caller"))
+
+    def test_the_machine_config_names_them_where_the_arguments_are_silent(self):
+        self.write(
+            'lane = "codex"\n\n[codex]\nmodel = "gpt-5.6-sol"\neffort = "medium"\n'
+        )
+
+        args = self.resolve()
+
+        self.assertEqual(
+            (args.model, args.model_source), ("gpt-5.6-sol", "config")
+        )
+        self.assertEqual((args.effort, args.effort_source), ("medium", "config"))
+
+    def test_neither_argument_nor_file_leaves_them_to_the_vendor(self):
+        args = self.resolve("--reviewer", "codex")
+
+        self.assertEqual((args.model, args.model_source), (None, "vendor"))
+        self.assertEqual((args.effort, args.effort_source), (None, "vendor"))
+
+    def test_an_argument_beats_a_file_that_names_another_model_or_effort(self):
+        self.write('[codex]\nmodel = "configured"\neffort = "low"\n')
+
+        args = self.resolve(
+            "--reviewer", "codex", "--model", "asked-for", "--effort", "max"
+        )
+
+        self.assertEqual((args.model, args.model_source), ("asked-for", "caller"))
+        self.assertEqual((args.effort, args.effort_source), ("max", "caller"))
+
+    def test_a_named_lane_selects_its_own_model_and_effort(self):
+        self.write(
+            'lane = "codex"\n\n'
+            '[codex]\nmodel = "codex-model"\neffort = "low"\n\n'
+            '[claude]\nmodel = "claude-model"\neffort = "max"\n'
+        )
+
+        args = self.resolve("--reviewer", "claude")
+
+        self.assertEqual(args.reviewer, "claude")
+        self.assertEqual(args.model, "claude-model")
+        self.assertEqual(args.effort, "max")
+
+    def test_a_lane_read_from_the_file_selects_its_own_model_and_effort(self):
+        self.write(
+            'lane = "claude"\n\n'
+            '[codex]\nmodel = "codex-model"\neffort = "low"\n\n'
+            '[claude]\nmodel = "claude-model"\neffort = "max"\n'
+        )
+
+        args = self.resolve()
+
+        self.assertEqual(args.reviewer, "claude")
+        self.assertEqual(args.model, "claude-model")
+        self.assertEqual(args.effort, "max")
+
+    def test_an_absent_file_leaves_every_other_value_unpinned(self):
+        self.config.unlink(missing_ok=True)
+
+        args = self.resolve("--reviewer", "codex")
+
+        self.assertEqual(args.reviewer, "codex")
+        self.assertIsNone(args.model)
+        self.assertIsNone(args.effort)
+        for point in self.bridge.HOOK_POINTS:
+            self.assertIsNone(
+                getattr(args, self.bridge.hook_destination(point))
+            )
+
+    def test_a_key_that_is_simply_absent_falls_through_silently(self):
+        self.write('lane = "codex"\n\n[codex]\nmodel = "only-a-model"\n')
+
+        args = self.resolve()
+
+        self.assertEqual((args.model, args.model_source), ("only-a-model", "config"))
+        self.assertEqual((args.effort, args.effort_source), (None, "vendor"))
+
+    # -- strictness -------------------------------------------------------
+
+    def test_a_relative_override_stops_the_run_naming_it(self):
+        with mock.patch.dict(
+            os.environ, {"REVIEW_SWITCH_CONFIG": "review-switch.toml"}
+        ):
+            message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("REVIEW_SWITCH_CONFIG", message)
+        self.assertIn("review-switch.toml", message)
+
+    def test_a_malformed_file_stops_the_run_naming_it(self):
+        self.write("lane = \n")
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn(str(self.config), message)
+
+    def test_an_unknown_key_stops_the_run_naming_the_key(self):
+        self.write('lane = "codex"\nlanes = "codex"\n')
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("lanes", message)
+        self.assertIn(str(self.config), message)
+
+    def test_an_unknown_key_inside_a_lane_table_stops_the_run(self):
+        self.write('[codex]\nmodle = "typo"\n')
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("modle", message)
+
+    def test_an_unknown_hook_point_stops_the_run(self):
+        self.write('[hooks]\nreview-middle = "notify"\n')
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("review-middle", message)
+
+    def test_an_unknown_lane_name_stops_the_run_naming_it(self):
+        self.write('lane = "gemini"\n')
+
+        message = self.refuse()
+
+        self.assertIn("gemini", message)
+
+    def test_an_unknown_lane_table_stops_the_run_naming_it(self):
+        self.write('[gemini]\nmodel = "whatever"\n')
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("gemini", message)
+
+    def test_a_value_of_the_wrong_kind_stops_the_run_naming_the_key(self):
+        self.write("[codex]\nmodel = 5\n")
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("model", message)
+
+    def test_the_machine_config_offers_no_per_axis_model_or_effort(self):
+        self.write('[codex]\nstandards-model = "pinned"\n')
+
+        message = self.refuse("--reviewer", "codex")
+
+        self.assertIn("standards-model", message)
+
+    def test_the_per_axis_options_keep_their_relationship_to_the_whole_review(self):
+        self.write('[codex]\nmodel = "whole-review"\neffort = "low"\n')
+
+        args = self.resolve("--reviewer", "codex", "--spec-model", "spec-only")
+
+        self.assertEqual(
+            self.bridge.resolve_axis_choice(args, "spec", "model"), "spec-only"
+        )
+        self.assertEqual(
+            self.bridge.resolve_axis_choice(args, "standards", "model"),
+            "whole-review",
+        )
+        self.assertEqual(
+            self.bridge.resolve_axis_choice(args, "spec", "effort"), "low"
+        )
+
+    # -- Lifecycle Hooks --------------------------------------------------
+
+    def test_hook_commands_reach_the_bridge_from_the_file(self):
+        commands = {
+            "child-launch": "notify 'a child' --with \"quotes\"",
+            "review-start": "notify a review   spaced out",
+            "axis-end": "notify --axis end",
+            "review-end": "notify --review end",
+        }
+        # TOML's basic string escapes the same way JSON's does, so a command
+        # carrying quotes reaches the file as its author wrote it.
+        self.write(
+            "[hooks]\n"
+            + "".join(
+                f"{point} = {json.dumps(command)}\n"
+                for point, command in commands.items()
+            )
+        )
+
+        args = self.resolve("--reviewer", "codex")
+
+        for point, command in commands.items():
+            self.assertEqual(
+                self.bridge.hook_command(args, point), command, point
+            )
+
+    def test_an_option_beats_a_hook_the_file_names(self):
+        self.write('[hooks]\nreview-start = "from the file"\n')
+
+        args = self.resolve(
+            "--reviewer", "codex", "--on-review-start", "from the option"
+        )
+
+        self.assertEqual(
+            self.bridge.hook_command(args, "review-start"), "from the option"
+        )
+
+    def test_a_hook_point_the_file_leaves_out_stays_unset(self):
+        self.write('[hooks]\nreview-start = "from the file"\n')
+
+        args = self.resolve("--reviewer", "codex")
+
+        self.assertEqual(self.bridge.hook_command(args, "axis-end"), "")
 
 
 if __name__ == "__main__":

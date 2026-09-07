@@ -120,6 +120,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "codex",
+                "laneSource": "caller",
             },
         )
 
@@ -180,6 +182,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "codex",
+                "laneSource": "caller",
             },
         )
 
@@ -225,6 +229,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "codex",
+                "laneSource": "caller",
             },
         )
 
@@ -266,6 +272,8 @@ class DocumentReviewCommandTests(FakePaneTestCase):
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "codex",
+                "laneSource": "caller",
             },
         )
 
