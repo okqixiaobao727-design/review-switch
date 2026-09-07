@@ -1,20 +1,14 @@
 ---
 name: review-switch
-description: Dispatch a review to the reviewer lane this machine is configured for. Use when a review is asked for without naming a lane, or when a review-skill invocation was refused and pointed here.
-allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(gh api:*), Bash(bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh:*), Bash(review-bridge:*)
+description: Dispatch a review to the Bridge, which resolves the reviewer Lane from this machine's Machine Config. Use when a review is asked for without naming a lane, or when a review-skill invocation was refused and pointed here.
+allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(gh api:*), Bash(review-bridge:*)
 ---
-
-!`bash ~/.claude/skills/review-switch/scripts/resolve-machine-config.sh`
 
 You are the Dispatcher: the entry point for a review asked for from inside a Claude session.
 The review itself runs outside this session, in the Bridge — `review-bridge`, which owns
 preparation, both Axis Briefs, delivery to the Lane, the result contract, and the round cap.
-Your work is to complete the two references the Bridge cannot know, hand it what this machine
-and this caller configured, and report back what it returns.
-
-The lines above are this machine's configuration, and this skill is the only place they are
-read. Use the Lane named there unless the caller named one, and append the hook options exactly
-as printed unless they read `none configured`.
+Your work is to complete the two references the Bridge cannot know, hand it what this caller
+asked for, and report back what it returns.
 
 When the caller asks to review documents — a spec, a ticket set, an issue's sub-issues, or a
 `crewtask/<n>/` run — rather than a change, read `references/document-review.md` and use it to
@@ -45,25 +39,24 @@ When the caller supplies no spec reference, locate the reference without opening
 Make one Bridge call from the repository being reviewed, with no session handle:
 
 ```bash
-review-bridge --reviewer '<LANE>' \
-  --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis '<AXIS>' \
-  <LIFECYCLE_HOOK_OPTIONS>
+review-bridge [--reviewer '<LANE>'] \
+  --base '<FIXED_POINT>' --spec '<SPEC_REFERENCE>' --axis '<AXIS>'
 ```
 
 For a confirmed no-spec review, omit `--spec` and pass `--axis standards`.
 
 Pass on what the caller asked for, and nothing they did not:
 
-- **Lane** — a Lane the caller named overrides the configured one. `claude` and `codex` are the
-  two.
+- **Lane** — `--reviewer`, and only where the caller named one; `claude` and `codex` are the
+  two. Left off, the Lane is the Bridge's to settle.
 - **Axis** — `standards`, `spec`, or `both`.
 - **Model and effort** — `--model` and `--effort` for the whole review, or `--standards-model`,
   `--standards-effort`, `--spec-model`, and `--spec-effort` to pin one axis at a time.
 - **Anything else the Bridge accepts** — `--help` is the source of truth for its options.
 
-An option the caller did not ask for is an option you do not pass: an omitted model or effort
-means the reviewing vendor's own configuration applies, and pinning one behind the caller's back
-is the one thing this skill must not do.
+An option the caller did not ask for is an option you do not pass: an omitted value is answered
+by this machine's configuration, and by the reviewing vendor's own where that is silent too.
+Pinning a value behind the caller's back is the one thing this skill must not do.
 
 ## Result
 
@@ -129,10 +122,17 @@ any). Don't pick a single winner across axes — that's the reranking the separa
 prevent. So, for a `both` review:
 
 ```markdown
-Spec source: <preparation.specSource> · Code graph: <preparation.codeGraphUsed>
-Standards — <n> findings; worst: <one clause>. Report: <axes.standards.reportFile>
-Spec — <n> findings; worst: <one clause>. Report: <axes.spec.reportFile>
+Spec source: <preparation.specSource> · Code graph: <preparation.codeGraphUsed> · Lane: <preparation.lane> (<preparation.laneSource>)
+Standards (<model> [<source>], <effort> [<source>]) — <n> findings; worst: <one clause>. Report: <axes.standards.reportFile>
+Spec (<model> [<source>], <effort> [<source>]) — <n> findings; worst: <one clause>. Report: <axes.spec.reportFile>
 ```
+
+What the review ran as is read back from the result, never restated from what you passed. The
+preparation line names `preparation.lane` with `preparation.laneSource` in parentheses; each axis
+line names that axis's `resolvedModel` and `resolvedEffort`, each with its own
+`resolvedModelSource` or `resolvedEffortSource` in brackets. A source of `caller`, `config` or
+`vendor` is what lets the reader tell a value they pinned from one the machine or the vendor
+chose. A `resolvedEffort` of `null` reads `effort unpinned [vendor]`.
 
 The preparation line states `preparation.specSource` verbatim and `preparation.codeGraphUsed`, on
 every review. `not fetched: <reference>` means the Bridge could not obtain that spec and the Lane

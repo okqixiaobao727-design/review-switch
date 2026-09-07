@@ -26,7 +26,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("python -m pytest", self.workflow)
         self.assertIn("bash hook/tests/test-review-adjudicator.sh", self.workflow)
         self.assertIn(
-            "bash skills/review-switch/tests/test-resolve-machine-config.sh",
+            "bash skills/review-switch/tests/test-skill-contract.sh",
             self.workflow,
         )
         self.assertIn("python scripts/validate_plugin_tree.py --root .", self.workflow)
