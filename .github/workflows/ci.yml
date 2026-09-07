@@ -34,5 +34,7 @@ jobs:
         run: bash skills/review-switch/tests/test-resolve-machine-config.sh
       - name: Run Dispatcher contract tests
         run: bash skills/review-switch/tests/test-skill-contract.sh
+      - name: Run review switcher tests
+        run: bash shell/tests/test-review-switcher.sh
       - name: Run Residue Lint
         run: python scripts/validate_plugin_tree.py --root .
