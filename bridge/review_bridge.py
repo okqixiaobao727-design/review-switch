@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import fcntl
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -41,7 +42,7 @@ import time
 import tomllib
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from types import MappingProxyType
 
 try:
@@ -4865,6 +4866,318 @@ def resolve_machine_config(parser, args, environment=None):
     return args
 
 
+# ---------------------------------------------------------------------------
+# The `config` mode: the Machine Config's one writer.
+#
+# A public mode selected the way the private ones are — by the first token —
+# because it is a different command from a review and shares none of a review's
+# command line. It reads, edits and writes the file; nothing else writes it, so
+# the shipped switcher and every later writer hold one grammar between them and
+# no knowledge of the format at all.
+#
+# Setting a model or an effort is proved before it lands. The proof is the
+# Bridge's own health probe, run on the target Lane with the values the file is
+# about to carry, so "you may not use this model" is answered in the vendor's
+# own words and nothing here has to keep a list of model IDs that a vendor's
+# next release would make wrong. There is no flag to skip it: the mode takes
+# positions and nothing else. Setting only the Lane, and clearing a value, prove
+# nothing and reach no network — there is no new value to be refused.
+# ---------------------------------------------------------------------------
+CONFIG_MODE = "config"
+#: The position that says "carry no value here", rather than a value to prove.
+CLEAR_TOKEN = "-"
+#: What a line prints where neither this file nor an argument named a value.
+UNSET_VALUE = "none"
+#: The layer that chose a value where no layer could: this machine named no
+#: Lane, so nothing downstream of the Lane has been reached at all.
+SOURCE_UNSET = "unset"
+CONFIG_STATE_LABELS = (
+    ("Lane", LANE_KEY), ("Model", MODEL_KEY), ("Effort", EFFORT_KEY)
+)
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def toml_key(key):
+    """One table or value key, bare where TOML allows it and quoted where not."""
+    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
+
+
+#: The one character JSON leaves bare that a TOML basic string may not carry.
+#: TOML's unescaped set stops at %x7E and resumes at %x80, so DELETE has to be
+#: escaped by hand; every other control character JSON already escapes, and TOML
+#: admits the literal non-ASCII above it.
+TOML_FORBIDDEN_BARE = ((chr(0x7F), "\\u007f"),)
+
+
+def toml_string(value):
+    """One string as a TOML basic string, escaped so it reads back unchanged.
+
+    JSON's own escaping of a `str` is very nearly a TOML basic string — every
+    escape JSON emits is a TOML escape — so the escape table is JSON's and not a
+    hand-rolled one to keep correct. The one gap is closed above: a character
+    TOML excludes from its unescaped set that JSON hands back bare would produce
+    a file this Bridge's own reader then refuses.
+    """
+    written = json.dumps(value, ensure_ascii=False)
+    for character, escape in TOML_FORBIDDEN_BARE:
+        written = written.replace(character, escape)
+    return written
+
+
+def serialize_machine_config(config):
+    """One Machine Config as the text this repository writes for it.
+
+    Every value the file carries is preserved — the Lane, both Lane tables and
+    `[hooks]` — in this Bridge's own order. Comments and layout are not: the
+    file's meaning is its keys, and a writer that re-created a person's
+    formatting would be a second parser to keep correct.
+    """
+    blocks = []
+    if config.lane is not None:
+        blocks.append(f"{toml_key(LANE_KEY)} = {toml_string(config.lane)}\n")
+    for name in LANES:
+        table = config.lanes.get(name)
+        if not table:
+            continue
+        lines = [f"[{toml_key(name)}]\n"]
+        lines.extend(
+            f"{toml_key(key)} = {toml_string(table[key])}\n"
+            for key in LANE_TABLE_KEYS
+            if key in table
+        )
+        blocks.append("".join(lines))
+    if config.hooks:
+        lines = [f"[{toml_key(HOOKS_TABLE)}]\n"]
+        lines.extend(
+            f"{toml_key(point)} = {toml_string(config.hooks[point])}\n"
+            for point in HOOK_POINTS
+            if point in config.hooks
+        )
+        blocks.append("".join(lines))
+    return "\n".join(blocks)
+
+
+def write_machine_config(config):
+    """Put this Machine Config in place, or leave the one there untouched.
+
+    The text is read back through this Bridge's own reader before any of it
+    reaches the file, so a value that would not parse — or that this Bridge
+    would refuse to read — fails while the file on disk is still the old one.
+    The file then arrives whole, by a rename over a sibling temporary, because a
+    half-written configuration is one no review could run from.
+    """
+    text = serialize_machine_config(config)
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise MachineConfigError(
+            f"the Machine Config this write produced is not valid TOML: {error}"
+        ) from error
+    parse_machine_config(config.path, document)
+    config.path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=config.path.parent,
+        prefix=f".{config.path.name}.",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, config.path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+    return config.path
+
+
+def apply_config_edit(config, lane, model, effort):
+    """This Machine Config with one Lane's entries edited, and that Lane selected.
+
+    Naming a Lane always selects it, and says nothing about that Lane's model or
+    effort: switching Lane carries switching to that Lane's own values, which is
+    why they are keyed by Lane at all. A position left out is left alone, and
+    the clearing token removes the key rather than writing an empty value.
+    """
+    lanes = {name: dict(table) for name, table in config.lanes.items()}
+    table = lanes.setdefault(lane, {})
+    for key, value in ((MODEL_KEY, model), (EFFORT_KEY, effort)):
+        if value is None:
+            continue
+        if value == CLEAR_TOKEN:
+            table.pop(key, None)
+        else:
+            table[key] = value
+    if not table:
+        lanes.pop(lane)
+    return dataclasses.replace(config, lane=lane, lanes=lanes)
+
+
+def config_state_lines(config):
+    """What this machine now says, in the order a person reads it.
+
+    The Lane, and that Lane's model and effort, each with the layer that chose
+    it. `config` is this file; `vendor` is the reviewing vendor's own
+    configuration, which is what a value this file leaves out falls to. A
+    machine that has named no Lane falls to neither: no vendor was selected to
+    answer for the model or the effort, and no vendor names the Lane itself, so
+    a review from here stops until one is named. That state is `unset`, and
+    saying `vendor` for it would credit a layer that was never reached.
+    """
+    if config.lane is None:
+        return [
+            f"{label}: {UNSET_VALUE} ({SOURCE_UNSET})"
+            for label, _key in CONFIG_STATE_LABELS
+        ]
+    values = {
+        LANE_KEY: config.lane,
+        MODEL_KEY: config.choice(config.lane, MODEL_KEY),
+        EFFORT_KEY: config.choice(config.lane, EFFORT_KEY),
+    }
+    return [
+        f"{label}: {UNSET_VALUE if values[key] is None else values[key]} "
+        f"({SOURCE_VENDOR if values[key] is None else SOURCE_CONFIG})"
+        for label, key in CONFIG_STATE_LABELS
+    ]
+
+
+def probe_arguments(lane, model, effort):
+    """The health probe this candidate is proved by, in the shape a review runs.
+
+    Built on the review parser so the probe is the Bridge's existing one and not
+    a second path to the Lane. The Machine Config is deliberately not resolved
+    into it: the values proved are this write's candidates, and a hook this
+    machine configured belongs to a review, which a proof is not.
+    """
+    argv = ["--reviewer", lane, "--probe"]
+    for option, value in (("--model", model), ("--effort", effort)):
+        if value is not None:
+            argv.extend([option, value])
+    args = build_parser().parse_args(argv)
+    args.machine_config = None
+    args.lane_source = SOURCE_CALLER
+    args.model_source = SOURCE_CALLER if model is not None else SOURCE_VENDOR
+    args.effort_source = SOURCE_CALLER if effort is not None else SOURCE_VENDOR
+    args.resolved_arguments = []
+    args.caller_arguments = []
+    args.resume_state = None
+    args.status = FAILED_STATUS
+    return args
+
+
+def probe_failure(output):
+    """The vendor's own words for why the probe failed, from the probe's result.
+
+    Both halves of what the Lane said are carried: the Bridge's own reason names
+    the *kind* of failure, and the axis's final message is the text the vendor
+    itself produced — which is where a refused model is explained, and the whole
+    reason nothing here keeps a list of model IDs.
+    """
+    try:
+        result = json.loads(output)
+    except json.JSONDecodeError:
+        return output.strip()
+    said = [
+        line
+        for axis in result.get("axes", {}).values()
+        for line in (axis.get("reason"), axis.get("finalMessage"))
+        if line and line.strip()
+    ]
+    return "\n".join(said) if said else output.strip()
+
+
+def probe_lane(lane, model, effort):
+    """Prove these values against this Lane, or say why the Lane refused them.
+
+    The probe's own result is swallowed where it succeeded: a person setting a
+    model asked for the model to be set, not for a review's JSON.
+    """
+    args = probe_arguments(lane, model, effort)
+    printed = io.StringIO()
+    try:
+        with redirect_stdout(printed):
+            code = asyncio.run(run_bridge(args))
+    except (AppServerError, OSError, RuntimeError) as error:
+        return str(error)
+    return None if code == 0 else probe_failure(printed.getvalue())
+
+
+def build_config_parser():
+    """The `config` mode's whole grammar: three positions and no options.
+
+    Positions rather than options so the shipped switcher forwards what it was
+    given and holds no grammar of its own. No option is offered because the one
+    a caller would reach for is a way past the proof, and there is none.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"review-bridge {CONFIG_MODE}",
+        description=(
+            "Print this machine's review configuration, or set it. Naming a "
+            "Lane selects it; a model or an effort is proved against that Lane "
+            f"before it is written; {CLEAR_TOKEN!r} clears a value, and a "
+            "position left out is left as it was."
+        ),
+    )
+    parser.add_argument(
+        "lane",
+        nargs="?",
+        choices=tuple(LANES),
+        help="Lane to select (omit every position to print the configuration)",
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        help=f"model for that Lane, or {CLEAR_TOKEN!r} to clear it",
+    )
+    parser.add_argument(
+        "effort",
+        nargs="?",
+        help=f"reasoning effort for that Lane, or {CLEAR_TOKEN!r} to clear it",
+    )
+    return parser
+
+
+def names_a_value(position):
+    """Whether this position carries a value to prove, rather than none or a clearing."""
+    return position is not None and position != CLEAR_TOKEN
+
+
+def run_config(argv, environment=None):
+    """The `config` mode end to end: read, prove, write, and say where it stands."""
+    args = build_config_parser().parse_args(argv)
+    try:
+        config = read_machine_config(environment)
+    except MachineConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if args.lane is None:
+        print("\n".join(config_state_lines(config)))
+        return 0
+    edited = apply_config_edit(config, args.lane, args.model, args.effort)
+    if names_a_value(args.model) or names_a_value(args.effort):
+        refusal = probe_lane(
+            args.lane,
+            edited.choice(args.lane, MODEL_KEY),
+            edited.choice(args.lane, EFFORT_KEY),
+        )
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 1
+    try:
+        write_machine_config(edited)
+    except (MachineConfigError, OSError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print("\n".join(config_state_lines(edited)))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Launch or resume a review on the Lane --reviewer names.",
@@ -5162,6 +5475,10 @@ def main():
         args = build_tui_proxy_parser().parse_args(sys.argv[2:])
         asyncio.run(run_tui_proxy(args))
         return 0
+    # The one public mode, selected the way the private ones are. It runs no
+    # review, so it fires no lifecycle point and takes none of what follows.
+    if len(sys.argv) > 1 and sys.argv[1] == CONFIG_MODE:
+        return run_config(sys.argv[2:])
     args = parse_args()
     # A review no result was ever reached for is a failed one, until the result
     # itself says otherwise.

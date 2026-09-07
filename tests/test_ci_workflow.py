@@ -31,6 +31,14 @@ class CiWorkflowTests(unittest.TestCase):
         )
         self.assertIn("python scripts/validate_plugin_tree.py --root .", self.workflow)
 
+    def test_ci_runs_the_review_switcher_suite(self):
+        """No other suite executes the shipped function, so this one has to run.
+
+        The switcher is a shell function this repository ships to be sourced; its whole
+        grammar can break with every Python suite green, because nothing else calls it.
+        """
+        self.assertIn("bash shell/tests/test-review-switcher.sh", self.workflow)
+
     def test_ci_installs_the_bridge_runtime_dependency(self):
         self.assertIn("aiohttp", self.workflow)
 
