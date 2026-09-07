@@ -49,6 +49,14 @@ require_text 'Bash(gh api:*)'
 require_text 'When the caller asks to review documents'
 require_text 'read `references/document-review.md`'
 require_text 'The Result section and everything after it apply unchanged.'
+require_text 'preparation.lane'
+require_text 'preparation.laneSource'
+require_text 'resolvedModelSource'
+require_text 'resolvedEffortSource'
+require_text "review-bridge [--reviewer '<LANE>']"
+refuse_text 'resolve-machine-config.sh'
+refuse_text 'append the hook options'
+refuse_text '<LIFECYCLE_HOOK_OPTIONS>'
 refuse_text '/tmp/review-response'
 refuse_text '--resume-session'
 refuse_text 'partially_completed'
@@ -62,7 +70,7 @@ else
   require_reference_text 'select(.state == "open")'
   require_reference_text 'docs/agents/issue-tracker.md'
   require_reference_text "--document '#<number>'"
-  require_reference_text 'Parent: <preparation.parentSource> · Documents: <n> · Standards: <preparation.standardsCondition>'
+  require_reference_text 'Parent: <preparation.parentSource> · Documents: <n> · Standards: <preparation.standardsCondition> · Lane: <preparation.lane> (<preparation.laneSource>)'
   require_reference_text 'codebase-design` skill could not be loaded'
 fi
 

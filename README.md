@@ -170,17 +170,17 @@ forwards to `review-bridge config`, so the file has exactly one writer.
 
 ## Asking from inside a Claude session
 
-`/review-switch` is the Dispatcher, and the only skill this project installs. It resolves the
-Lane this machine is configured for, completes the fixed point and the spec reference, and calls
-`review-bridge` — the same command a terminal runs.
+`/review-switch` is the Dispatcher, and the only skill this project installs. It completes the
+fixed point and the spec reference, and calls `review-bridge` — the same command a terminal runs.
 
-Two files configure it, and the Dispatcher is the only thing that reads either:
+It reads no configuration of its own: it passes on what you asked for and nothing else, so the
+Lane, its model and effort, and the Lifecycle Hook commands all come from the Machine Config the
+`review` switcher writes, exactly as they do for a terminal call. A Lane you name when you ask is
+an argument like any other, and beats the file.
 
-- `~/.claude/code-reviewer` — the exact value `codex` selects the codex Lane; any other value or
-  a missing file selects the claude Lane. A Lane you name when you ask overrides it.
-- `~/.claude/review-hooks/` — one file per lifecycle point, named `child-launch`,
-  `review-start`, `axis-end`, or `review-end`, each holding one command. A missing directory,
-  missing file, or blank file leaves that point unset.
+Every review it reports back names what that review ran as, read from the Bridge's own result:
+the Lane on the preparation line, the model and effort on each axis's line, and beside each one
+whether you pinned it, this machine did, or the vendor answered.
 
 ## Dependencies
 
