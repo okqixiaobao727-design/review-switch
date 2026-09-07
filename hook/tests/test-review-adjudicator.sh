@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Black-box suite for the review adjudicator hook: PreToolUse JSON on stdin plus environment in,
+# Black-box suite for the review adjudicator hook: host event JSON on stdin plus environment in,
 # decision JSON on stdout. Nothing here reaches into the script's internals.
-#
-# Case inventory is the decision table the Adjudicator now holds: coordinator standdown across
-# both governed targets, the plugin reviewer denied whatever it is called with, and the
-# Dispatcher — the one skill left — allowed. Every case runs with no reviewer configuration in
-# reach, because the Adjudicator reads none: the Dispatcher is where that file is read.
 #
 # Run: bash hook/tests/test-review-adjudicator.sh
 # ADJUDICATOR_UNDER_TEST overrides the script under test (defaults to the sibling copy).
@@ -26,6 +21,8 @@ trap cleanup EXIT
 # A home with no reviewer configuration in it, and a config path that names nothing. A
 # decision that changes when these change would be a decision read from a file.
 mkdir -p "$test_dir/home"
+
+expected_dispatcher="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/skills/review-switch/SKILL.md"
 
 failures=0
 cases=0
@@ -66,7 +63,7 @@ expect_deny() {
   [ "${1:-}" = "--" ] && shift
   local out decision reason
   cases=$((cases + 1))
-  out=$(run "$coordinator" "$skill" "$args")
+  out=$(run "$coordinator" "$skill" "$args") || fail "$name: nonzero hook exit"
   decision=$(jq -r '.hookSpecificOutput.permissionDecision // ""' <<<"$out" 2>/dev/null)
   if [ "$decision" != "deny" ]; then
     fail "$name: expected permissionDecision deny, got: $out"
@@ -87,7 +84,7 @@ expect_deny() {
 plugin=mattpocock-skills:code-review
 
 # --- Row 1: a coordinator owns review here; every governed target stands down -----------------
-for target in "$plugin" review-switch; do
+for target in "$plugin" code-review review-switch; do
   expect_deny "standdown/$target" orchestrate "$target" "" -- \
     "orchestrate" "already given to this session"
 done
@@ -114,13 +111,89 @@ expect_allow "dispatcher/with-target" "" review-switch "review the branch"
 expect_allow "dispatcher/no-target" "" review-switch ""
 expect_allow "dispatcher/reviewer-named" "" review-switch "review the branch --reviewer codex"
 
-# Skills outside the family are none of the Adjudicator's business, and the plugin reviewer is
-# governed under its qualified name only.
+# Skills outside the family are none of the Adjudicator's business.
 expect_allow "ungoverned/other-skill" "" orchestrate ""
-expect_allow "ungoverned/bare-name" "" code-review ""
+expect_deny "review/bare-name" "" code-review "" -- "/review-switch"
 # The lane skills are gone; their names govern nothing.
 expect_allow "ungoverned/retired-cc-lane" "" review-switch-cc "review the branch"
 expect_allow "ungoverned/retired-codex-lane" "" review-switch-codex "review the branch"
+
+# Context-only events retain the host permission flow.
+expect_context() {
+  local name=$1 event=$2 coordinator=$3 payload=$4
+  local out status
+  cases=$((cases + 1))
+  out=$(REVIEW_COORDINATOR="$coordinator" bash "$adjudicator" <<<"$payload")
+  status=$?
+  if [ "$status" -ne 0 ] || ! jq -e --arg event "$event" '
+    .hookSpecificOutput | .hookEventName == $event and
+    (.additionalContext | contains("review")) and
+    (has("permissionDecision") | not)' <<<"$out" >/dev/null; then
+    fail "$name: expected routing context without a permission decision, got: $out"
+  fi
+  if [ -z "$coordinator" ]; then
+    for expected in "$expected_dispatcher" "Inspection alone" "fallback"; do
+      [[ "$out" == *"$expected"* ]] || fail "$name: missing $expected"
+    done
+  fi
+  if [ -n "$coordinator" ] && [[ "$out" != *"$coordinator"* ]]; then
+    fail "$name: coordinator missing"
+  fi
+}
+
+expect_context prompt/implement UserPromptSubmit '' \
+  '{"hook_event_name":"UserPromptSubmit","prompt":"$mattpocock-skills:implement #57"}'
+
+expect_context read/upstream PreToolUse '' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/opt/plugins/mattpocock-skills/9.8/skills/engineering/code-review/SKILL.md"}}'
+expect_context bash/incident PreToolUse '' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cat /home/agent/.codex/plugins/cache/mattpocock/mattpocock-skills/1.2.3/skills/engineering/code-review/SKILL.md"}}'
+expect_context bash/simulation PreToolUse '' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"sed -n \"1,240p\" /new/root/mattpocock-skills/2.0/skills/engineering/code-review/SKILL.md"}}'
+
+expect_context read/marketplace PreToolUse '' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/opt/plugins/marketplaces/mattpocock/skills/engineering/code-review/SKILL.md"}}'
+expect_context bash/marketplace PreToolUse '' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cat /new/root/marketplaces/mattpocock/skills/engineering/code-review/SKILL.md"}}'
+
+for entry in /implement '$implement' /code-review '$code-review' /mattpocock-skills:code-review; do
+  payload=$(jq -n --arg prompt "$entry --base main" '{hook_event_name:"UserPromptSubmit",prompt:$prompt}')
+  expect_context "prompt/$entry" UserPromptSubmit '' "$payload"
+  expect_context "coordinator/$entry" UserPromptSubmit owner-runner "$payload"
+done
+expect_context coordinator/read PreToolUse owner-runner \
+  '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/opt/mattpocock-skills/skills/engineering/code-review/SKILL.md"}}'
+
+for payload in \
+  '{"hook_event_name":"UserPromptSubmit","prompt":"Explain how code-review works"}' \
+  '{"hook_event_name":"UserPromptSubmit","prompt":"$code-review-extra"}' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/opt/other/skills/engineering/code-review/SKILL.md"}}' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status"}}' \
+  '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo /opt/mattpocock-skills/skills/engineering/code-review/SKILL.md"}}' \
+  '{"hook_event_name":"PostToolUse","tool_name":"Skill","tool_input":{"skill":"code-review"}}'; do
+  cases=$((cases + 1))
+  out=$(bash "$adjudicator" <<<"$payload") || fail "unrelated: nonzero hook exit"
+  [ -z "$out" ] || fail "unrelated: expected silence, got $out"
+done
+
+# Relocating the installation must relocate the Dispatcher pointer too.
+mkdir -p "$test_dir/install with spaces/hook" "$test_dir/install with spaces/skills/review-switch"
+cp "$adjudicator" "$test_dir/install with spaces/hook/review-adjudicator.sh"
+adjudicator="$test_dir/install with spaces/hook/review-adjudicator.sh"
+expected_dispatcher="$test_dir/install with spaces/skills/review-switch/SKILL.md"
+expect_context relocated/dispatcher UserPromptSubmit '' \
+  '{"hook_event_name":"UserPromptSubmit","prompt":"/code-review"}'
+
+# A broken installation must not fabricate /SKILL.md in a successful decision.
+rmdir "$test_dir/install with spaces/skills/review-switch"
+cases=$((cases + 1))
+out=$(bash "$adjudicator" <<<'{"hook_event_name":"UserPromptSubmit","prompt":"/code-review"}' 2>"$test_dir/missing.err")
+[ "$?" -eq 0 ] && [ -z "$out" ] && [ -s "$test_dir/missing.err" ] || fail "missing Dispatcher: expected diagnostic and no routing decision"
+
+for target in "$plugin" code-review; do
+  expect_deny "missing Dispatcher/$target" '' "$target" '' -- '/review-switch'
+done
+expect_allow 'missing Dispatcher/entry' '' review-switch ''
 
 if [ "$failures" -eq 0 ]; then
   printf 'ok: %d cases\n' "$cases"

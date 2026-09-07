@@ -4,15 +4,15 @@ description: Dispatch a review to the Bridge, which resolves the reviewer Lane f
 allowed-tools: Read, Write, Glob, Grep, AskUserQuestion, Bash(git log:*), Bash(git branch:*), Bash(gh api:*), Bash(review-bridge:*)
 ---
 
-You are the Dispatcher: the entry point for a review asked for from inside a Claude session.
-The review itself runs outside this session, in the Bridge — `review-bridge`, which owns
+You are the Dispatcher: the entry point for a review asked for from inside a Claude or Codex session.
+The initial review runs outside this session, in the Bridge — `review-bridge`, which owns
 preparation, both Axis Briefs, delivery to the Lane, the result contract, and the round cap.
 Your work is to complete the two references the Bridge cannot know, hand it what this caller
 asked for, and report back what it returns.
 
 When the caller asks to review documents — a spec, a ticket set, an issue's sub-issues, or a
 `crewtask/<n>/` run — rather than a change, read `references/document-review.md` and use it to
-complete the call. The Result section and everything after it apply unchanged.
+complete the call. Use the Result and Recovery sections below; operational-failure fallback is Code Review only.
 
 ## Completing the call
 
@@ -63,7 +63,8 @@ Pinning a value behind the caller's back is the one thing this skill must not do
 Read the single JSON result through `axes`:
 
 - Retain every non-empty `reviewSessionId`.
-- A hard error or malformed result ends this review. Report it exactly.
+- A hard error or malformed result ends this Bridge attempt. Report it exactly, then use
+  Operational failure below. Recover a started review whose result was lost first.
 
 Then do what the axis's `next` field names, and nothing else: the Bridge holds the round cap
 and every result says what this lineage is permitted after it. The five actions are `done`,
@@ -76,10 +77,11 @@ Where `next` is `done`, the reviewer counted no finding on that round: end the r
 axis and report it as complete, naming `axes.<axis>.reportFile`. Nothing is in dispute, so none
 of the escalation wording below belongs to it.
 Follow `run again` at most once per axis per invocation. If that same axis returns `run again`
-again, make no further Bridge call; report that axis as incomplete with its `reason`, and leave
-the next decision to the user.
+again, make no further Bridge call; report that axis as incomplete with its `reason`, and
+use Operational failure below.
 If `next` names a Bridge call but `nextCall` is `null`, this is a legacy result; report that no
-safe follow-up call is available and stop rather than reconstructing one from prose.
+safe follow-up call is available and stop Bridge follow-ups rather than reconstructing one
+from prose; use Operational failure below.
 Where `next` is `escalate`, the act is this skill's to choose, and here it is to end the review as
 a disagreement and put both positions to whoever asked for it — naming
 `axes.<axis>.reportFile` and `preparation.responseFile`, so the reader opens each side where it was
@@ -90,6 +92,32 @@ first round, and `null` where the report carried no such line. A `refused` resul
 
 Treat `preparation` as the Bridge's receipt. If the result explicitly names a gap or a required
 action, act on it exactly as named before declaring the review complete.
+
+### Operational failure
+
+For Code Review outside coordinator-owned workflows, an unavailable command, failed attempt,
+malformed result, or operationally incomplete axis after the existing recovery and bounded
+`run again` handling selects fallback automatically. Completed findings, required fixes,
+refused extra rounds, and retained disagreements keep their Next Call handling above; they
+are not reasons to seek a different verdict through fallback. Document Review and
+coordinator-owned workflows retain their existing policy: report the failure and leave the
+next decision to their caller.
+
+1. Disclose the exact Bridge failure and which configured review did not complete. Preserve
+   the original target, every returned finding, and all report paths and session handles.
+2. Read the original `mattpocock-skills:code-review` file from this host's installed skill
+   catalog, or reuse its already-loaded content. Follow that original procedure as a whole
+   in the current agent, with the same fixed point and spec. Supply the original Review Scope
+   explicitly: fixed point to the current working tree, including uncommitted and untracked
+   changes. Use that scope for its diff and empty-diff check, as for the Bridge. Reading it is the
+   Dispatcher-selected fallback permitted by the Adjudicator. Load it as a file rather than
+   invoking the intercepted review Skill again; keep upstream files unchanged.
+3. Clearly separate completed Bridge reports from the fallback report, labelling its actual
+   host explicitly as Claude or Codex. Preserve returned Bridge findings for resolution alongside fallback
+   findings. If the original skill is unavailable too, state that review could not run;
+   never claim successful review.
+4. Continue the implementation workflow after handling the findings. Operational failure
+   adds no mandatory pre-commit pause or fallback approval request.
 
 ### The re-review
 
@@ -162,4 +190,4 @@ rule. Retain every recovered handle and process the result above.
 
 **Completion criterion:** every returned axis has its line — summary and report path, or
 `reason` — every preparation gap is handled, and every follow-up is the one that axis's `next`
-named.
+named, or Operational failure has been handled and the actual review outcome disclosed.

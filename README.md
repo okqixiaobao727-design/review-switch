@@ -1,7 +1,8 @@
 # review-switch
 
 Review-Switch runs one code review protocol and delivers it to the reviewing vendor you name:
-`claude` or `codex`. The review runs outside the session that asked for it, on both Lanes.
+`claude` or `codex`. Both Lanes review outside the caller session. If the Bridge cannot complete a Code Review,
+the Dispatcher discloses the failure and falls back to the caller running the original Matt review.
 
 `review-bridge` is the review. It pins the Review Scope — the fixed point to your working tree as
 it stands, committed or not — fetches the spec you name, gathers the standards sources, fills one
@@ -21,7 +22,42 @@ ln -sfn "$PWD/bridge/review_bridge.py" "$HOME/.local/bin/review-bridge"
 The second link puts the Bridge on your `PATH` as `review-bridge`; use any directory on your
 `PATH` if `~/.local/bin` is not on yours.
 
-Register `hook/review-adjudicator.sh` as a Claude Code `PreToolUse` hook matching `Skill`.
+### Caller hooks (Claude and Codex)
+
+The Adjudicator needs Bash and `jq`. Merge these registrations into the existing `hooks`
+object in `~/.claude/settings.json` for Claude and `~/.codex/hooks.json` for Codex. Replace
+`<checkout>` with the absolute Review-Switch checkout path; retain unrelated hooks. When
+upgrading the previous Claude installation, replace its Review-Switch `Skill` registration
+with the expanded matcher below so the same hook runs once per event.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Skill|Bash|Read",
+      "hooks": [{"type": "command", "command": "bash \"<checkout>/hook/review-adjudicator.sh\"", "timeout": 5}]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{"type": "command", "command": "bash \"<checkout>/hook/review-adjudicator.sh\"", "timeout": 5}]
+    }]
+  }
+}
+```
+
+Start a fresh trusted session after changing registration. In Codex, open `/hooks`, review
+and trust the new/changed definitions; untrusted hooks are skipped. Codex exposes shell and
+`exec_command` calls to this matcher as `Bash`. In Claude, inspect `/hooks` and accept the
+normal settings/trust review. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks)
+and [Claude hook reference](https://code.claude.com/docs/en/hooks) for host loading rules.
+Verify hook delivery in a fresh session; a configuration entry alone is not proof it ran.
+
+Both qualified Matt and bare `code-review` Skill calls redirect to the Dispatcher. Explicit
+`/implement`, `$implement`, `/code-review`, and `$code-review` prompts (including qualified
+names) supply routing context for the review step. Literal `cat`/`sed` and `Read` loads of
+Matt's review skill supply the same context, with its Dispatcher path resolved from this
+checkout. This also lets Codex load the Dispatcher without a Skill tool or another skill
+installation. Reading for inspection does not start review. A declared `REVIEW_COORDINATOR`
+keeps ownership. These are targeted entry instructions, not exhaustive anti-bypass controls.
 
 ## Running a review
 
@@ -168,7 +204,7 @@ ships; sourcing it is yours to do:
 and `rcodex` switch Lane. `cc` is the word you type for the claude Lane. Every case
 forwards to `review-bridge config`, so the file has exactly one writer.
 
-## Asking from inside a Claude session
+## Asking from inside a Claude or Codex session
 
 `/review-switch` is the Dispatcher, and the only skill this project installs. It completes the
 fixed point and the spec reference, and calls `review-bridge` — the same command a terminal runs.
@@ -181,6 +217,13 @@ an argument like any other, and beats the file.
 Every review it reports back names what that review ran as, read from the Bridge's own result:
 the Lane on the preparation line, the model and effort on each axis's line, and beside each one
 whether you pinned it, this machine did, or the vendor answered.
+
+When a Code Review cannot complete operationally, the Dispatcher discloses the Bridge failure
+and falls back to the current agent executing the unchanged original Matt review skill from
+its installed catalog. Completed Bridge findings remain visible alongside that fallback.
+Implementation continues; if the upstream skill is unavailable too, the caller reports that
+review could not run. Completed findings and disagreements keep the existing round rules.
+This fallback does not change Document Review or coordinator-owned policy.
 
 ## Dependencies
 
