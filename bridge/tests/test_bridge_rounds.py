@@ -874,5 +874,124 @@ class DocumentReviewVerdictLineTests(FakePaneTestCase):
                 self.assertEqual(result["findings"], {"reported": 0})
 
 
+class FrozenNextCallTests(FakePaneTestCase):
+    """A resume freezes what its lineage resolved; a fresh run resolves afresh."""
+
+    ROUND_ONE_CONFIG = (
+        'lane = "codex"\n\n'
+        '[codex]\nmodel = "round-one-model"\neffort = "medium"\n'
+    )
+    SECOND_THOUGHTS = (
+        'lane = "claude"\n\n'
+        '[claude]\nmodel = "another-lanes-model"\neffort = "max"\n'
+    )
+
+    def argv(self, *arguments):
+        """A call that names its review and leaves every resolved value out."""
+        return [
+            "--cwd", str(self.worktree),
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--axis", "spec",
+            "--no-network",
+            *arguments,
+        ]
+
+    def caller_tokens(self):
+        return [
+            "--cwd", str(self.worktree),
+            "--base", self.fixed_point,
+            "--spec", "spec.md",
+            "--no-network",
+        ]
+
+    def first_round(self, message="one spec finding", expected_code=0):
+        self.write_machine_config(self.ROUND_ONE_CONFIG)
+        args = self.parsed_args(self.argv())
+        self.codex.finish(message, axis="spec")
+        code, output = self.run_bridge(args)
+        self.assertEqual(code, expected_code, output)
+        return output["axes"]["spec"]
+
+    def test_a_resume_names_the_lane_model_and_effort_its_caller_omitted(self):
+        result = self.first_round()
+
+        session = result["reviewSessionId"]
+        response_file = str(self.state_dir / f"{session}-response.md")
+        self.assertEqual(
+            result["nextCall"]["argv"],
+            [
+                "review-bridge",
+                *self.caller_tokens(),
+                "--reviewer", "codex",
+                "--model", "round-one-model",
+                "--effort", "medium",
+                "--axis", "spec",
+                "--resume-session", session,
+                "--response", response_file,
+            ],
+        )
+
+    def test_a_resume_names_round_ones_values_after_the_file_is_edited(self):
+        result = self.first_round()
+        next_call = result["nextCall"]
+        pathlib.Path(next_call["responseFile"]).write_text(
+            '1. "one spec finding" — fixed in feature.py\n', encoding="utf-8"
+        )
+        # This machine changes its Lane, its model and its effort between the
+        # two rounds. The lineage is already open on the first of them.
+        self.write_machine_config(self.SECOND_THOUGHTS)
+
+        resumed = self.parsed_args(next_call["argv"][1:])
+
+        self.assertEqual(resumed.reviewer, "codex")
+        self.assertEqual(resumed.model, "round-one-model")
+        self.assertEqual(resumed.effort, "medium")
+        self.codex.finish("the fix closes it", axis="spec")
+        code, output = self.run_bridge(resumed)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(
+            output["axes"]["spec"]["reviewSessionId"],
+            result["reviewSessionId"],
+        )
+        self.assertEqual(output["preparation"]["lane"], "codex")
+
+    def test_a_caller_that_named_a_value_is_not_told_it_twice(self):
+        self.write_machine_config(self.ROUND_ONE_CONFIG)
+        args = self.parsed_args(self.argv("--model", "asked-for"))
+        self.codex.finish("one spec finding", axis="spec")
+
+        code, output = self.run_bridge(args)
+
+        self.assertEqual(code, 0, output)
+        argv = output["axes"]["spec"]["nextCall"]["argv"]
+        self.assertEqual(argv.count("--model"), 1)
+        self.assertEqual(argv[argv.index("--model") + 1], "asked-for")
+
+    def test_a_value_the_vendor_answered_for_is_named_in_no_resume(self):
+        self.write_machine_config('lane = "codex"\n')
+        args = self.parsed_args(self.argv())
+        self.codex.finish("one spec finding", axis="spec")
+
+        code, output = self.run_bridge(args)
+
+        self.assertEqual(code, 0, output)
+        argv = output["axes"]["spec"]["nextCall"]["argv"]
+        self.assertIn("--reviewer", argv)
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--effort", argv)
+
+    def test_run_again_still_omits_what_its_caller_omitted(self):
+        # An axis that came back with no report earns a fresh lineage, not a
+        # resume, and a fresh lineage resolves this machine's file again.
+        result = self.first_round(message="", expected_code=1)
+
+        self.assertEqual(result["next"], RUN_AGAIN)
+        self.assertEqual(
+            result["nextCall"]["argv"],
+            ["review-bridge", *self.caller_tokens(), "--axis", "spec"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

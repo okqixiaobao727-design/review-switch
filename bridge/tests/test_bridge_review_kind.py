@@ -111,6 +111,8 @@ Report: (a) requirements the spec asked for that are missing or partial; (b) beh
                 "standardsCondition": "absent",
                 "codeGraphUsed": False,
                 "responseFile": None,
+                "lane": "codex",
+                "laneSource": "caller",
             },
         )
 
