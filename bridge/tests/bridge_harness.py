@@ -72,23 +72,47 @@ def assert_first_round_turns(test, delivered, templates):
         test.assertEqual(text[len(template):], block)
 
 
-def redirect_machine_config(test, text=None):
+def redirect_machine_config(test, text=None, models=None):
     """Point the Bridge's Machine Config at this test's own file, and name it.
 
     Every suite that crosses the Bridge's command line redirects the file, so
     that no test resolves anything from the machine it happens to run on. A test
     given no text starts from an absent file, which is what a fresh machine has.
+
+    Codex's model catalog is redirected with it, for the same reason and to the
+    same directory: it too is read while the command line resolves, and left
+    alone it would hold every test's placeholder model name against whatever
+    this machine happens to be able to run. A test given no `models` gets no
+    catalog, so nothing is offered and no model is refused.
     """
     directory = tempfile.TemporaryDirectory()
     test.addCleanup(directory.cleanup)
     path = pathlib.Path(directory.name) / "config.toml"
     if text is not None:
         path.write_text(text, encoding="utf-8")
+    if models is not None:
+        write_models_catalog(pathlib.Path(directory.name), models)
     patcher = mock.patch.dict(
-        os.environ, {"REVIEW_SWITCH_CONFIG": str(path)}
+        os.environ,
+        {"REVIEW_SWITCH_CONFIG": str(path), "CODEX_HOME": directory.name},
     )
     patcher.start()
     test.addCleanup(patcher.stop)
+    return path
+
+
+def write_models_catalog(codex_home, models):
+    """One Codex model catalog, in the shape Codex caches it.
+
+    `models` is a slug, or a `(slug, visibility)` pair where a test needs the
+    difference between what --help offers and what --model will take.
+    """
+    entries = []
+    for model in models:
+        slug, visibility = model if isinstance(model, tuple) else (model, "list")
+        entries.append({"slug": slug, "visibility": visibility})
+    path = pathlib.Path(codex_home) / "models_cache.json"
+    path.write_text(json.dumps({"models": entries}), encoding="utf-8")
     return path
 
 
@@ -723,11 +747,20 @@ class FakePaneTestCase(unittest.TestCase):
             "REVIEW_SWITCH_CONFIG": str(
                 self.root / "machine-config" / "config.toml"
             ),
+            # Redirected for the same reason and at the same moment: Codex's
+            # model catalog is read while the command line resolves, and the
+            # machine's own would hold this suite's placeholder model names
+            # against whatever that machine can actually run. Nothing writes a
+            # catalog here unless a test does, so by default none is offered
+            # and no model is refused.
+            "CODEX_HOME": str(self.root / "codex-home"),
         }
         self.machine_config = pathlib.Path(
             self.environment["REVIEW_SWITCH_CONFIG"]
         )
         self.machine_config.parent.mkdir()
+        self.codex_home = pathlib.Path(self.environment["CODEX_HOME"])
+        self.codex_home.mkdir()
         self.worktree_root = str(self.worktree)
         self.enter(mock.patch.dict(os.environ, self.environment, clear=False))
         self.enter(mock.patch.object(

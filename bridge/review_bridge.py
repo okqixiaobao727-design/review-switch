@@ -289,12 +289,79 @@ def hook_review_end(args, status):
     run_hook(args, REVIEW_END, REVIEW_STATUS=status)
 
 
-def codex_sessions_root(environment=None):
-    """The directory Codex writes its rollouts under, wherever this machine keeps it."""
+def codex_home(environment=None):
+    """Where Codex keeps everything this machine has of it, wherever that is."""
     environment = os.environ if environment is None else environment
     home = environment.get(CODEX_HOME_ENV_VAR)
-    root = pathlib.Path(home) if home else pathlib.Path.home() / CODEX_HOME_DEFAULT
-    return root / ROLLOUT_DIRECTORY
+    return pathlib.Path(home) if home else pathlib.Path.home() / CODEX_HOME_DEFAULT
+
+
+def codex_sessions_root(environment=None):
+    """The directory Codex writes its rollouts under, wherever this machine keeps it."""
+    return codex_home(environment) / ROLLOUT_DIRECTORY
+
+
+# ---------------------------------------------------------------------------
+# The Codex model catalog.
+#
+# Codex caches the models this machine may run, refreshed from the vendor
+# against an etag. Reading it is not the list of model IDs the config mode's
+# note refuses to keep: nothing here is maintained by hand, and a vendor
+# release that adds a model adds it to this file too, on Codex's own schedule.
+#
+# One read answers both questions a model name raises — the names --help offers
+# and the name --model is held to — so a model the vendor would reject is
+# refused in the caller's own terminal before a Lane opens, rather than rounds
+# later as a turn that "ended with status failed" and dropped the reason.
+#
+# A machine that wrote no catalog, or wrote one that cannot be read, offers no
+# names and refuses none: a guardrail that cannot reach its source is absent,
+# and the review it could not check still runs.
+# ---------------------------------------------------------------------------
+MODELS_CACHE_FILENAME = "models_cache.json"
+#: What Codex marks a model it keeps out of its own picker. It stays runnable,
+#: so it is accepted on --model and left out of what --help offers.
+LISTED_VISIBILITY = "list"
+
+
+def codex_model_catalog(environment=None):
+    """`(offered, runnable)`: the slugs --help names, and the ones --model takes.
+
+    Both empty where the catalog is missing or unreadable, which is this
+    machine saying it cannot answer, and is acted on as that rather than as an
+    empty catalog that would refuse every model there is.
+    """
+    path = codex_home(environment) / MODELS_CACHE_FILENAME
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return (), ()
+    models = document.get("models") if isinstance(document, dict) else None
+    if not isinstance(models, list):
+        return (), ()
+    entries = [
+        model
+        for model in models
+        if isinstance(model, dict) and isinstance(model.get("slug"), str)
+    ]
+    offered = tuple(
+        model["slug"]
+        for model in entries
+        if model.get("visibility") == LISTED_VISIBILITY
+    )
+    return offered, tuple(model["slug"] for model in entries)
+
+
+def codex_models_offered(environment=None):
+    """What --help adds about the codex Lane's models, or the nothing it knows.
+
+    On --model alone: the per-axis options default to it, and repeating the
+    catalog under each would bury the line a reader opened --help for.
+    """
+    offered, _runnable = codex_model_catalog(environment)
+    if not offered:
+        return ""
+    return "; codex models on this machine: " + ", ".join(offered)
 
 
 def find_rollout(root, thread_id):
@@ -4828,6 +4895,52 @@ def frozen_arguments(args):
     return frozen
 
 
+#: Every option that can put a model in front of the resolved Lane. The per-axis
+#: pair carries no Machine Config entry, so whatever it holds came from the
+#: caller and is checked on that basis.
+AXIS_MODEL_OPTIONS = (
+    ("--standards-model", "standards_model"),
+    ("--spec-model", "spec_model"),
+)
+
+
+def check_codex_models(parser, args, environment=None):
+    """Hold every model this call would run to the ones this machine carries.
+
+    Here because here is where the Lane and its models are both settled and no
+    Lane has opened yet: a name the vendor will reject spends no round, and is
+    answered by this machine's own catalog rather than by a review that returns
+    failed with the vendor's reason dropped on the way back.
+
+    The codex Lane only. Claude resolves aliases of its own — `opus`, `sonnet` —
+    that no file here enumerates, so there is nothing to check them against and
+    a check would refuse the names that work.
+
+    A model the Machine Config chose is left alone: the config mode proved it
+    against the Lane itself before writing it, and a catalog that has not caught
+    up with the vendor must not overturn a live proof and take this machine's
+    every review down with it. What the caller passed has been proved by
+    nothing, and is what this checks.
+    """
+    if args.reviewer != REVIEWER_CODEX:
+        return
+    offered, runnable = codex_model_catalog(environment)
+    if not runnable:
+        return
+    checked = list(AXIS_MODEL_OPTIONS)
+    if getattr(args, "model_source", None) == SOURCE_CALLER:
+        checked.insert(0, ("--model", "model"))
+    for option, attribute in checked:
+        model = getattr(args, attribute, None)
+        if model is None or model in runnable:
+            continue
+        parser.error(
+            f"{option} names no model this machine carries: {model!r} is not "
+            f"in {codex_home(environment) / MODELS_CACHE_FILENAME}; available: "
+            + ", ".join(offered or runnable)
+        )
+
+
 def resolve_machine_config(parser, args, environment=None):
     """Reconcile this call's arguments with this machine's file, once, here.
 
@@ -4856,6 +4969,7 @@ def resolve_machine_config(parser, args, environment=None):
     args.effort, args.effort_source = resolve_against_config(
         args.effort, config.choice(args.reviewer, EFFORT_KEY)
     )
+    check_codex_models(parser, args, environment)
     for point in HOOK_POINTS:
         destination = hook_destination(point)
         if getattr(args, destination, None) is None:
@@ -5228,7 +5342,8 @@ def build_parser():
     parser.add_argument(
         "--model",
         help="model for this review lineage (default: the Machine Config's "
-             "entry for the resolved Lane, then the reviewer's own config)",
+             "entry for the resolved Lane, then the reviewer's own config)"
+             + codex_models_offered(),
     )
     parser.add_argument(
         "--effort",

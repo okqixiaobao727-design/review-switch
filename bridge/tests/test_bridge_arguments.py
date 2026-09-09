@@ -848,5 +848,131 @@ class MachineConfigResolutionTests(unittest.TestCase):
         self.assertEqual(self.bridge.hook_command(args, "axis-end"), "")
 
 
+class CodexModelCatalogTests(unittest.TestCase):
+    """A model name is held to what this machine can actually run, before a Lane opens."""
+
+    OFFERED = ("gpt-6-astra", "gpt-5.6-sol")
+    #: Codex keeps this one out of its own picker; it still runs.
+    HIDDEN = ("gpt-reserve", "hide")
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        self.config = redirect_machine_config(
+            self, models=(*self.OFFERED, self.HIDDEN)
+        )
+        self.codex_home = pathlib.Path(os.environ["CODEX_HOME"])
+
+    def write(self, text):
+        self.config.write_text(text, encoding="utf-8")
+
+    def resolve(self, *arguments):
+        return self.bridge.parse_args(["--base", "main", *arguments])
+
+    def refuse(self, *arguments):
+        """The message a call this machine's catalog stops comes back with."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                self.resolve(*arguments)
+        self.assertEqual(raised.exception.code, 2)
+        return stderr.getvalue()
+
+    def test_a_model_the_catalog_carries_is_taken(self):
+        args = self.resolve("--reviewer", "codex", "--model", "gpt-5.6-sol")
+
+        self.assertEqual(args.model, "gpt-5.6-sol")
+        self.assertEqual(args.model_source, "caller")
+
+    def test_a_model_the_catalog_does_not_carry_is_refused(self):
+        message = self.refuse("--reviewer", "codex", "--model", "sol 5.6")
+
+        self.assertIn("--model", message)
+        self.assertIn("sol 5.6", message)
+
+    def test_the_refusal_names_the_catalog_and_what_it_offers(self):
+        message = self.refuse("--reviewer", "codex", "--model", "sol 5.6")
+
+        # The file, so a reader who thinks it is stale knows where to look, and
+        # the names, so the next call is the corrected one rather than a guess.
+        self.assertIn(str(self.codex_home / "models_cache.json"), message)
+        for slug in self.OFFERED:
+            self.assertIn(slug, message)
+
+    def test_a_model_codex_hides_from_its_picker_still_runs(self):
+        args = self.resolve("--reviewer", "codex", "--model", self.HIDDEN[0])
+
+        self.assertEqual(args.model, self.HIDDEN[0])
+
+    def test_a_hidden_model_is_not_among_the_names_offered(self):
+        self.assertNotIn(self.HIDDEN[0], self.bridge.codex_models_offered())
+        for slug in self.OFFERED:
+            self.assertIn(slug, self.bridge.codex_models_offered())
+
+    def test_each_per_axis_model_is_held_to_the_same_catalog(self):
+        for option in ("--standards-model", "--spec-model"):
+            with self.subTest(option=option):
+                message = self.refuse("--reviewer", "codex", option, "sol 5.6")
+
+                self.assertIn(option, message)
+
+    def test_the_claude_lane_is_checked_against_nothing(self):
+        # Claude resolves aliases of its own that no file here enumerates, so a
+        # check could only refuse names that work.
+        args = self.resolve("--reviewer", "claude", "--model", "opus")
+
+        self.assertEqual(args.model, "opus")
+
+    def test_a_model_the_machine_config_chose_is_left_alone(self):
+        # The config mode proved it against the Lane itself before writing it.
+        # A catalog that has not caught up with the vendor must not overturn a
+        # live proof and take this machine's every review down with it.
+        self.write('lane = "codex"\n\n[codex]\nmodel = "proved-by-probe"\n')
+
+        args = self.resolve()
+
+        self.assertEqual(args.model, "proved-by-probe")
+        self.assertEqual(args.model_source, "config")
+
+
+class AbsentCodexCatalogTests(unittest.TestCase):
+    """A catalog this machine cannot read offers no name and refuses none."""
+
+    def setUp(self):
+        self.bridge = load_bridge()
+        redirect_machine_config(self)
+        self.codex_home = pathlib.Path(os.environ["CODEX_HOME"])
+
+    def resolve(self, *arguments):
+        return self.bridge.parse_args(["--base", "main", *arguments])
+
+    def assert_checks_nothing(self):
+        args = self.resolve("--reviewer", "codex", "--model", "sol 5.6")
+
+        self.assertEqual(args.model, "sol 5.6")
+        self.assertEqual(self.bridge.codex_models_offered(), "")
+
+    def test_a_machine_that_wrote_no_catalog_refuses_no_model(self):
+        self.assert_checks_nothing()
+
+    def test_a_catalog_that_is_not_json_refuses_no_model(self):
+        (self.codex_home / "models_cache.json").write_text("{not json")
+
+        self.assert_checks_nothing()
+
+    def test_a_catalog_whose_models_are_not_a_list_refuses_no_model(self):
+        (self.codex_home / "models_cache.json").write_text(
+            json.dumps({"models": "gpt-5.6-sol"})
+        )
+
+        self.assert_checks_nothing()
+
+    def test_an_entry_without_a_slug_is_passed_over(self):
+        (self.codex_home / "models_cache.json").write_text(
+            json.dumps({"models": [{"display_name": "no slug here"}]})
+        )
+
+        self.assert_checks_nothing()
+
+
 if __name__ == "__main__":
     unittest.main()
