@@ -240,8 +240,10 @@ class FakeClient:
     def __init__(self):
         self.requests = []
 
-    async def request(self, method, params):
+    async def request(self, method, params, sent=None):
         self.requests.append((method, params))
+        if sent is not None:
+            sent()
         if method == "thread/queue/add":
             return {"queuedSubmission": {"id": "queued-followup"}}
         raise AssertionError(f"unexpected request: {method}")
@@ -320,7 +322,20 @@ class FakeCodexAxis:
             self.owner.axis_errors[self.axis] = "Cannot write to closing transport"
         self.owner.record_mcp_startup(self)
 
-    async def request(self, method, params):
+    async def request(self, method, params, sent=None):
+        """`sent` fires where a real client's write to the socket returns.
+
+        Before every hook that models a far side which already has the request:
+        a Brief this fake raises over is one the Bridge had already written.
+        A send that never happened is modelled by `fail_queue_send`, which
+        raises ahead of it.
+        """
+        if method == "thread/queue/add" and (
+            self.owner.queue_send_errors.get(self.axis) is not None
+        ):
+            raise RuntimeError(self.owner.queue_send_errors[self.axis])
+        if sent is not None:
+            sent()
         if method == "thread/loaded/list":
             self.attach_tui(self.resume_thread_id)
             return {"data": [self.thread_id]}
@@ -359,6 +374,9 @@ class FakeCodexAxis:
         if method == "thread/queue/list":
             return {"data": list(self.queued), "nextCursor": None}
         if method == "thread/queue/add":
+            refusal = self.owner.queue_reply_errors.get(self.axis)
+            if refusal is not None:
+                raise self.owner.bridge.AppServerError(refusal)
             submission = {
                 "id": f"queued-{self.axis}-{len(self.owner.started_turns) + 1}",
                 "clientUserMessageId": params["clientUserMessageId"],
@@ -410,6 +428,8 @@ class FakeCodexSession:
         self.thread_start_errors = {}
         self.mcp_errors = {}
         self.queue_add_exit_after_accept = None
+        self.queue_send_errors = {}
+        self.queue_reply_errors = {}
         self.concurrent_turn_count = 0
 
     def record_mcp_startup(self, session):
@@ -506,6 +526,14 @@ class FakeCodexSession:
 
     def fail_mcp_startup(self, axis, reason):
         self.mcp_errors[axis] = reason
+
+    def fail_queue_send(self, axis, reason):
+        """Kill the transport while the Brief is being written, as #58 did."""
+        self.queue_send_errors[axis] = reason
+
+    def refuse_queue_add(self, axis, reason):
+        """Answer the written Brief with an error, taking nothing into the queue."""
+        self.queue_reply_errors[axis] = reason
 
     def hand_off_thread(self, runtime_dir, thread_id):
         """Model the old pane consuming its handoff and resuming an active turn."""

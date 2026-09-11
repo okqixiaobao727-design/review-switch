@@ -130,6 +130,57 @@ class DeliveryContractTests(unittest.TestCase):
         )
         self.assertEqual(command[-2:], ["resume", "thread-ticket-50"])
 
+    def test_a_resuming_tui_carries_no_overrides(self):
+        """codex-cli refuses a remote resume that carries any override.
+
+        Sandbox, approval, network and model/effort all count, and the TUI exits
+        rather than loading the thread. None of them is lost by being left off:
+        the private app-server is started with the same model and network
+        overrides, and the thread keeps the permissions it was created under.
+        """
+        socket_path = pathlib.Path("/tmp/app-server.sock")
+
+        command = self.bridge.build_tui_command(
+            base_args(
+                network=True, model="gpt-5.6-sol", effort="xhigh"
+            ),
+            socket_path,
+            "thread-ticket-58",
+        )
+
+        self.assertEqual(
+            command,
+            ["codex", "--remote", f"unix://{socket_path}",
+             "resume", "thread-ticket-58"],
+        )
+
+    def test_a_fresh_tui_still_carries_every_override(self):
+        """Only a resume is refused them, so a first launch is left as it was.
+
+        Asserted whole rather than flag by flag: what a resume may not carry is
+        decided by what a fresh launch does carry, and a flag added, dropped or
+        reordered here without a thought for the resume is the defect.
+        """
+        socket_path = pathlib.Path("/tmp/app-server.sock")
+
+        command = self.bridge.build_tui_command(
+            base_args(network=True, model="gpt-5.6-sol", effort="xhigh"),
+            socket_path,
+            None,
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "codex", "--remote", f"unix://{socket_path}",
+                "--sandbox", "danger-full-access",
+                "--ask-for-approval", "never",
+                "-c", "sandbox_workspace_write.network_access=true", "--search",
+                "-c", 'model="gpt-5.6-sol"',
+                "-c", 'model_reasoning_effort="xhigh"',
+            ],
+        )
+
     def test_a_fresh_tui_starts_without_an_axis_brief_or_resume_target(self):
         """The TUI must own an idle thread before the Bridge delivers the Brief.
 

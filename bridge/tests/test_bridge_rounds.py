@@ -518,8 +518,104 @@ class RoundCapTests(RoundsContractTestCase):
                 self.assertEqual(fresh["finalMessage"], "a fresh first round")
                 self.assertEqual(fresh["next"], FIX_THEN_ONE_RE_REVIEW)
 
-    def test_a_resume_that_fails_has_still_had_its_round(self):
-        """A round is spent when it is granted, not when it succeeds."""
+    def test_a_resume_that_failed_before_the_write_keeps_its_round(self):
+        """A round buys one Brief delivered, so a Brief that never left buys nothing.
+
+        Only the codex Lane can fail this way. The claude Lane puts the Brief on
+        its reviewer's own command line, so by the time there is a run to fail,
+        the Brief has already arrived.
+        """
+        first = self.review("codex", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.codex.fail_mcp_startup("spec", "the reviewer never came up")
+
+        failed, _output = self.resume("codex", "spec", session, "never arrives")
+
+        self.assertEqual(failed, 1)
+        self.assertEqual(store.read(session)["rounds"], 1)
+
+    def test_a_resume_that_failed_before_the_write_is_offered_its_lineage_again(self):
+        """The round is still there, so the retry answers the same round one.
+
+        A fresh lineage here would drop the Response the caller already wrote,
+        and put round one's findings to a reviewer that never heard them.
+        """
+        first = self.review("codex", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.codex.fail_mcp_startup("spec", "the reviewer never came up")
+
+        _failed, output = self.resume("codex", "spec", session, "never arrives")
+
+        result = output["axes"]["spec"]
+        argv = result["nextCall"]["argv"]
+        self.assertEqual(result["next"], RUN_AGAIN)
+        self.assertEqual(argv[argv.index("--resume-session") + 1], session)
+        self.assertIn("--response", argv)
+        self.assertEqual(
+            result["nextCall"]["responseFile"],
+            str(store.response_path(session)),
+        )
+        self.assertEqual(result["nextCall"]["responseFormat"], RESPONSE_FORMAT)
+
+        del self.codex.mcp_errors["spec"]
+        granted, _output = self.resume("codex", "spec", session, "round two")
+
+        self.assertEqual(granted, 0)
+
+    def test_a_resume_whose_write_died_keeps_its_round(self):
+        """#58's own failure: the transport closes as the Brief is written."""
+        first = self.review("codex", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.codex.fail_queue_send("spec", "Cannot write to closing transport")
+
+        failed, output = self.resume("codex", "spec", session, "never leaves")
+
+        self.assertEqual(failed, 1)
+        self.assertEqual(store.read(session)["rounds"], 1)
+        argv = output["axes"]["spec"]["nextCall"]["argv"]
+        self.assertEqual(argv[argv.index("--resume-session") + 1], session)
+
+    def test_a_resume_whose_brief_was_written_spends_its_round(self):
+        """A reply can be lost while the Brief it answers was not.
+
+        The queue has the Brief and the reviewer will run it, so a lineage
+        handed its round back here would deliver the same Brief twice. An
+        unknown delivery is a spent one.
+        """
+        first = self.review("codex", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.codex.queue_add_exit_after_accept = RuntimeError(
+            "the reply never came back"
+        )
+
+        failed, output = self.resume("codex", "spec", session, "arrives")
+
+        self.assertEqual(failed, 1)
+        self.assertEqual(store.read(session)["rounds"], 2)
+        self.assertNotIn(
+            "--resume-session", output["axes"]["spec"]["nextCall"]["argv"]
+        )
+
+    def test_a_resume_the_queue_refused_keeps_its_round(self):
+        """An error reply is the queue saying in as many words that it took nothing."""
+        first = self.review("codex", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.codex.refuse_queue_add("spec", "thread is not accepting work")
+
+        failed, output = self.resume("codex", "spec", session, "is refused")
+
+        self.assertEqual(failed, 1)
+        self.assertEqual(store.read(session)["rounds"], 1)
+        argv = output["axes"]["spec"]["nextCall"]["argv"]
+        self.assertEqual(argv[argv.index("--resume-session") + 1], session)
+
+    def test_a_resume_that_fails_after_its_brief_arrived_has_still_had_its_round(self):
+        """Past delivery the round is spent, whether or not a report came back."""
         for reviewer in LANES:
             with self.subTest(reviewer=reviewer):
                 first = self.review(reviewer, "spec", "one spec finding")

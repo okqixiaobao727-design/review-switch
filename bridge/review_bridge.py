@@ -881,12 +881,18 @@ class AppServerClient:
         await self.websocket.close()
         await self.session.close()
 
-    async def request(self, method, params):
+    async def request(self, method, params, sent=None):
         request_id = self.next_id
         self.next_id += 1
         await self.websocket.send_json(
             {"id": request_id, "method": method, "params": params}
         )
+        if sent is not None:
+            # Past the write the far side may already have acted on this
+            # request, whatever comes back or fails to. A caller that turns a
+            # decision on delivery is told here rather than after a reply,
+            # because a reply can be lost while the request was not.
+            sent()
 
         while True:
             message = await self.websocket.receive()
@@ -2509,6 +2515,22 @@ def result_next_action(axis, result, state, findings=None):
     return next_action(axis, rounds_had(state), findings)
 
 
+def lineage_retries(args, state):
+    """Whether this result's retry belongs to the lineage it resumed.
+
+    A resume whose round was returned still has one, and its retry answers the
+    same round one: it carries the same Response, and a fresh lineage would put
+    round one's findings to a reviewer that never heard the caller's answer to
+    them. A lineage that spent its round has none left to be resumed into, and
+    a first round that failed has no round one to answer at all.
+    """
+    return (
+        bool(args.resume_session)
+        and state is not None
+        and refusal_for(state) is None
+    )
+
+
 def next_call(action, axis, state, args, store):
     """The Bridge call this result permits, or none where it permits no call."""
     if action not in (NEXT_FIX_THEN_ONE_RE_REVIEW, NEXT_RUN_AGAIN):
@@ -2520,7 +2542,7 @@ def next_call(action, axis, state, args, store):
         caller_arguments = getattr(args, "caller_arguments", None)
     if caller_arguments is None:
         return None
-    if action == NEXT_RUN_AGAIN:
+    if action == NEXT_RUN_AGAIN and not lineage_retries(args, state):
         # A fresh lineage, so omitted stays omitted and this machine's file is
         # read again — the retry is entitled to whatever it now says.
         return {
@@ -2610,9 +2632,12 @@ def grant_round(args, owner, store):
     arrived with predates any round a sibling call has since taken, and a cap
     decided on that copy is a cap two calls can pass at once. Writing: a round
     consumed but never recorded is one the contract cannot hold the next call
-    to, so the round is spent when it is granted rather than when it succeeds —
-    a resume that then fails has still had it, and a fresh lineage is the way
-    back.
+    to, so the round is taken here rather than where it succeeds — a resume
+    that then fails past delivery has still had it.
+
+    Taken here is not the same as kept. What a round buys is one Brief put to
+    the reviewer, so a resume that fails before its Brief ever went out has it
+    returned; `return_undelivered_round` does that, under these same locks.
 
     The round, the Response it is granted against, and the receipt naming that
     Response are taken together and written once. Once, because a record saying
@@ -2636,6 +2661,28 @@ def grant_round(args, owner, store):
     state["updatedAt"] = time.time()
     store.write(state["reviewSessionId"], state)
     return state, None
+
+
+def return_undelivered_round(store, run):
+    """Give back the round of a resume whose Brief never reached its reviewer.
+
+    The grant comes first because the contract cannot hold a later call to a
+    round it has no record of. What that round buys, though, is one Brief put
+    to the reviewer, and a call that failed before its Brief ever went out
+    bought nothing: not a word of it was read, and the lineage still owes the
+    caller the re-review it was promised. Written under the locks the grant was
+    taken under, so no sibling call ever reads a round nobody had.
+
+    A failure past that point keeps its round, as does a failure that cannot
+    say which side of it fell on: the cost of one round too few is a Brief
+    delivered twice.
+    """
+    state = run.state
+    if run.delivered or state is None:
+        return
+    state["rounds"] = max(rounds_had(state) - 1, 0)
+    state["updatedAt"] = time.time()
+    store.write(state["reviewSessionId"], state)
 
 
 def validate_resume_axis(args, state):
@@ -2896,23 +2943,27 @@ def run_pane(args):
 
 
 def build_tui_command(args, socket_path, thread_id=None):
-    """Return a visible TUI command that starts with no Axis Brief in flight."""
-    command = [
-        "codex",
-        "--remote",
-        f"unix://{socket_path}",
-        "--sandbox",
-        args.sandbox,
-        "--ask-for-approval",
-        args.approval,
-    ]
+    """Return a visible TUI command that starts with no Axis Brief in flight.
+
+    A resume carries no override of any kind. Codex refuses a remote resume that
+    carries one — sandbox, approval, network and model/effort alike — and the
+    TUI exits without loading the thread, which takes the private app-server
+    down with its pane and leaves the Bridge writing to a closing transport.
+    Leaving them off costs the resumed round nothing: the app-server this TUI
+    attaches to was started with the same model and network overrides, and a
+    thread keeps the permissions it was created under.
+    """
+    command = ["codex", "--remote", f"unix://{socket_path}"]
+    if thread_id:
+        return command + ["resume", thread_id]
+    command.extend(
+        ["--sandbox", args.sandbox, "--ask-for-approval", args.approval]
+    )
     if args.network:
         command.extend(
             ["-c", "sandbox_workspace_write.network_access=true", "--search"]
         )
     command.extend(model_config_overrides(args))
-    if thread_id:
-        command.extend(["resume", thread_id])
     return command
 
 
@@ -3183,7 +3234,7 @@ async def wait_for_review(client, thread_id, marker, pane_id, timeout_seconds):
     )
 
 
-async def queue_review(client, thread_id, prompt, marker):
+async def queue_review(client, thread_id, prompt, marker, sent=None):
     """Durably queue one Axis Brief on the TUI-owned thread."""
     return await client.request(
         "thread/queue/add",
@@ -3198,16 +3249,33 @@ async def queue_review(client, thread_id, prompt, marker):
                 }
             ],
         },
+        sent=sent,
     )
 
 
-async def persist_and_queue_review(client, store, state, prompt, marker, timeout):
+async def persist_and_queue_review(
+    client, store, state, prompt, marker, timeout, delivery=None
+):
     """Make recovery discoverable before the durable queue accepts the Brief."""
     store.write(state["reviewSessionId"], state)
-    return await asyncio.wait_for(
-        queue_review(client, state["threadId"], prompt, marker),
-        timeout=timeout,
-    )
+    try:
+        return await asyncio.wait_for(
+            queue_review(
+                client,
+                state["threadId"],
+                prompt,
+                marker,
+                sent=None if delivery is None else delivery.confirm,
+            ),
+            timeout=timeout,
+        )
+    except AppServerError:
+        # The one failure past the write that is still provably undelivered:
+        # an error reply is the queue itself saying it took nothing. A lost
+        # reply and a timeout say nothing of the kind and keep their round.
+        if delivery is not None:
+            delivery.retract()
+        raise
 
 
 async def queued_review_present(client, thread_id, marker):
@@ -3405,6 +3473,9 @@ class AxisCompleted:
     state: dict
     turn: dict
 
+    #: A turn that reached a terminal status was read a Brief to reach it by.
+    delivered = True
+
     @property
     def thread_id(self):
         return self.state["threadId"]
@@ -3415,6 +3486,10 @@ class AxisFailure:
     state: dict | None
     thread_id: str | None
     reason: str
+    #: Whether this axis's Brief reached its reviewer before the failure. A
+    #: failure of unknown provenance says it did, so an unaccounted-for round
+    #: is spent rather than handed out twice.
+    delivered: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3422,6 +3497,9 @@ class StoredAxisRun:
     """One axis whose reviewer is gone but whose report is still undelivered."""
 
     state: dict
+
+    #: There is a report to hand back, so the Brief that earned it arrived.
+    delivered = True
 
     @property
     def thread_id(self):
@@ -3609,7 +3687,35 @@ async def connect_existing_session(state):
     return None
 
 
-async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
+class BriefDelivery:
+    """Whether one axis's Brief left the Bridge, which is what a round buys.
+
+    Left, not arrived: a request the durable queue accepted can still lose its
+    reply, and a Brief put a second time is a second turn the reviewer runs at
+    the caller's expense. So the line sits at the write, and everything past it
+    counts as delivered unless the far side says otherwise in as many words —
+    a Brief is free only where it provably never went out, or was refused.
+
+    In-process and deliberately off the record: the only caller that ever asks
+    is the one that granted the round, while it still holds the locks the grant
+    was taken under. A record would have to be reaped and reconciled to answer
+    the same question no later call needs answered.
+    """
+
+    def __init__(self):
+        self.arrived = False
+
+    def confirm(self):
+        self.arrived = True
+
+    def retract(self):
+        """Take the confirmation back where the far side said it has nothing."""
+        self.arrived = False
+
+
+async def resume_session_in_new_pane(
+    args, owner, store, state, prompt, marker, delivery
+):
     close_pane(state["paneId"])
     shutil.rmtree(state["runtimeDir"], ignore_errors=True)
 
@@ -3648,7 +3754,7 @@ async def resume_session_in_new_pane(args, owner, store, state, prompt, marker):
         state["paneId"] = pane_id
         state["updatedAt"] = time.time()
         await persist_and_queue_review(
-            client, store, state, prompt, marker, args.startup_timeout
+            client, store, state, prompt, marker, args.startup_timeout, delivery
         )
         return await wait_for_review(
             client,
@@ -3682,12 +3788,13 @@ async def run_existing_review(args, brief, owner, store):
     # writes its record early: a driver killed mid-turn must leave a marker the
     # recovery path can wait on.
     state["marker"] = marker
+    delivery = BriefDelivery()
 
     try:
         client = await connect_existing_session(state)
         if client is None:
             _thread, turn = await resume_session_in_new_pane(
-                args, owner, store, state, prompt, marker
+                args, owner, store, state, prompt, marker, delivery
             )
         else:
             try:
@@ -3699,6 +3806,7 @@ async def run_existing_review(args, brief, owner, store):
                     prompt,
                     marker,
                     args.startup_timeout,
+                    delivery,
                 )
                 _thread, turn = await wait_for_review(
                     client,
@@ -3714,6 +3822,7 @@ async def run_existing_review(args, brief, owner, store):
             state,
             state["threadId"],
             str(error) or type(error).__name__,
+            delivery.arrived,
         )
     return AxisCompleted(state, turn)
 
@@ -4326,6 +4435,13 @@ class ClaudeRun:
     parsed: ClaudeResult | None = None
     reason: str = ""
 
+    #: This Lane puts the Brief on its reviewer's own command line, so a run
+    #: that was driven at all was driven on a Brief already delivered. A
+    #: reviewer that never started raises out of `resume` instead of returning
+    #: a run, so it reaches no round of this Lane's to give back — that gap is
+    #: this Lane's own, and older than the rule.
+    delivered = True
+
 
 class ClaudeLane(Lane):
     """Delivery to the claude reviewer: one headless process per axis.
@@ -4642,6 +4758,7 @@ async def run_bridge(args):
             if refusal is not None:
                 return report_refusal(args, refusal)
             runs = {args.axis: await lane.resume(axis_brief(args, args.axis))}
+            return_undelivered_round(store, runs[args.axis])
         else:
             runs = await deliver_briefs(args, lane, axis_briefs(args))
 

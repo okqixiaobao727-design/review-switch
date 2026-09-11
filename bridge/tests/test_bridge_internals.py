@@ -67,8 +67,10 @@ class GateClient:
             "".join(f"{line}\n" for line in lines), encoding="utf-8"
         )
 
-    async def request(self, method, params):
+    async def request(self, method, params, sent=None):
         self.requests.append((method, dict(params)))
+        if sent is not None:
+            sent()
         if method == "thread/loaded/list":
             return {"data": list(self.loaded), "nextCursor": None}
         if method == "config/read":
@@ -447,8 +449,10 @@ class RecoveryDeliveryTests(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            async def request(self, method, params):
+            async def request(self, method, params, sent=None):
                 self.requests.append((method, params))
+                if sent is not None:
+                    sent()
                 if method == "thread/queue/list":
                     return {
                         "data": [{"clientUserMessageId": marker}],
