@@ -8,6 +8,7 @@ rounds a lineage earns or what a result names as the next permitted action.
 import os
 import pathlib
 import unittest
+from unittest import mock
 
 from bridge_harness import FakePaneTestCase
 
@@ -613,6 +614,80 @@ class RoundCapTests(RoundsContractTestCase):
         self.assertEqual(store.read(session)["rounds"], 1)
         argv = output["axes"]["spec"]["nextCall"]["argv"]
         self.assertEqual(argv[argv.index("--resume-session") + 1], session)
+
+    def test_a_claude_resume_whose_reviewer_never_started_keeps_its_round(self):
+        """The claude Lane's own before-the-write: no process, so no Brief.
+
+        This Lane's launch failure is a raised error and stays one — there is
+        no report to read, and the exception is the whole of what the caller is
+        told. What the lineage keeps is the round, which bought nothing: the
+        retry answers the same round one rather than a cap it never reached.
+        """
+        first = self.review("claude", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.claude.fail_launch("spec", "cannot launch headless Claude")
+
+        with self.assertRaisesRegex(RuntimeError, "cannot launch"):
+            self.resume("claude", "spec", session, "never starts")
+
+        self.assertEqual(store.read(session)["rounds"], 1)
+
+        granted, _output = self.resume("claude", "spec", session, "round two")
+
+        self.assertEqual(granted, 0)
+
+    def test_a_claude_resume_whose_reviewer_did_start_spends_its_round(self):
+        """Past the process there is a reviewer already reading the Brief.
+
+        This Lane's Brief is on the command line, so delivery is the moment the
+        process exists — before the launch hook, whose failure leaves a live
+        reviewer behind. A lineage handed its round back here would put that
+        same Brief to a reviewer already running on it.
+        """
+        first = self.review("claude", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        self.enter(mock.patch.object(
+            self.bridge,
+            "hook_child_launch",
+            mock.Mock(side_effect=RuntimeError("the launch hook died")),
+        ))
+
+        with self.assertRaisesRegex(RuntimeError, "the launch hook died"):
+            self.resume("claude", "spec", session, "arrives anyway")
+
+        self.assertEqual(store.read(session)["rounds"], 2)
+
+    def test_a_claude_resume_that_never_started_pins_no_model_to_its_lineage(self):
+        """A round that bought nothing chose nothing either.
+
+        The model a resume names is written to the record before its reviewer
+        is launched, and the give-back writes that record. A launch that failed
+        drove no review at all, so the lineage must not come out of the call
+        naming a model nothing here was ever run under.
+        """
+        first = self.review("claude", "spec", "one spec finding")
+        session = first["reviewSessionId"]
+        store = self.bridge.SessionStore()
+        fields = self.bridge.SESSION_CHOICE_FIELDS
+        before = {key: store.read(session).get(key) for key in fields}
+        self.claude.fail_launch("spec", "cannot launch headless Claude")
+
+        with self.assertRaisesRegex(RuntimeError, "cannot launch"):
+            self.run_bridge(self.args(
+                reviewer="claude",
+                axis="spec",
+                resume_session=session,
+                model="a-model-no-round-ran-under",
+                model_source="caller",
+                effort="high",
+                effort_source="caller",
+            ))
+
+        after = store.read(session)
+        self.assertEqual({key: after.get(key) for key in fields}, before)
+        self.assertEqual(after["rounds"], 1)
 
     def test_a_resume_that_fails_after_its_brief_arrived_has_still_had_its_round(self):
         """Past delivery the round is spent, whether or not a report came back."""

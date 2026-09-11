@@ -2663,6 +2663,22 @@ def grant_round(args, owner, store):
     return state, None
 
 
+def return_round(store, state):
+    """Write back the round one lineage was granted and did not spend.
+
+    The write alone. Who may ask for it, and on what evidence, is the caller's
+    to decide — `return_undelivered_round` for a Lane that returned a run, and
+    `ClaudeLane.resume` for the one failure that returns none. Both ask under
+    the locks the grant was taken under, so no sibling call ever reads a round
+    nobody had.
+    """
+    if state is None:
+        return
+    state["rounds"] = max(rounds_had(state) - 1, 0)
+    state["updatedAt"] = time.time()
+    store.write(state["reviewSessionId"], state)
+
+
 def return_undelivered_round(store, run):
     """Give back the round of a resume whose Brief never reached its reviewer.
 
@@ -2670,19 +2686,15 @@ def return_undelivered_round(store, run):
     round it has no record of. What that round buys, though, is one Brief put
     to the reviewer, and a call that failed before its Brief ever went out
     bought nothing: not a word of it was read, and the lineage still owes the
-    caller the re-review it was promised. Written under the locks the grant was
-    taken under, so no sibling call ever reads a round nobody had.
+    caller the re-review it was promised.
 
     A failure past that point keeps its round, as does a failure that cannot
     say which side of it fell on: the cost of one round too few is a Brief
     delivered twice.
     """
-    state = run.state
-    if run.delivered or state is None:
+    if run.delivered:
         return
-    state["rounds"] = max(rounds_had(state) - 1, 0)
-    state["updatedAt"] = time.time()
-    store.write(state["reviewSessionId"], state)
+    return_round(store, run.state)
 
 
 def validate_resume_axis(args, state):
@@ -3409,6 +3421,11 @@ def session_state(
     }
 
 
+#: The fields `apply_session_model_choice` writes, and so the only ones a
+#: resume that never reached its reviewer has anything to put back.
+SESSION_CHOICE_FIELDS = ("model", "modelSource", "effort", "effortSource")
+
+
 def apply_session_model_choice(args, state):
     """Reconcile a follow-up's model/effort with the ones the lineage carries.
 
@@ -3431,6 +3448,28 @@ def apply_session_model_choice(args, state):
         setattr(
             args, f"{choice}_source", state.get(source, SOURCE_VENDOR)
         )
+
+
+def session_model_choice(state):
+    """The model and effort a record carries, exactly as it carries them.
+
+    Paired with `apply_session_model_choice`, which writes those fields in
+    place. A caller that may have to undo that write needs what stood there
+    first, and an absent field is not the same as one holding `None`.
+    """
+    return {key: state[key] for key in SESSION_CHOICE_FIELDS if key in state}
+
+
+def restore_session_model_choice(state, choice):
+    """Put back a model and effort that were applied and never got used.
+
+    A choice is pinned to a lineage by the round that ran under it. A round
+    that never reached its reviewer pins nothing, so the record must not come
+    out of it naming a model no review of this lineage was ever driven at.
+    """
+    for key in SESSION_CHOICE_FIELDS:
+        state.pop(key, None)
+    state.update(choice)
 
 
 def update_session_after_turn(state, turn, target):
@@ -4244,9 +4283,19 @@ def launch_claude(args, command, runtime_dir):
     return ClaudeProcess(process)
 
 
-def open_child_process(args, command, runtime_dir):
-    """Start this axis's reviewer, and tell the caller's hook which child it got."""
+def open_child_process(args, command, runtime_dir, delivery=None):
+    """Start this axis's reviewer, and tell the caller's hook which child it got.
+
+    `delivery` is confirmed between the two, because that is where this Lane's
+    Brief changes hands: it is on the command line the process was started
+    with, so a reviewer that exists is a reviewer already reading it, and the
+    hook below runs with the Brief long gone. A caller that must know whether
+    the Brief went out passes one; the first review of a lineage has no round
+    riding on the answer and passes none.
+    """
     process = launch_claude(args, command, runtime_dir)
+    if delivery is not None:
+        delivery.confirm()
     hook_child_launch(args)
     return process
 
@@ -4437,9 +4486,10 @@ class ClaudeRun:
 
     #: This Lane puts the Brief on its reviewer's own command line, so a run
     #: that was driven at all was driven on a Brief already delivered. A
-    #: reviewer that never started raises out of `resume` instead of returning
-    #: a run, so it reaches no round of this Lane's to give back — that gap is
-    #: this Lane's own, and older than the rule.
+    #: reviewer that never started raises out of `resume` and returns no run at
+    #: all, so the round it was granted is settled there, against the
+    #: `BriefDelivery` that Lane confirms the moment its process exists, rather
+    #: than read from a field here.
     delivered = True
 
 
@@ -4492,7 +4542,7 @@ class ClaudeLane(Lane):
         self.store.write(state["reviewSessionId"], state)
         return dataclasses.replace(launch, state=state)
 
-    def launch(self, axis_args, brief, model, effort, resume_id):
+    def launch(self, axis_args, brief, model, effort, resume_id, delivery=None):
         """Put one brief to a reviewer of this axis's own, new lineage or resumed."""
         command = build_claude_command(
             resolve_claude_binary(self.args.claude_binary),
@@ -4503,7 +4553,9 @@ class ClaudeLane(Lane):
         )
         runtime_dir = make_runtime(brief.text)
         try:
-            process = open_child_process(axis_args, command, runtime_dir)
+            process = open_child_process(
+                axis_args, command, runtime_dir, delivery
+            )
         except Exception:
             shutil.rmtree(runtime_dir, ignore_errors=True)
             raise
@@ -4558,16 +4610,34 @@ class ClaudeLane(Lane):
         state = self.args.resume_state
         if state is None:
             state = self.store.read(self.args.resume_session)
-        validate_resume_axis(self.args, state)
-        validate_session_owner(state, self.owner)
-        apply_session_model_choice(self.args, state)
-        launch = self.launch(
-            axis_arguments(self.args, state["axis"]),
-            brief,
-            state["model"],
-            state["effort"],
-            state.get("claudeSessionId"),
-        )
+        pinned = session_model_choice(state)
+        delivery = BriefDelivery()
+        try:
+            validate_resume_axis(self.args, state)
+            validate_session_owner(state, self.owner)
+            apply_session_model_choice(self.args, state)
+            launch = self.launch(
+                axis_arguments(self.args, state["axis"]),
+                brief,
+                state["model"],
+                state["effort"],
+                state.get("claudeSessionId"),
+                delivery,
+            )
+        except Exception:
+            # This Lane's Brief rides the command line its reviewer is started
+            # with, so `delivery` is confirmed the moment that process exists
+            # and everything before it is the near side of delivery. A resume
+            # that fell there was never read by anyone: its round bought
+            # nothing and goes back, along with the model this call applied to
+            # the record and no reviewer ever ran under. Past delivery both
+            # stay, because the cost of one round too few is a Brief delivered
+            # twice. The caller is told what it was told before either way —
+            # this failure is still raised, not reported.
+            if not delivery.arrived:
+                restore_session_model_choice(state, pinned)
+                return_round(self.store, state)
+            raise
         state["runtimeDir"] = str(launch.runtime_dir)
         state["resultPath"] = str(
             launch.runtime_dir / CLAUDE_RESULT_FILENAME
